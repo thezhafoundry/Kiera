@@ -232,7 +232,7 @@ class VoiceConversionWorker:
                     
                     # Calculate how old this audio chunk is
                     age = time.time() - chunk_start_t
-                    if age > 2.0:
+                    if age > 5.0:
                         # Stale chunk — discard it to prevent permanent audio buffer backup/delay
                         print(f"[Worker] Discarding stale chunk {next_publish_seq} (age: {age:.1f}s) to keep low latency")
                     else:
