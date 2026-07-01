@@ -363,13 +363,15 @@ class VoiceConversionWorker:
 
         # Emit latency metric to the room data channel for the frontend
         if self.room and self.room.isconnected():
-            try:
-                import json
-                asyncio.create_task(self.room.local_participant.publish_data(
-                    json.dumps({"pipeline_latency_ms": added_latency_ms, "is_fallback": not success}).encode()
-                ))
-            except Exception:
-                pass
+            import json
+            async def safe_publish():
+                try:
+                    await self.room.local_participant.publish_data(
+                        json.dumps({"pipeline_latency_ms": added_latency_ms, "is_fallback": not success}).encode()
+                    )
+                except Exception:
+                    pass
+            asyncio.create_task(safe_publish())
 
         return audio_payload
 
