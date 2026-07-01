@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "render": {
+      "type": "http",
+      "url": "https://kiera.onrender.com",
+      "headers": {
+        "Authorization": "Bearer rnd_gdLQ7lZZloEXKj2HNpvBXRIFHYpS"
+      }
+    }
+  }
+}
