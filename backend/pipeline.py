@@ -217,6 +217,11 @@ class VoiceConversionWorker:
         # Semaphore: cap concurrent RVC HTTP requests at 2
         rvc_semaphore = asyncio.Semaphore(2)
 
+        output_buffer = {}
+        publish_ready = asyncio.Event()
+        next_publish_seq = 0
+        pending_seq = 0
+
         async def ordered_publisher():
             nonlocal next_publish_seq
             while self.running:
