@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Keira Agent Softphone — Real-Time Voice Conversion</title>
+    <meta name="description" content="Keira Agent softphone dashboard for real-time voice conversion using RVC.">
+    <link rel="stylesheet" href="style.css">
+    <!-- Google Fonts for premium typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- LiveKit Client SDK -->
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+</head>
+<body>
+    <!-- Background glowing accents for rich visual style -->
+    <div class="glow-container">
+        <div class="glow-circle glow-1"></div>
+        <div class="glow-circle glow-2"></div>
+    </div>
+
+    <!-- Incoming Call Overlay/Modal -->
+    <div id="incoming-call-overlay" class="modal-overlay" style="display: none;">
+        <div class="glass-card modal-content ringing-card">
+            <div class="phone-ring-animation">
+                <div class="ring-circle"></div>
+                <div class="ring-icon">📞</div>
+            </div>
+            <h2>Incoming Phone Call</h2>
+            <div class="caller-id" id="incoming-caller-id">+1 (555) 000-0000</div>
+            <p class="modal-subtitle">Lead is dialing in via Twilio SIP</p>
+            <div class="button-group">
+                <button id="btn-incoming-accept" class="btn btn-secondary">Accept Call</button>
+                <button id="btn-incoming-reject" class="btn btn-danger-outline">Reject</button>
+            </div>
+        </div>
+    </div>
+
+    <main class="app-container">
+        <header class="app-header">
+            <div class="header-logo-row">
+                <div class="badge">KEIRA TELEPHONY MVP</div>
+                <h1>KEIRA</h1>
+                <p class="subtitle">Real-Time Voice Conversion Softphone Platform</p>
+            </div>
+        </header>
+
+        <!-- System Bar / Controls -->
+        <section class="system-bar glass-card">
+            <div class="system-status-group">
+                <div class="status-item">
+                    <span class="status-label">Shift Status</span>
+                    <span class="status-value offline-text" id="val-shift-status">Offline</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">RVC Serverless GPU</span>
+                    <div class="status-indicator-wrapper">
+                        <span class="status-indicator" id="gpu-status-indicator"></span>
+                        <span class="status-value" id="val-gpu-status">Cold</span>
+                    </div>
+                </div>
+                <div class="status-item">
+                    <span class="status-label">Conversion Bot</span>
+                    <div class="status-indicator-wrapper">
+                        <span class="status-indicator" id="bot-status-indicator"></span>
+                        <span class="status-value" id="val-bot-status">Offline</span>
+                    </div>
+                </div>
+            </div>
+            <div class="system-actions" style="display: flex; gap: 10px;">
+                <button id="btn-deploy" class="btn btn-secondary" style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); color: #e4e6eb;">🚀 Deploy GPU</button>
+                <button id="btn-warmup" class="btn btn-primary">Start Shift (Warm GPU)</button>
+            </div>
+        </section>
+
+        <section class="grid-layout">
+            <!-- Left Side: Lead List Card -->
+            <div class="glass-card lead-card">
+                <h2>Leads Directory</h2>
+                <p class="description">Select a lead to initiate an outbound call with active voice conversion.</p>
+                <div class="lead-list" id="lead-list-container">
+                    <!-- Dynamic Leads will be loaded here -->
+                </div>
+            </div>
+
+            <!-- Right Side: Active Call Console -->
+            <div class="glass-card console-card" id="call-console">
+                <div class="console-idle-state" id="console-idle-view">
+                    <div class="pulse-phone-icon">👤</div>
+                    <h3>Ready for Calls</h3>
+                    <p class="helper-text">Start your shift to prepare the GPU, then select a lead to call, or wait for inbound leads.</p>
+                </div>
+
+                <div class="console-active-state" id="console-active-view" style="display: none;">
+                    <div class="active-call-header">
+                        <div class="call-badge pulse">ACTIVE CALL</div>
+                        <h2 id="active-lead-name">Jane Doe</h2>
+                        <div class="active-lead-number" id="active-lead-number">+1 (555) 123-4567</div>
+                    </div>
+
+                    <div class="call-timer-box">
+                        <div class="timer-label">DURATION</div>
+                        <div class="timer-value" id="call-duration-timer">00:00</div>
+                    </div>
+
+                    <div class="console-actions">
+                        <button id="btn-mute-mic" class="btn btn-outline-warning">
+                            <span class="btn-icon">🎙️</span> <span id="btn-mute-text">Mute Mic</span>
+                        </button>
+                        <button id="btn-end-call" class="btn btn-danger">
+                            <span class="btn-icon">🚫</span> End Call
+                        </button>
+                    </div>
+
+                    <!-- Latency Indicator inside Active Panel -->
+                    <div class="latency-status-card">
+                        <div class="latency-header">
+                            <span>Pipeline Latency</span>
+                            <span class="latency-badge" id="latency-val-badge">-- ms</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="latency-progress-fill" style="width: 0%"></div>
+                        </div>
+                        <div class="latency-footer">
+                            <span id="latency-text-detail">Denoising + RVC Serverless GPU</span>
+                            <span class="failsafe-badge" id="failsafe-active-badge" style="display: none;">FAILSAFE</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Hidden Audio Container -->
+        <div id="audio-outputs-container" style="display: none;"></div>
+    </main>
+
+    <footer class="app-footer">
+        <p>Keira Telephony Voice Conversion Platform &copy; 2026. Built with LiveKit, Twilio, and Modal RVC.</p>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>

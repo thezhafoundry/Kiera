@@ -1,0 +1,21 @@
+/.env
+__pycache__/
+*.pyc
+.venv/
+venv311/
+.DS_Store
+
+# Large model / audio files — do not push to GitHub
+*.pth
+*.index
+*.wav
+*.pt
+train.log
+models/
+dataset/
+
+# Local binaries — too large / downloadable
+tools/ngrok.exe
+
+# RVC WebUI — too large for GitHub
+Retrieval-based-Voice-Conversion-WebUI/

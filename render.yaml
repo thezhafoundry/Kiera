@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: keira-backend
+    runtime: python
+    region: oregon          # US West — closest to Modal US servers
+    plan: free              # free tier (512MB RAM, sleeps after 15min idle)
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false         # set manually in Render dashboard
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: RVC_ENDPOINT_URL
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: TWILIO_SIP_URI
+        sync: false         # Twilio Elastic SIP Trunk termination URI (e.g. myproject.pstn.twilio.com)
+      - key: TWILIO_SIP_TRUNK_ID
+        sync: false         # LiveKit outbound trunk ID — populate after running POST /api/setup
+      - key: SERVER_URL
+        sync: false         # public URL of this server (e.g. https://keira-backend.onrender.com)
+      - key: MODAL_TOKEN_ID
+        sync: false
+      - key: MODAL_TOKEN_SECRET
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"          # show print() logs in real time
