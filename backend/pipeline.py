@@ -191,9 +191,9 @@ class VoiceConversionWorker:
         FRAME_BYTES   = 320          # 10ms @ 16kHz 16-bit mono
         FRAME_MS      = 10
 
-        MIN_CHUNK_MS  = 300          # don't send anything shorter to RVC
+        MIN_CHUNK_MS  = 600          # don't send anything shorter to RVC
         MAX_CHUNK_MS  = 2500         # hard cap — prevents unbounded latency on long sentences
-        SILENCE_MS    = 200          # consecutive silence to trigger a chunk cut
+        SILENCE_MS    = 300          # consecutive silence to trigger a chunk cut
 
         min_frames    = MIN_CHUNK_MS  // FRAME_MS   # 30 frames
         max_frames    = MAX_CHUNK_MS  // FRAME_MS   # 250 frames
@@ -241,7 +241,13 @@ class VoiceConversionWorker:
 
         async def convert_and_stage(chunk_with_carry: bytes, raw_chunk: bytes, carry_len: int, chunk_start_t: float, seq: int):
             async with rvc_semaphore:
-                audio = await self._convert_chunk(chunk_with_carry, raw_chunk, carry_len, chunk_start_t)
+                # Check if this chunk is already stale before making a slow remote RVC call
+                age_before = time.time() - chunk_start_t
+                if age_before > 2.5:
+                    print(f"[Worker] Queue backed up: skipping RVC for stale chunk {seq} (age: {age_before:.1f}s)")
+                    audio = self._resample_16k_to_48k(raw_chunk)
+                else:
+                    audio = await self._convert_chunk(chunk_with_carry, raw_chunk, carry_len, chunk_start_t)
             output_buffer[seq] = (chunk_start_t, audio)
             publish_ready.set()
 
