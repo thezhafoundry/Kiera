@@ -12,7 +12,7 @@ from websockets.exceptions import ConnectionClosed
 from backend.noise.noise_suppressor import WebRTCNoiseSuppressor
 from backend.converters.dummy import DummyVoiceConverter
 from backend.converters.rvc import RVCVoiceConverter
-from backend.converters.rvc_stream import RVCStreamingConverter
+from backend.converters.rvc_stream import RVCStreamingConverter, _MAX_BUFFER_BYTES
 
 async def test_noise_suppressor():
     print("\n--- Testing Noise Suppressor ---")
@@ -296,6 +296,10 @@ async def test_rvc_streaming_converter_basic():
 
             await converter.close()
             await asyncio.wait_for(collect_task, timeout=5.0)
+            # _make_fed_input's generator only unwinds via the pump task's
+            # cancellation above; explicitly close it too so nothing relies
+            # solely on that cancellation to release it.
+            await in_gen.aclose()
 
             error_records = [r for r in log_handler.records if r.levelno >= logging.ERROR]
             assert not error_records, (
@@ -325,6 +329,7 @@ async def test_rvc_streaming_converter_reconnect():
 
     collect_task = asyncio.create_task(collect())
     server2 = None
+    server1_closed = False
     try:
         # 1. Prove the happy path works before inducing an outage.
         in_queue.put_nowait(_make_frame(1))
@@ -338,6 +343,7 @@ async def test_rvc_streaming_converter_reconnect():
         # kill needed -- Windows-friendly).
         server.close()
         await server.wait_closed()
+        server1_closed = True
 
         # Frames sent during the outage must be buffered (bounded, replayed
         # on reconnect), never dropped silently and never leaked raw.
@@ -374,13 +380,131 @@ async def test_rvc_streaming_converter_reconnect():
         assert _decode_frame_value(output_chunks[pre_outage_count + 1]) == 3
         print("Reconnect-with-backoff: silence during outage, buffered replay in order: OK")
     finally:
+        if not server1_closed:
+            server.close()
+            await server.wait_closed()
         if server2 is not None:
             server2.close()
             await server2.wait_closed()
         await converter.close()
         await asyncio.wait_for(collect_task, timeout=5.0)
+        await in_gen.aclose()
 
     print("RVCStreamingConverter reconnect test: SUCCESS")
+
+
+async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
+    print("\n--- Testing RVCStreamingConverter reconnect buffer cap (bounded, drop-oldest) ---")
+
+    server = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    converter = RVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+    in_gen, in_queue = _make_fed_input()
+    output_chunks = []
+
+    async def collect():
+        async for chunk in converter.convert_stream(in_gen):
+            output_chunks.append(chunk)
+
+    collect_task = asyncio.create_task(collect())
+    server2 = None
+    server1_closed = False
+    try:
+        # 1. Prove the happy path works before inducing an outage.
+        in_queue.put_nowait(_make_frame(0))
+        deadline = time.monotonic() + 3.0
+        while len(output_chunks) < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert len(output_chunks) == 1, "pre-outage frame was not echoed"
+        pre_outage_count = len(output_chunks)
+
+        # 2. Kill the server so the connection loop cannot drain the buffer --
+        # everything fed from here on stays in the bounded buffer until we
+        # reconnect below.
+        server.close()
+        await server.wait_closed()
+        server1_closed = True
+
+        # 3. Feed well over 5s worth of 16kHz PCM (each frame is 320 bytes =
+        # 10ms; _MAX_BUFFER_BYTES caps at 500 such frames = 5s). Each frame's
+        # sample value encodes its own sequence index, so which frames survive
+        # the drop-oldest policy is externally verifiable after reconnect.
+        frame_len_bytes = 320
+        cap_frames = _MAX_BUFFER_BYTES // frame_len_bytes
+        assert _MAX_BUFFER_BYTES % frame_len_bytes == 0, (
+            "test assumes the cap is an exact multiple of the frame size"
+        )
+        n_fed = cap_frames + 200  # ~7s worth fed against a 5s cap
+        for i in range(n_fed):
+            in_queue.put_nowait(_make_frame(i))
+
+        # 4. Wait for the input pump to drain the feeder queue and finish
+        # applying the drop-oldest trim, then inspect internal buffer state
+        # directly -- this is a white-box check of the cap/drop-oldest policy
+        # itself, which the public API (order of replayed output) alone can't
+        # fully prove (a drop-newest bug would still "pass" an output-only
+        # check restricted to values within the surviving window).
+        drain_deadline = time.monotonic() + 5.0
+        while in_queue.qsize() > 0 and time.monotonic() < drain_deadline:
+            await asyncio.sleep(0.01)
+        assert in_queue.qsize() == 0, "feeder queue never drained -- pump task stalled"
+        # Give the pump task a moment to finish appending/trimming the last
+        # dequeued item (queue-empty doesn't itself guarantee that).
+        await asyncio.sleep(0.1)
+
+        assert converter._buffered_bytes == _MAX_BUFFER_BYTES, (
+            f"expected buffer to sit exactly at the {_MAX_BUFFER_BYTES}-byte cap after "
+            f"overflow, got {converter._buffered_bytes}"
+        )
+        assert len(converter._buffer) == cap_frames, (
+            f"expected exactly {cap_frames} surviving frames, got {len(converter._buffer)}"
+        )
+
+        survivor_values = [_decode_frame_value(f) for f in converter._buffer]
+        expected_survivors = list(range(n_fed - cap_frames, n_fed))
+        assert survivor_values == expected_survivors, (
+            "drop-oldest policy violated: surviving buffered frames are not exactly the "
+            f"newest {cap_frames} fed, in order. Expected {expected_survivors[:3]}...{expected_survivors[-3:]}, "
+            f"got {survivor_values[:3]}...{survivor_values[-3:]}"
+        )
+        print(
+            f"Buffer capped at {_MAX_BUFFER_BYTES} bytes ({cap_frames} frames); "
+            f"oldest {n_fed - cap_frames} of {n_fed} fed frames dropped, newest survive in order: OK"
+        )
+
+        # 5. Reconnect and confirm the survivors (and only the survivors) get
+        # converted/yielded once the connection resumes.
+        server2 = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", port)
+
+        expected_count = pre_outage_count + cap_frames
+        reconnect_deadline = time.monotonic() + 10.0
+        while len(output_chunks) < expected_count and time.monotonic() < reconnect_deadline:
+            await asyncio.sleep(0.05)
+
+        assert len(output_chunks) == expected_count, (
+            f"expected reconnect to replay exactly the {cap_frames} surviving buffered frames: "
+            f"got {len(output_chunks) - pre_outage_count}, wanted {cap_frames}"
+        )
+        replayed_values = [
+            _decode_frame_value(c) for c in output_chunks[pre_outage_count:]
+        ]
+        assert replayed_values == expected_survivors, (
+            "replayed post-reconnect frames were not exactly the newest surviving frames, in order"
+        )
+        print("Reconnect replay after cap/trim matches surviving newest frames, in order: OK")
+    finally:
+        if not server1_closed:
+            server.close()
+            await server.wait_closed()
+        if server2 is not None:
+            server2.close()
+            await server2.wait_closed()
+        await converter.close()
+        await asyncio.wait_for(collect_task, timeout=5.0)
+        await in_gen.aclose()
+
+    print("RVCStreamingConverter buffer-cap drop-oldest test: SUCCESS")
 
 
 async def main():
@@ -391,6 +515,7 @@ async def main():
     await test_rvc_converter_empty_response()
     await test_rvc_streaming_converter_basic()
     await test_rvc_streaming_converter_reconnect()
+    await test_rvc_streaming_converter_buffer_cap_drop_oldest()
     print("\nAll automated verification tests completed successfully!")
 
 if __name__ == "__main__":
