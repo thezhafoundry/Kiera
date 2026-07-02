@@ -39,18 +39,13 @@ class VoiceConversionWorker:
         self._audio_queue: Optional[asyncio.Queue] = None
         self._publish_lock: Optional[asyncio.Lock] = None
 
-        # Pre-buffer: hold back audio until 1s of *converted* audio is ready, then release
-        # it all at once so the lead hears smooth, uninterrupted Kiera voice from the start.
-        # Fail-safe (raw, unconverted) chunks are discarded while filling so a slow/cold RVC
-        # doesn't leak the agent's real voice into the burst — but only for up to
-        # PREBUFFER_TIMEOUT_S, after which we release whatever's queued (even if raw) so the
-        # lead isn't left in dead silence indefinitely if RVC stays down past that point.
-        # 48000 samples/s × 2 bytes × 1.0s = 96000 bytes
-        self._PREBUFFER_BYTES     = 48000 * 2 * 1          # 1 second of 48kHz 16-bit mono
-        self._PREBUFFER_TIMEOUT_S = 4.0                    # max wait for real conversion before giving up
-        self._prebuffer           = bytearray()
-        self._prebuffer_ready     = False   # True once buffer has filled/timed out for the first time
-        self._prebuffer_start_t: Optional[float] = None    # when the current speech session's buffering began
+        # Pre-buffer: hold back audio until 1.5s of converted audio is ready,
+        # then release it all at once so the lead hears smooth, uninterrupted speech.
+        # The RVC pipeline needs ~1.4s anyway, so this delay is imperceptible.
+        # 48000 samples/s × 2 bytes × 1.5s = 144000 bytes
+        self._PREBUFFER_BYTES = 48000 * 2 * 1          # 1 second of 48kHz 16-bit mono
+        self._prebuffer       = bytearray()
+        self._prebuffer_ready = False   # True once buffer has filled for the first time
 
     async def start(self):
         """Starts the worker, connects to the LiveKit room, and publishes the output track."""
@@ -146,7 +141,6 @@ class VoiceConversionWorker:
         # Reset pre-buffer so the next speech session starts fresh
         self._prebuffer.clear()
         self._prebuffer_ready = False
-        self._prebuffer_start_t = None
         print("[Worker] Pre-buffer reset for new speech session.")
 
     async def stop(self):
@@ -265,9 +259,9 @@ class VoiceConversionWorker:
                 age_before = time.time() - chunk_start_t
                 if age_before > MAX_AGE_S:
                     print(f"[Worker] Queue backed up: skipping RVC for stale chunk {seq} (age: {age_before:.1f}s)")
-                    audio, is_converted = self._resample_16k_to_48k(raw_chunk), False
+                    audio = self._resample_16k_to_48k(raw_chunk)
                 else:
-                    audio, is_converted = await self._convert_chunk(chunk_with_carry, raw_chunk, carry_len, chunk_start_t)
+                    audio = await self._convert_chunk(chunk_with_carry, raw_chunk, carry_len, chunk_start_t)
 
             # Re-check age after conversion — discard if too old to be useful
             age_after = time.time() - chunk_start_t
@@ -277,7 +271,7 @@ class VoiceConversionWorker:
 
             # Publish immediately — use lock so frames from parallel chunks don't interleave
             async with publish_seq_lock:
-                await self._publish_audio(audio, is_converted=is_converted)
+                await self._publish_audio(audio)
 
         publisher_task = None   # no longer used; publishing happens directly in convert_and_publish
         carry_over     = b""
@@ -364,9 +358,8 @@ class VoiceConversionWorker:
         samples = np.frombuffer(pcm_16k, dtype=np.int16)
         return np.repeat(samples, 3).tobytes()
 
-    async def _convert_chunk(self, chunk_with_carry: bytes, raw_chunk: bytes, carry_len: int, chunk_start_t: float) -> tuple[bytes, bool]:
-        """Converts one chunk via the voice converter.
-        Returns (48kHz PCM, is_converted) where is_converted=False means fail-safe raw audio."""
+    async def _convert_chunk(self, chunk_with_carry: bytes, raw_chunk: bytes, carry_len: int, chunk_start_t: float) -> bytes:
+        """Converts one chunk via the voice converter. Returns 48kHz PCM ready to publish."""
 
         async def chunk_generator() -> AsyncIterator[bytes]:
             yield chunk_with_carry
@@ -419,44 +412,28 @@ class VoiceConversionWorker:
                     pass
             asyncio.create_task(safe_publish())
 
-        return audio_payload, success
+        return audio_payload
 
-    async def _publish_audio(self, audio_payload: bytes, is_converted: bool = True):
+    async def _publish_audio(self, audio_payload: bytes):
         """Publish 48kHz PCM audio to LiveKit with a pre-buffer for smooth playback.
 
-        The first PREBUFFER_BYTES of *converted* audio are held back. Once the buffer fills,
-        the full buffer is released as a burst and streaming continues normally. Fail-safe
-        (raw, unconverted) chunks are discarded while filling so the lead only ever hears
-        Kiera's voice — never a leaking raw syllable — unless PREBUFFER_TIMEOUT_S elapses
-        with no real conversion, in which case we give up waiting and release whatever's
-        queued (even if raw) so the lead isn't left in dead silence indefinitely.
-        Once streaming has started, fail-safe audio is accepted normally to prevent gaps.
+        The first PREBUFFER_BYTES of audio are held back. Once the buffer fills,
+        the full buffer is released as a burst and streaming continues normally.
+        This hides the RVC cold-start jitter and keeps the lead's audio smooth.
         """
         async with self._publish_lock:
             if not self._prebuffer_ready:
-                if self._prebuffer_start_t is None:
-                    self._prebuffer_start_t = time.time()
-                waited = time.time() - self._prebuffer_start_t
-                timed_out = waited >= self._PREBUFFER_TIMEOUT_S
-
-                if not is_converted and not timed_out:
-                    print(f"[Worker] Pre-buffer: discarding fail-safe chunk ({waited:.1f}s elapsed, waiting for real conversion)")
-                    return
-
-                # Add to the pre-buffer — either real converted audio, or we've waited long
-                # enough that we accept raw audio rather than keep the lead in silence.
+                # Still filling the pre-buffer
                 self._prebuffer.extend(audio_payload)
                 buffered_secs = len(self._prebuffer) / (48000 * 2)
-                print(f"[Worker] Pre-buffering... {buffered_secs:.2f}s / {self._PREBUFFER_BYTES/(48000*2):.1f}s"
-                      + (" [TIMEOUT — accepting fail-safe audio]" if timed_out and not is_converted else ""))
+                print(f"[Worker] Pre-buffering... {buffered_secs:.2f}s / {self._PREBUFFER_BYTES/(48000*2):.1f}s")
 
-                if len(self._prebuffer) >= self._PREBUFFER_BYTES or timed_out:
-                    # Buffer is full (or we've run out of patience) — release everything
+                if len(self._prebuffer) >= self._PREBUFFER_BYTES:
+                    # Buffer is full — release everything and switch to streaming
                     self._prebuffer_ready = True
                     audio_payload = bytes(self._prebuffer)
                     self._prebuffer.clear()
-                    reason = "timeout" if timed_out else "full"
-                    print(f"[Worker] Pre-buffer released ({reason}) — starting playback to lead.")
+                    print("[Worker] Pre-buffer full — starting smooth playback to lead.")
                 else:
                     return  # Still filling, don't publish yet
 
