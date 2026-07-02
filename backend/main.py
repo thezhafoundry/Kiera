@@ -122,6 +122,43 @@ def get_livekit_sip_domain() -> str:
         pass
     return "sip.livekit.cloud"
 
+# Shared logic to poll the RVC endpoint's /health until the Modal GPU reports "ready",
+# used both by the manual /api/warmup endpoint and to block an outbound dial until the
+# voice engine can actually convert audio. Never raises — always returns a status dict.
+async def _wait_for_rvc_ready(max_wait_seconds: float = 360.0, poll_interval: float = 30.0) -> dict:
+    if not RVC_ENDPOINT_URL:
+        return {"status": "skipped", "message": "No RVC endpoint URL configured."}
+
+    import httpx
+    health_url = RVC_ENDPOINT_URL.replace("/convert", "/health").replace("web-convert", "web-health").replace("web_convert", "web_health")
+    print(f"[RVC Warmup] Polling {health_url} (max_wait={max_wait_seconds:.0f}s, interval={poll_interval:.0f}s)")
+
+    elapsed = 0.0
+    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=10.0)) as client:
+        while elapsed < max_wait_seconds:
+            try:
+                resp = await client.get(health_url)
+            except httpx.TimeoutException:
+                elapsed += poll_interval
+                print(f"[RVC Warmup] GPU not ready yet (timeout after {poll_interval:.0f}s). Retrying... ({elapsed:.0f}/{max_wait_seconds:.0f}s elapsed)")
+                continue
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "loading":
+                    elapsed += poll_interval
+                    print(f"[RVC Warmup] GPU booting, model loading... Retrying... ({elapsed:.0f}/{max_wait_seconds:.0f}s elapsed)")
+                    await asyncio.sleep(poll_interval)
+                    continue
+                print(f"[RVC Warmup] SUCCESS: {data}")
+                return {"status": "success", "message": "GPU warmed up successfully.", "rvc_status": data}
+            else:
+                print(f"[RVC Warmup] FAILED: HTTP Status {resp.status_code} - {resp.text}")
+                return {"status": "error", "message": f"RVC endpoint returned status code {resp.status_code}"}
+
+    print(f"[RVC Warmup] TIMEOUT: GPU did not become ready within {max_wait_seconds:.0f}s")
+    return {"status": "error", "message": f"GPU did not become ready within {max_wait_seconds:.0f}s."}
+
 # Shared logic to spawn a converter bot for a room
 async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent_gender: str = "male"):
     if room_name in active_workers:
@@ -323,6 +360,19 @@ async def call_outbound(request: OutboundCallRequest, background_tasks: Backgrou
     except Exception as e:
         _tb.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to start conversion bot: {str(e)}")
+
+    # 1b. Wait for the RVC GPU to actually be ready before ringing the lead. The bot's
+    # own pre-warm ping (fired inside _do_start_bot) starts the cold start, but a cold
+    # T4 can take 60-90s to load the model — far longer than the per-chunk conversion
+    # budget (2s). Without this wait, a call placed right after a cold start runs the
+    # *entire* call in fail-safe (raw, unconverted voice) because every chunk misses
+    # budget before the GPU even finishes loading. Bounded to 90s and fails open (dials
+    # anyway) so a genuinely broken RVC endpoint doesn't block outbound calling outright.
+    if RVC_ENDPOINT_URL:
+        warm_result = await _wait_for_rvc_ready(max_wait_seconds=90.0, poll_interval=5.0)
+        if warm_result.get("status") != "success":
+            print(f"[Server] Dialing {request.phoneNumber} with a cold/unavailable RVC engine "
+                  f"— call may fall back to raw voice: {warm_result.get('message')}")
 
     # 2. LiveKit dials the lead via Twilio Elastic SIP Trunking.
     #    LiveKit → SIP trunk → Twilio → PSTN → lead's phone.
@@ -856,61 +906,7 @@ async def warmup_gpu():
         print("[Server Warmup] FAILED: No RVC_ENDPOINT_URL configured in .env")
         return {"status": "skipped", "message": "No RVC endpoint URL configured."}
 
-    print(f"[Server Warmup] Pinging RVC Endpoint: {RVC_ENDPOINT_URL}")
-    try:
-        import httpx
-        health_url = RVC_ENDPOINT_URL.replace("/convert", "/health").replace("web-convert", "web-health").replace("web_convert", "web_health")
-        print(f"[Server Warmup] Health URL: {health_url}")
-
-        max_wait_seconds = 360   # wait up to 6 minutes for GPU cold start
-        poll_interval    = 30    # retry every 30 seconds
-        elapsed          = 0
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=10.0)) as client:
-            while elapsed < max_wait_seconds:
-                try:
-                    resp = await client.get(health_url)
-                except httpx.TimeoutException:
-                    elapsed += poll_interval
-                    print(f"[Server Warmup] GPU not ready yet (timeout after {poll_interval}s). Retrying... ({elapsed}/{max_wait_seconds}s elapsed)")
-                    await asyncio.sleep(1)   # brief sleep before next attempt
-                    continue
-                if resp.status_code == 200:
-                    data = resp.json()
-                    # GPU booting — model still loading, retry
-                    if data.get("status") == "loading":
-                        elapsed += poll_interval
-                        print(f"[Server Warmup] GPU booting, model loading... Retrying... ({elapsed}/{max_wait_seconds}s elapsed)")
-                        await asyncio.sleep(poll_interval)
-                        continue
-                    # GPU fully ready
-                    print(f"[Server Warmup] SUCCESS: {data}")
-                    return {
-                        "status": "success",
-                        "message": "GPU warmed up successfully.",
-                        "rvc_status": data
-                    }
-                else:
-                    print(f"[Server Warmup] FAILED: HTTP Status {resp.status_code} - {resp.text}")
-                    return {
-                        "status": "error",
-                        "message": f"RVC endpoint returned status code {resp.status_code}"
-                    }
-
-        # Loop exhausted — GPU never became ready in time
-        print(f"[Server Warmup] TIMEOUT: GPU did not become ready within {max_wait_seconds}s")
-        return {
-            "status": "error",
-            "message": f"GPU did not become ready within {max_wait_seconds // 60} minutes. Try again in a moment."
-        }
-    except Exception as e:
-        import traceback
-        print(f"[Server Warmup] FAILED with exception: {repr(e)}")
-        traceback.print_exc()
-        return {
-            "status": "error", 
-            "message": f"Failed to connect to RVC endpoint: {str(e)}"
-        }
+    return await _wait_for_rvc_ready(max_wait_seconds=360.0, poll_interval=30.0)
 
 # --- GPU DEPLOY ENDPOINT ---
 

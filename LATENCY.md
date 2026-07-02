@@ -150,7 +150,32 @@ endpoint directly. Two concrete issues showed up:
   likely under load. Either move the Render service closer to `ap-southeast`, or re-pin the
   Modal function to a US region, so the two aren't fighting each other.
 
-### 4.2 General checklist
+### 4.2 Confirmed production incident: lead heard the agent's raw voice for a whole call
+
+Traced a report of "the lead was getting the agent's original voice, not the trained voice"
+to a specific outbound call at **06:35:41 UTC on 2026-07-02** (Render logs, room
+`outbound_916281686616_1782974101`):
+
+- The bot's pre-warm ping fired at call start, but the bot began publishing audio only ~30s
+  later — nowhere near the ~75s+ cold start measured in §4.1.
+- **Every single chunk for the entire call** logged `Conversion TIMEOUT after ~2000ms →
+  Triggering fail-safe!`, i.e. permanent fallback to raw voice, not just the first chunk or
+  two as the fail-safe is meant to cover.
+- A second bot spawn fired ~2s after the first (same lead number), which likely reset/duplicated
+  the warm-up cycle instead of reusing it.
+
+**Fix applied**: `POST /api/call/outbound` ([backend/main.py](backend/main.py)) now calls the
+new `_wait_for_rvc_ready()` helper — polling `/health` every 5s for up to 90s — **after**
+spawning the bot but **before** creating the SIP participant that rings the lead. The lead's
+phone no longer starts ringing until the RVC engine reports `ready` (or the 90s cap is hit, in
+which case it dials anyway and logs a warning rather than blocking outbound calling outright).
+`/api/warmup` was refactored to call the same helper (unchanged behavior: 30s interval, 6
+minute cap) so the polling logic isn't duplicated between the two call sites.
+
+The duplicate bot-spawn observed in this incident is still open — worth a follow-up look if
+"call twice in quick succession for the same lead" is reproducible.
+
+### 4.3 General checklist
 
 If the bot is always falling back to raw voice (no conversion applied), work through these in
 order:

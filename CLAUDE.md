@@ -8,6 +8,43 @@ and streamed to a lead over the PSTN via Twilio + LiveKit SIP. Conversion is app
 See [README.md](README.md) for account setup and the end-to-end run guide, and
 [LATENCY.md](LATENCY.md) for the latency methodology.
 
+There is also a human-facing knowledge wiki at [wiki/](wiki/WIKI.md) — narrative,
+cross-referenced pages synthesized from project docs (latency, decisions, incidents),
+meant to be browsed (e.g. in Obsidian) or queried directly. It's separate from
+`.agents/` below: `.agents/` is terse operating memory for this agent, `wiki/` is for
+humans and is updated on request (ingest/query/lint), not read automatically per task.
+
+---
+
+## How to Work Efficiently (low context — this is the DEFAULT, no need to be told)
+- The brain is **queried, not loaded**. Never read whole files or the whole `.agents/` tree "to get context."
+- Lookup order for ANY task: (1) the ONE relevant `.agents/` file the task scope points to below, (2) at most 2–3 targeted reads. Full-file reads are the last resort.
+- Pull ONLY the `.agents/` file the task scope points to — never preload all of them.
+- This runs automatically for every task; the user does NOT have to say "use the second brain."
+
+## Agent Routing Instructions
+To prevent context dilution, general invariants and rules are split into modular guides. **Always read these files first based on the scope of your task:**
+
+1.  **Identity, Dev Persona & Code Style Rules**:
+    *   Location: `.agents/context/identity.md`
+    *   Read when: Starting a new session or reviewing coding style, formatting, and response conventions.
+2.  **Invariants, Tech Stack & File Map**:
+    *   Location: `.agents/context/stack-and-rules.md`
+    *   Read when: Touching the audio pipeline (`backend/pipeline.py`), the RVC/Modal integration, Twilio/LiveKit SIP routing, or sample-rate/frame-size contracts.
+3.  **Historical Decisions & Migrations**:
+    *   Location: `.agents/decisions/log.md`
+    *   Read when: Seeking context on why the pipeline was built/changed a certain way, or checking the buffering/latency migration history.
+4.  **Active Roadmap & Technical Debt**:
+    *   Location: `.agents/projects/active-backlog.md`
+    *   Read when: Checking current backlog tasks or known tech debt.
+5.  **Subsystem Notes & Load-Bearing Gotchas**:
+    *   Location: `.agents/context/subsystem-notes.md`
+    *   Read when: Editing pipeline latency/playout, the Modal RVC worker, the Render deployment, or debugging Windows-only degraded-audio behavior — holds the *why* and traps the code can't.
+
+If a non-trivial architecture question can't be answered from the file above, fall back
+to [LATENCY.md](LATENCY.md) (pipeline timing detail) or a targeted `git log`/grep before
+reading whole source files.
+
 ---
 
 ## Project Layout
