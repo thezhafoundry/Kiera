@@ -107,28 +107,51 @@ this from the running server if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set.
 ### Pluggable Interfaces
 1. **Voice Conversion** — subclass `VoiceConverter` in [backend/converters/base.py](backend/converters/base.py)
    and implement `async def convert_stream(self, in_audio: AsyncIterator[bytes]) -> AsyncIterator[bytes]`.
-   - Input is raw **16 kHz** mono 16-bit PCM.
-   - `RVCVoiceConverter` returns **48 kHz** PCM (the published track is 48 kHz). The pipeline
-     slices the converted carry-over at 3× (16→48 kHz) — a converter returning 16 kHz will
-     be mis-sliced, so match the output rate the pipeline expects (48 kHz for RVC-style engines).
+   - Input is raw **16 kHz** mono 16-bit PCM, fed in as 20 ms (640-byte) frames.
+   - `convert_stream` is now typically driven as ONE long-lived duplex generator for the life of a
+     call — `in_audio` is a continuous async iterator, not a single pre-cut phrase — rather than
+     invoked fresh per chunk. Implementations should expect to be iterated indefinitely and torn
+     down via `contextlib.aclosing` (see `pipeline.py`'s `_run_conversion_stream`), not just
+     exhausted after one request/response.
+   - Output must be **48 kHz** PCM (the published track is 48 kHz) — the pipeline no longer
+     resamples on egress, so a converter returning 16 kHz audio will play back at the wrong
+     speed/pitch, not just be mis-sliced.
+   - `RVCStreamingConverter` (`backend/converters/rvc_stream.py`) is what `_do_start_bot` actually
+     selects when `RVC_ENDPOINT_URL` is set: a WebSocket client to the Modal worker's `/ws`
+     endpoint, one persistent duplex connection for the whole call, with bounded reconnect
+     buffering/backoff on WS drop (never raw fallback — see "Audio Pipeline & Streaming" below).
+     `RVCVoiceConverter` (`backend/converters/rvc.py`, one HTTP POST per `convert_stream` call)
+     still exists but is **offline-test-only** now — it is not wired into `_do_start_bot`, only
+     exercised by `backend/test_pipeline.py`.
    - Register the engine in `main.py`'s `_do_start_bot`. Selection is by env: an `RVC_ENDPOINT_URL`
-     picks `RVCVoiceConverter`, otherwise it falls back to `DummyVoiceConverter`.
+     picks `RVCStreamingConverter`, otherwise it falls back to `DummyVoiceConverter`.
 
 2. **Noise Suppression** — subclass `NoiseSuppressor` in [backend/noise/noise_suppressor.py](backend/noise/noise_suppressor.py)
    and implement `def process_frame(self, frame_bytes: bytes) -> bytes`.
    - Expect and return exactly **320 bytes** (10 ms of 16 kHz mono 16-bit PCM).
    - Both built-in suppressors degrade gracefully to passthrough if their native lib is missing.
 
-### Audio Pipeline & Chunking ([backend/pipeline.py](backend/pipeline.py))
-- **Producer**: reads the agent track at 16 kHz, denoises each 10 ms frame, and enqueues it.
-- **VAD chunking**: the consumer does **not** cut on a fixed interval. It uses `webrtcvad`
-  to cut at natural pauses — min chunk 300 ms, cut after 200 ms of silence, hard cap 2500 ms,
-  with a 200 ms carry-over prepended to the next chunk to smooth boundaries. If `webrtcvad`
-  is unavailable it falls back to fixed max-length chunks.
-- **Parallelism**: up to 2 concurrent RVC requests (semaphore); an ordered buffer republishes
-  chunks in sequence. Chunks older than 2 s are discarded to bound latency.
-- **Fail-safe**: each conversion runs inside `asyncio.timeout(budget_seconds)`. On timeout or
-  error, fall back to forwarding the raw denoised chunk (resampled 16→48 kHz) — never drop audio.
+### Audio Pipeline & Streaming ([backend/pipeline.py](backend/pipeline.py))
+- **Producer**: reads the agent track at 16 kHz, denoises each 10 ms (320-byte) frame with the
+  active `NoiseSuppressor`, and enqueues it with an ingress timestamp.
+- **No chunking, no VAD.** `webrtcvad` is not imported or used anywhere in `pipeline.py` anymore —
+  the whole "cut at natural pauses" concept from the old design is gone. `_frame_pairs()` simply
+  pairs two consecutive denoised 10 ms frames into one 20 ms (640-byte) input frame and feeds it
+  continuously into `converter.convert_stream(...)`, which is driven as a single long-lived duplex
+  stream for the life of the worker's active pipeline.
+- **No reordering, no semaphore.** `_run_conversion_stream()` republishes whatever the converter
+  yields, in arrival order — a single ordered stream (WS or local generator) has nothing to
+  reorder, so the old parallel-RVC-request semaphore and ordered reorder/playout-buffer machinery
+  no longer exist (there is no `_run_playout` and no playout queue).
+- **One-shot jitter buffer**: `_run_conversion_stream` holds back the first ~100 ms
+  (`_JITTER_TARGET_BYTES`) of converted 48 kHz audio before publishing, then streams everything
+  after that straight through as it arrives — a small startup smoothing buffer, not a per-session
+  adaptive standing buffer.
+- **Fail-CLOSED, never raw.** There is no raw-audio-fallback path — it was removed structurally,
+  not just avoided. If the converter's backend connection drops or errors, output is **silence**
+  (nothing published) until real converted audio resumes; the lead never hears the agent's
+  original, unconverted voice. See `RVCStreamingConverter` in `backend/converters/rvc_stream.py`
+  for the bounded (5 s) reconnect-buffer + exponential-backoff behavior backing this.
 - **Publishing**: push exact 10 ms frames of 960 bytes (480 samples @ 48 kHz mono). LiveKit's
   `AudioSource.capture_frame()` handles pacing/backpressure. LiveKit resamples inbound tracks,
   so we subscribe at `sample_rate=16000` and avoid manual resampling on ingress.
@@ -137,10 +160,16 @@ this from the running server if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set.
 - **One-time setup**: `POST /api/setup` creates the LiveKit↔Twilio SIP trunks + dispatch rule
   and points the Twilio number's inbound webhook at this server. Run it once after filling env vars.
 - **Outbound**: `POST /api/call/outbound` spawns the bot then dials the lead via
-  `create_sip_participant` on the LiveKit outbound trunk (LiveKit → Twilio → PSTN).
+  `create_sip_participant` on the LiveKit outbound trunk (LiveKit → Twilio → PSTN). **Fail-closed
+  warm gate**: after spawning the bot it `await`s `worker.wait_until_ready(150.0)` before dialing;
+  if the converter's backend isn't ready in time, the bot is stopped and the endpoint returns
+  HTTP 503 instead of ringing the lead — a cold/unready GPU now blocks the call rather than
+  proceeding and leaking anything.
 - **Inbound**: Twilio hits `/api/call/inbound` → caller is held (TwiML) while `/api/call/wait`
-  polls until the agent accepts (`/api/call/accept`), then bridges to LiveKit SIP. This avoids
-  bridging before LiveKit is ready.
+  polls until the agent accepts (`/api/call/accept`) **and** the bot's `worker.is_ready` is true,
+  then bridges to LiveKit SIP. `is_ready` is a cheap cached property backed by a one-shot
+  background readiness probe started when the bot spawns (not a fresh network probe on every
+  ~3s poll). This avoids bridging before LiveKit — or the voice engine — is ready.
 - **Bot identity/subscription**: the bot joins as `voice-converter-bot-<roomName>` and subscribes
   to participants whose identity contains `agent`.
 - **Health**: `GET /api/health` reports live integration status; `POST /api/warmup` pings the
@@ -160,5 +189,8 @@ Config is read from `.env` (see [.env.example](.env.example)): `LIVEKIT_*`, `RVC
 ### Windows Gotchas
 - `webrtc-noise-gain` has no prebuilt Windows wheel and needs MSVC build tools. If it won't
   build, the import fallback bypasses noise suppression (logs a warning) — tests still pass.
-- `webrtcvad` is likewise optional; without it the pipeline uses fixed-length chunking.
+- `webrtcvad` is no longer imported or used anywhere in `backend/pipeline.py` — the streaming
+  rebuild deleted VAD-based chunking entirely, so "falls back to fixed-length chunking without it"
+  no longer applies to anything. It's now effectively an unused dependency (still Linux-only in
+  `backend/requirements.txt`); nothing in this task removes it, but it's worth a look.
 - Use `py`/`.venv\Scripts\...` if bare `python` isn't on PATH.

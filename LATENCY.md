@@ -10,74 +10,144 @@ troubleshooting steps for Modal GPU connection/cold-start issues.
 > starting" report — see §4 for the confirmed root causes (redeploys killing in-flight calls,
 > and cold-start taking much longer than assumed).
 
+> **2026-07-02 streaming-rebuild update:** `backend/pipeline.py`, the Modal worker
+> (`modal_deploy/worker.py` + new `modal_deploy/streaming.py`), and the converters
+> (`backend/converters/rvc_stream.py`) were rewritten from the VAD-chunked, HTTP-per-request
+> design this document originally described to a persistent-WebSocket streaming design — see
+> [CLAUDE.md](CLAUDE.md) and `.agents/decisions/log.md` for the full rationale. **§1's budget
+> table below has been rewritten to describe the new pipeline's stages, but the numbers in it
+> are design targets from the rebuild plan, not live measurements** — there is no deployed
+> Modal `/ws` worker or live call available in this environment to re-measure against (that
+> deploy is a separate, still-pending task). §2's log-reading guide has been rewritten to match
+> the actual log lines/messages in the current code. §3 (the spectral-tone test method) is
+> unchanged but needs a fresh live pass once a `/ws` deployment exists. §4's pre-rebuild
+> investigation (cold-start timing, the raw-voice incident) is preserved as historical record,
+> with notes added where the fail-closed rebuild changes the failure mode going forward. §5
+> (the old ordered-playout-queue design) is retitled and kept as historical record — that
+> machinery no longer exists in the code.
+
 ---
 
-## 1. Latency Budget Breakdown
+## 1. Latency Budget Breakdown (design targets — not yet re-measured, see banner)
 
 In a real-time voice call, total mouth-to-ear latency is composed of multiple steps in the
-media transport and conversion pipeline:
+media transport and conversion pipeline. The stages below reflect the **new** streaming
+pipeline (`backend/pipeline.py` + `modal_deploy/streaming.py`'s `/ws` engine); there is no more
+VAD chunking or standing playout buffer to budget for.
 
-$$\text{Mouth-to-Ear Latency} = T_{\text{ingress}} + T_{\text{noise\_suppression}} + T_{\text{VAD\_chunking}} + T_{\text{RVC\_conversion}} + T_{\text{egress}}$$
+$$\text{Mouth-to-Ear Latency} = T_{\text{ingress}} + T_{\text{noise\_suppression}} + T_{\text{frame\_batch}} + T_{\text{block\_accumulate}} + T_{\text{inference}} + T_{\text{SOLA\_crossfade}} + T_{\text{jitter\_buffer}} + T_{\text{egress}}$$
 
-| Pipeline Step | Duration | Description |
+| Pipeline Step | Target Duration | Description |
 | :--- | :--- | :--- |
-| **Ingress Network** | 20 - 45 ms | Browser capture, OPUS encoding, WebRTC transport to LiveKit, and forwarding to the Python worker at 16 kHz mono. |
-| **Noise Suppression** | 0.2 - 0.5 ms | `WebRTCNoiseSuppressor` processing of 10ms/320-byte frames. Sub-millisecond on CPU. |
-| **VAD Chunk Collection** | 450 - 700 ms | `_conversion_consumer` collects frames until a natural pause (150ms of silence, `webrtcvad`) or the 700ms hard cap, whichever comes first. Minimum raised from 250ms to 450ms (see §5) so RVC's fixed per-request overhead is amortized over more audio instead of falling behind during continuous speech. A 100ms carry-over is prepended to the next chunk to smooth boundaries. |
-| **RVC Conversion (warm GPU)** | ~150 - 700 ms | HTTP round trip to the Modal T4 endpoint (`RVC_ENDPOINT_URL`) — see [modal_deploy/worker.py](modal_deploy/worker.py). `pm` pitch extraction (not `rmvpe`) saves ~300ms/chunk. Bounded by a 2000ms budget (`asyncio.timeout`); on timeout it fails over to the raw denoised chunk resampled 16→48kHz instead of dropping audio. |
-| **RVC Conversion (cold GPU)** | 30 - 90+ s (first chunk only) | Modal spins up a new T4 container, loads the RVC model + HuBERT + index (`RVCEngine.startup`), and runs one silent warm-up inference before serving real requests. This only happens when no container has served a request in the last 120s (`scaledown_window=120`). **Measured live on 2026-07-02**: a `/health` ping against an idle container got no response at all for ~75s before the container came up as `{"status":"ready","cuda_available":true,"cuda_device":"Tesla T4"}` — noticeably longer than the ~8-30s the code comments assume. The 2000ms conversion budget means a cold GPU **always** fails over to raw voice for the first several chunks — see §4. |
-| **Standing Playout Buffer** | 400 - 1500 ms, adaptive (once per speech session) | `_run_playout` holds back playback until an adaptive target of *contiguous* converted audio is buffered (default 500ms; re-tuned per session from a rolling P95 of RVC latency — see §5). Unlike the old one-shot pre-buffer, this refills every session, not just the first one. |
-| **Egress Network** | 20 - 40 ms | Publishing 960-byte (10ms @ 48kHz) frames to LiveKit, then WebRTC + browser jitter-buffer playout to the lead. |
-| **Steady-state Total (warm GPU)** | **~450 - 1400 ms** | Per-chunk added latency once the GPU is warm and the standing buffer is filled. |
-| **First-chunk Total (cold GPU)** | **30 - 90+ s of raw voice, then fail-over recovers** | The lead hears the agent's real (unconverted) voice for the first several chunks while the GPU boots; conversion kicks in once the container is warm. |
+| **Ingress Network** | 20 - 45 ms | Browser capture, OPUS encoding, WebRTC transport to LiveKit, and forwarding to the Python worker at 16 kHz mono. Unchanged by this rebuild (frontend/LiveKit transport untouched) — carried forward from the pre-rebuild estimate. |
+| **Noise Suppression** | 0.2 - 0.5 ms | `WebRTCNoiseSuppressor` processing of 10ms/320-byte frames. Sub-millisecond on CPU. Unchanged by this rebuild. |
+| **Input Frame Batching** | up to 20 ms | `_frame_pairs()` in `backend/pipeline.py` pairs two consecutive 10ms denoised frames into one 20ms (640-byte) input frame before it's sent into `convert_stream` — the plan's "Input frame to WS" parameter. |
+| **Inference Block Accumulation** | up to 320 ms (design target) | `modal_deploy/streaming.py::BlockAccumulator` only pops a block once 320ms of *new* audio has arrived (`BLOCK_MS`/`BLOCK_SAMPLES_IN`); a 160ms left-context window (`CONTEXT_MS`) is prepended for inference quality but doesn't itself add wait time. Per the rebuild plan's parameter table — see `docs/plans/2026-07-02-streaming-rebuild-plan.md`. |
+| **GPU Inference (warm)** | target < ~250 ms per 320ms block | `RVCEngine.run_conversion` inside the `/ws` handler (`modal_deploy/worker.py`), same underlying inference path as the old `/convert` HTTP endpoint (`pm` pitch extraction, not `rmvpe`). The plan's verification checklist target is `infer_ms` per 320ms block < ~250ms warm — **not yet measured live** against a deployed `/ws` worker. |
+| **GPU Inference (cold)** | 30 - 90+ s (whole call blocked, not just first block) | Same Modal cold-start as before — see the historical ~75s measurement in §4.1 — but the *consequence* changed: the fail-closed warm gate (`worker.wait_until_ready`, see CLAUDE.md "Telephony & SIP") now blocks the call from starting at all until the GPU is ready, instead of letting the first several chunks through as raw voice. |
+| **SOLA Crossfade** | 80 ms held back per block | `modal_deploy/streaming.py::sola_crossfade` (`SOLA_CROSSFADE_SAMPLES`, 3840 samples @ 48kHz) holds back the last 80ms of each converted block as `pending_tail`, overlap-added onto the next block, to avoid audible seams between blocks. Per the plan's parameter table. |
+| **One-shot Jitter Buffer** | 100 ms (once, at stream start) | `VoiceConversionWorker._JITTER_TARGET_BYTES` in `backend/pipeline.py` — holds the first ~100ms of converted 48kHz audio before publishing starts, then streams straight through. Unlike the old adaptive standing playout buffer, this is a single fixed fill, not re-triggered per speech session. |
+| **Egress Network** | 20 - 40 ms | Publishing 960-byte (10ms @ 48kHz) frames to LiveKit, then WebRTC + browser jitter-buffer playout to the lead. Unchanged by this rebuild. |
+| **Steady-state Total** | **~400 - 550 ms (design target)** | Explicit target from the rebuild plan ("Target: ~400-550 ms mouth-to-ear, converted from the first word"). The plan's separate live-verification checklist gives a slightly wider acceptance range, "mouth-to-ear latency ≈ 400-600 ms". Both are **plan text, not measurements** — no live run has produced a number yet. |
+| **Cold-GPU Total** | **Call blocked (503 outbound / held inbound) until ready, no audio published** | Replaces the old "30-90+s of raw voice, then fail-over recovers" row — there is no raw-voice period anymore; see the Inference (cold) row above and §4.2. |
 
 Region note: the Modal function is pinned to `region="ap-southeast"` (Singapore), intended to
-sit next to Render/Twilio infrastructure and avoid a transpacific round trip on every chunk —
-but see §4.1, the currently deployed Render service is actually in Oregon, so this pin may be
-working against itself right now.
+sit next to Render/Twilio infrastructure and avoid a transpacific round trip on every audio
+block — unchanged by this rebuild. But see §4.1: the currently deployed Render service is
+actually in Oregon, and moving it to Singapore is a separate, still-pending task (not done here)
+— so this pin may still be working against itself until that migration lands.
 
 ---
 
 ## 2. Reading Live Latency Logs
 
-Unlike a fixed pipeline, per-chunk latency varies with GPU warm/cold state and chunk length,
-so treat the numbers below as **how to read the logs**, not as fixed benchmarks. Run your own
-pass (§3) after any pipeline or model change and capture fresh numbers.
+Per-block latency varies with GPU warm/cold state and load, so treat the log lines below as
+**how to read the logs**, not as fixed benchmarks. Run your own pass (§3) after any pipeline or
+model change and capture fresh numbers — none of the numbers below are live measurements.
 
-Worker-side log lines (`backend/pipeline.py`) to watch during a call:
+These are the actual log lines/messages in the current streaming pipeline, not the old
+chunk/playout-buffer lines (which no longer exist in the code).
+
+Worker-side (`backend/pipeline.py`) log lines to watch during a call:
 
 ```text
-[Worker] VAD pipeline active. min=450ms silence_cut=150ms max=700ms carry-over=100ms max_age=1.0s max_concurrent_rvc=2
-[Worker] Dispatching chunk 0: 480ms (8320 bytes incl. carry-over)
-[RVC Client] Server processing time: 612.4 ms
-[Latency] 891ms total (conversion: 640ms)
-[Worker] Adaptive playout buffer target: 500ms (from 0 recent RVC latency samples)
-[Worker] Playout buffer full (0.52s) — starting playback.
+[Worker] Connecting to room: wss://...
+[Worker] Connected. Identity: voice-converter-bot-<roomName>
+[Worker] Subscribed to agent track TR_xxx from participant agent-1
+[Worker] Published converted-audio track to the room.
+[Worker] Started reading remote audio stream @ 16kHz mono
+[Worker Error in conversion stream] <exception text>
+[Worker] Readiness probe failed: <exception text>
 ```
 
-- `[Latency] {X}ms total (conversion: {Y}ms)` — `X` is the full added latency for that chunk
-  (from first frame captured to publish), `Y` is just the RVC HTTP round trip. `X - Y` is
-  chunk-collection + noise-suppression + queueing overhead.
-- `[Worker] Fail-safe fallback (latency: {X}ms)` — the RVC call missed its 2000ms budget (or
-  errored) and the raw denoised chunk was forwarded instead. Frequent fail-safes usually mean
-  the GPU is cold or overloaded — see §4.
-- `[Worker] Queue backed up: skipping RVC for stale chunk N` — the input queue is more than
-  1s behind; that chunk skips RVC entirely to keep the call from drifting further behind.
-- `[Worker] Adaptive playout buffer target: {X}ms (from {N} recent RVC latency samples)` —
-  logged whenever the standing buffer target is (re)computed (start of a session); grows/shrinks
-  with the P95 of the last 20 RVC round trips (400-1500ms range).
-- `[Worker] Playout buffer full ({X}s) — starting playback.` — the standing buffer reached its
-  target and `_run_playout` began draining chunks in order.
-- `[Worker] Playout: chunk N not ready after {X}ms — skipping to avoid stalling the call.` — the
-  next chunk in sequence didn't resolve within the 600ms reorder window, so playback skipped
-  past it rather than freezing the call waiting on one slow chunk. Frequent occurrences of this
-  usually mean the same underlying problem as fail-safes: the GPU is cold or overloaded.
-- The frontend also receives a `pipeline_latency_ms` / `is_fallback` data-channel message per
-  chunk (see `_convert_chunk`), which the agent dashboard can surface live.
+- `[Worker] Subscribed to agent track ...` — confirms the pipeline started reading the agent's
+  mic track; if this never appears, no audio is flowing into the converter at all (check the
+  agent participant's identity contains `"agent"`, per `on_track_subscribed`).
+- `[Worker Error in conversion stream] ...` / a traceback — the conversion stream task hit an
+  unhandled exception (not a normal reconnect, which is handled silently inside
+  `RVCStreamingConverter` — see below). Output is silence until this task is retried/reset.
+- `[Worker] Readiness probe failed: ...` — the one-shot `start_readiness_probe()` background
+  task raised; `is_ready`/`wait_until_ready` will report not-ready. Check the exception text for
+  the underlying cause (usually a WS connect failure to the converter's backend).
+- There is no more `[Latency] {X}ms total (conversion: {Y}ms)` per-chunk line, no fail-safe
+  fallback log, no "queue backed up" log, and no adaptive-playout-buffer logs — that entire
+  logging surface was deleted along with the machinery it described.
+
+`RVCStreamingConverter` (`backend/converters/rvc_stream.py`) logs via the standard `logging`
+module (logger name `backend.converters.rvc_stream`), not `print`, so make sure your logging
+config surfaces `WARNING`-level output to see these:
+
+```text
+[RVCStreamingConverter] WS connection lost/failed: <exception text>
+[RVCStreamingConverter] reconnect buffer full (5s cap) — dropped oldest input frame (1280 bytes)
+[RVCStreamingConverter] WS send failed — requeuing frame, will reconnect
+[RVCStreamingConverter] server error: <message>
+[RVCStreamingConverter] wait_ready failed: <exception text>
+```
+
+- `WS connection lost/failed` — the persistent session's socket dropped; `_connection_loop`
+  will retry with exponential backoff (0.5s → 5s cap) while incoming audio buffers (bounded to
+  5s, oldest dropped first) — the lead hears silence for this duration, never raw voice.
+- `reconnect buffer full ... dropped oldest input frame` — the outage lasted long enough that
+  the 5s input buffer filled and started dropping the oldest buffered audio; that audio is lost
+  (never converted), but nothing raw is ever leaked to the lead.
+- `server error: <message>` — the server sent `{"type":"error",...}` for one inference block
+  (see the worker-side messages below); that block emits no audio and the session stays open.
+
+Server-side (`modal_deploy/worker.py`'s `/ws` handler) sends these JSON messages over the
+socket, which the client logs/acts on:
+
+```text
+{"type": "ready"}                                  # handshake success, session accepted
+{"type": "busy"}                                   # a session is already active (1-concurrent MVP)
+{"type": "error", "message": "..."}                 # engine-not-ready at handshake, or one block's inference failed
+{"type": "stats", "infer_ms": 210.4, "block_ms": 320}   # per-block timing, after every processed block (voiced or silence-bypassed)
+{"type": "pong"}                                    # keepalive reply to a client "ping"
+```
+
+- `{"type": "stats", "infer_ms":.., "block_ms":..}` is the latency source of truth on the
+  client: `VoiceConversionWorker._on_converter_stats` sums `infer_ms + block_ms` into
+  `pipeline_latency_ms`, published to the frontend over the room data channel (same
+  `pipeline_latency_ms` / `is_fallback` JSON shape the dashboard has always parsed). Note
+  `is_fallback` no longer means "raw audio was sent" (that path is gone) — it now doubles as a
+  "HOLDING" indicator: `VoiceConversionWorker._is_holding` flips true if no converted chunk has
+  arrived for 750ms (`_HOLD_TIMEOUT_S`), e.g. mid-reconnect, and flips false again once real
+  audio resumes.
+- `RVCEngine.run_conversion` (shared by both `/convert` and the `/ws` handler, unchanged by this
+  rebuild) still prints its own per-call timing breakdown to the Modal container logs:
+  `[Timing] file-write: ...ms | pitch=... index_rate=...`, `[Timing] vc_single: ...ms | <info>`,
+  `[Timing] total run_conversion: ...ms → N bytes` — useful for isolating GPU inference time from
+  the block-accumulation/network overhead around it.
 
 ---
 
 ## 3. How to Run the Mouth-to-Ear Latency Test
+
+> **Note (2026-07-02 streaming rebuild):** this method itself is unchanged — the frontend/browser
+> test tooling wasn't touched by the rebuild — but every number in §1 is a design target, not a
+> live result. Re-run this test end-to-end against a real `/ws` deployment (once that's deployed
+> — a separate, still-pending task) and replace §1's target numbers with what you actually
+> measure before trusting them for real capacity/SLA planning.
 
 The PoC includes a built-in, automated spectral tone latency analyzer that bypasses acoustic
 noise and measures delay digitally in the browser.
@@ -87,8 +157,10 @@ noise and measures delay digitally in the browser.
    and `GET /api/health` reports it — otherwise the bot silently falls back to
    `DummyVoiceConverter` and you'll measure the wrong pipeline.
 2. Hit `POST /api/warmup` (or wait for the automatic pre-warm ping fired on bot start) so the
-   Modal T4 is warm **before** you measure — see §4. A cold-start run will only show you the
-   fail-safe path, not real RVC latency.
+   Modal T4 is warm **before** you measure — see §4. With the fail-closed warm gate, a
+   still-cold GPU won't give you a bad measurement to sanity-check — it'll just block the call
+   (outbound 503, or inbound stuck on hold), so there's nothing to measure until the engine
+   reports ready.
 3. Open two separate browser tabs (or use two devices to prevent speaker-to-mic feedback loop).
 4. Click **Spawn Bot** in the Room Setup panel.
 5. On Tab 1 (or Device 1), click **Join as Agent**.
@@ -145,10 +217,14 @@ endpoint directly. Two concrete issues showed up:
   `region="ap-southeast"` (Singapore, per the comment in
   [modal_deploy/worker.py](modal_deploy/worker.py)) on the premise that Render/Twilio also run
   in that region — but the deployed Render service is currently in **Oregon** (`us-west`), not
-  Singapore. If that's still the case, every RVC call pays a transpacific round trip on top of
-  inference time, eating into the 2000ms budget and making timeouts (→ fail-safe fallback) more
-  likely under load. Either move the Render service closer to `ap-southeast`, or re-pin the
-  Modal function to a US region, so the two aren't fighting each other.
+  Singapore. If that's still the case, every audio block on the persistent `/ws` stream pays a
+  transpacific round trip on top of inference, eating into the per-320ms-block real-time budget
+  and making it harder to keep the stream's real-time factor under 1 (i.e. converting audio
+  faster than it's spoken) under load — the streaming rebuild does not remove this cost, it just
+  changed what a per-request timeout/fallback used to look like (there is no more per-chunk
+  budget/fallback at all — see §4.2/§4.3). Moving Render to `ap-southeast` is planned as a
+  separate, still-pending task (not done as part of this rebuild); until then, this pin may still
+  be working against itself.
 
 ### 4.2 Confirmed production incident: lead heard the agent's raw voice for a whole call
 
@@ -175,14 +251,29 @@ minute cap) so the polling logic isn't duplicated between the two call sites.
 The duplicate bot-spawn observed in this incident is still open — worth a follow-up look if
 "call twice in quick succession for the same lead" is reproducible.
 
+> **2026-07-02 streaming-rebuild note:** this incident is preserved here as historical record of
+> what happened under the **old** fail-safe/fail-open design. The streaming rebuild is the
+> structural fix for this exact class of incident: the raw-audio-fallback path
+> (`_convert_chunk`'s timeout → raw denoised chunk) was deleted from the code, not just avoided,
+> and the pre-dial/pre-bridge warm gate is now fail-**closed** (`worker.wait_until_ready` /
+> `is_ready` — see §4.3 point 6 and CLAUDE.md "Telephony & SIP"). A stuck-unready GPU can no
+> longer produce "lead hears raw voice for the whole call" — the equivalent failure now is
+> "outbound dial returns 503" or "inbound caller stays on hold music," which is an availability
+> problem, not a voice-leak problem. This has not been exercised against a live deployed `/ws`
+> worker yet (see the top-of-document banner), so treat "can no longer recur" as a structural
+> claim about the code, not yet a field-verified one.
+
 ### 4.3 General checklist
 
-If the bot is always falling back to raw voice (no conversion applied), work through these in
-order:
+If outbound calls are returning 503 ("Voice engine not ready"), or an inbound caller is stuck on
+hold music past a normal cold-start window, or a live call is publishing nothing but silence,
+work through these in order:
 
 1. **Is `RVC_ENDPOINT_URL` actually set?** Check server startup logs or `GET /api/health` →
    `rvc.endpoint`. If it prints "not configured (using dummy converter)", the bot never talks
-   to Modal at all — `.env` is missing the value or the deployed URL changed.
+   to Modal at all — `.env` is missing the value or the deployed URL changed. (With no
+   `RVC_ENDPOINT_URL`, the bot uses `DummyVoiceConverter`, which is always "ready" — the warm
+   gate/503 behavior below only applies when an RVC endpoint is configured.)
 2. **Is the Modal app deployed?** `modal deploy modal_deploy/worker.py` (locally, or via
    `POST /api/deploy` if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set in the server env —
    check the response for `MODAL_TOKEN_ID or MODAL_TOKEN_SECRET ... are missing` if it fails
@@ -198,10 +289,19 @@ order:
    found.")` if `/root/rvc-models/logs/mi-test/*.index` is empty on the `rvc-models` volume —
    this looks like a hang/failure from the caller's side but is actually a missing-model error
    visible in the Modal container logs (`modal app logs rvc-worker`).
-6. **Budget is too tight for a cold start, by design.** `budget_ms=2000.0` in `_do_start_bot`
-   means the pipeline will *always* fail over to raw voice while a cold T4 boots (30-90+s) —
-   this is not a bug, it's the fail-safe working as intended so the lead isn't left in silence.
-   Real conversion resumes automatically once the container reports `ready`.
+6. **A cold GPU now blocks the call, by design — it does not degrade to raw voice.** The old
+   per-chunk `budget_ms=2000.0`/raw-fallback design is gone entirely (see the banner and §4.2).
+   Instead: outbound (`POST /api/call/outbound`) `await`s `worker.wait_until_ready(150.0)` after
+   spawning the bot and returns HTTP 503 without dialing the lead if the converter's backend
+   isn't ready in time; inbound (`POST /api/call/wait`) only bridges to LiveKit SIP once
+   `worker.is_ready` is true, otherwise it keeps returning hold-music TwiML and re-polling. This
+   is the fail-safe working as intended — a cold/unready GPU produces a bounded wait or a clean
+   503, never a period of the lead hearing the agent's real voice. Note `wait_until_ready` for
+   `RVCStreamingConverter` opens a short-lived **`/ws` probe connection** (not a `/health` HTTP
+   check) that expects `{"type":"ready"}` — if the server is already serving a real call (the
+   1-concurrent-session MVP), that probe gets `{"type":"busy"}` and is treated as not-ready, so
+   "warm gate keeps failing" can also mean "a session is already active," not just "GPU is cold."
+   Real conversion resumes automatically once the container reports ready and a session is free.
 7. **Confirm GPU visibility inside the container**, not just that the container started: the
    `/health` response includes `cuda_available` and `cuda_device` — if `cuda_available` is
    `false` on a `gpu="T4"` function, that's a Modal-side scheduling/image issue, not an
@@ -214,7 +314,14 @@ order:
 
 ---
 
-## 5. Ordered Playout Queue (2026-07-02)
+## 5. (Historical, pre-streaming-rebuild) Ordered Playout Queue
+
+> **Superseded 2026-07-02 by the streaming rebuild.** Everything in this section — VAD chunking,
+> `_conversion_consumer`, `_run_playout`, the adaptive standing playout buffer, the reorder-wait
+> window — was deleted from `backend/pipeline.py`, not just changed. It's kept here as historical
+> record of the design that preceded the current persistent-WebSocket streaming pipeline
+> (described in §1/§2 above and `.agents/decisions/log.md`). Do not use anything below as current
+> behavior.
 
 The original pipeline had a one-shot pre-buffer: hold back the first 1s of converted audio,
 release it as a burst, then publish every subsequent chunk directly to LiveKit the moment its
