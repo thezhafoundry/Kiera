@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from livekit import api
-from .converters.rvc import RVCVoiceConverter
+from .converters.rvc_stream import RVCStreamingConverter
 from .converters.dummy import DummyVoiceConverter
 from .noise.noise_suppressor import WebRTCNoiseSuppressor
 from .pipeline import VoiceConversionWorker
@@ -186,12 +186,11 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
     print(f"[Server] Agent gender: {agent_gender} → pitch_shift={pitch_shift}")
 
     if RVC_ENDPOINT_URL:
-        print(f"[Server] Spawning RVC Voice Changer (Endpoint: {RVC_ENDPOINT_URL})")
-        converter = RVCVoiceConverter(
+        print(f"[Server] Spawning RVC Streaming Voice Changer (Endpoint: {RVC_ENDPOINT_URL})")
+        converter = RVCStreamingConverter(
             endpoint_url=RVC_ENDPOINT_URL,
             api_key=RVC_API_KEY,
             pitch_shift=pitch_shift,
-            budget_ms=2000.0,
         )
     else:
         print("[Server] No RVC endpoint config found. Spawning Dummy Pitch Modulation Engine.")
@@ -200,31 +199,21 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
     # Initialize noise suppression (WebRTC)
     suppressor = WebRTCNoiseSuppressor(ns_level=3)
 
-    # Set chunk size and budget based on converter type.
-    #   chunk_ms  → hard cap on how long the pipeline collects speech before sending a
-    #               chunk to RVC (the VAD cuts earlier at natural pauses). Smaller = lower latency.
-    #   budget_ms → max time to wait for a conversion before failing over to the raw
-    #               denoised voice. A COLD GPU cannot beat this, so keep it small: the lead
-    #               hears the agent's real (unconverted) voice promptly instead of 8-10s of lag.
-    #               Warm T4 inference on a ~700ms chunk finishes well within 2s.
-    is_rvc = isinstance(converter, RVCVoiceConverter)
-    if is_rvc:
-        chunk_ms = 700
-        budget_ms = 2000.0
-    else:
-        chunk_ms = 300
-        budget_ms = 300.0
-
     worker = VoiceConversionWorker(
         room_url=LIVEKIT_URL,
         token=bot_token.to_jwt(),
         converter=converter,
         suppressor=suppressor,
-        chunk_duration_ms=chunk_ms,
-        budget_ms=budget_ms,
     )
-    
+
     active_workers[room_name] = worker
+
+    # Fail-closed warm gate (Task 4): kick off a single background readiness probe
+    # for the life of this worker. Twilio polls /api/call/wait every ~3s while a
+    # caller is on hold, so worker.is_ready must be a cheap property read — not a
+    # fresh network probe per poll. This background task calls the (potentially
+    # slow) wait_until_ready() exactly once and caches the result.
+    worker.start_readiness_probe(150.0)
 
     # Start bot in background
     async def run_worker_task():
@@ -361,18 +350,23 @@ async def call_outbound(request: OutboundCallRequest, background_tasks: Backgrou
         _tb.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to start conversion bot: {str(e)}")
 
-    # 1b. Wait for the RVC GPU to actually be ready before ringing the lead. The bot's
-    # own pre-warm ping (fired inside _do_start_bot) starts the cold start, but a cold
-    # T4 can take 60-90s to load the model — far longer than the per-chunk conversion
-    # budget (2s). Without this wait, a call placed right after a cold start runs the
-    # *entire* call in fail-safe (raw, unconverted voice) because every chunk misses
-    # budget before the GPU even finishes loading. Bounded to 90s and fails open (dials
-    # anyway) so a genuinely broken RVC endpoint doesn't block outbound calling outright.
-    if RVC_ENDPOINT_URL:
-        warm_result = await _wait_for_rvc_ready(max_wait_seconds=90.0, poll_interval=5.0)
-        if warm_result.get("status") != "success":
-            print(f"[Server] Dialing {request.phoneNumber} with a cold/unavailable RVC engine "
-                  f"— call may fall back to raw voice: {warm_result.get('message')}")
+    # 1b. Fail-closed warm gate: block until the converter's backend session can
+    # actually accept audio before ringing the lead. The bot's own pre-warm ping
+    # (fired inside _do_start_bot) starts the cold start, but a cold T4 can take
+    # 60-90s to load the model. Unlike the old fail-open wait, we do NOT dial on
+    # failure — publishing converted audio to a lead requires a ready GPU session
+    # (the pipeline never falls back to raw voice; see pipeline.py), so an unready
+    # engine here must abort the call, not proceed with silence.
+    worker = active_workers.get(room_name)
+    if worker:
+        ok = await worker.wait_until_ready(150.0)
+        if not ok:
+            await worker.stop()
+            active_workers.pop(room_name, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Voice engine not ready — GPU still warming. Try again shortly.",
+            )
 
     # 2. LiveKit dials the lead via Twilio Elastic SIP Trunking.
     #    LiveKit → SIP trunk → Twilio → PSTN → lead's phone.
@@ -540,8 +534,12 @@ async def call_wait(
     print(f"[Twilio Wait] Polling for callSid={sid} room={room_name} TwilioStatus={CallStatus}")
 
     call_info = active_calls.get(room_name)
-    if call_info and call_info.get("status") == "accepted":
-        # Agent has accepted — bridge to LiveKit SIP
+    worker = active_workers.get(room_name)
+    if call_info and call_info.get("status") == "accepted" and worker and worker.is_ready:
+        # Agent has accepted AND the voice engine is confirmed ready — bridge to
+        # LiveKit SIP. Fail-closed: if the worker isn't ready yet, this falls
+        # through to the hold-TwiML branch below and re-polls in 3s rather than
+        # bridging a call that would only publish silence (never raw audio).
         sip_domain = get_livekit_sip_domain()
         status_callback = f"{SERVER_URL.rstrip('/') if SERVER_URL else ''}/api/call/status-event"
         print(f"[Twilio Wait] Agent accepted! Bridging to LiveKit SIP: {room_name}@{sip_domain}")
@@ -560,7 +558,8 @@ async def call_wait(
 <Response><Hangup/></Response>""", media_type="application/xml")
 
     else:
-        # Still ringing — play hold and re-poll in 3 seconds
+        # Still ringing, or accepted but the voice engine isn't ready yet —
+        # play hold and re-poll in 3 seconds
         wait_url = f"{SERVER_URL.rstrip('/') if SERVER_URL else ''}/api/call/wait?callSid={sid}"
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>

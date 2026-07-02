@@ -67,6 +67,12 @@ class VoiceConversionWorker:
         self._conversion_task: Optional[asyncio.Task] = None
         self._audio_queue: Optional[asyncio.Queue] = None
 
+        # Fail-closed warm-gate cache (Task 4): background probe result, cheap to
+        # read on every poll (e.g. /api/call/wait every ~3s) unlike wait_until_ready
+        # itself, which opens a real probe connection to the converter's backend.
+        self._ready: bool = False
+        self._readiness_task: Optional[asyncio.Task] = None
+
         # Data-channel latency/fallback metric state (frontend/app.js reads
         # {"pipeline_latency_ms":.., "is_fallback":..} unchanged — see
         # _publish_latency_metric).
@@ -201,12 +207,47 @@ class VoiceConversionWorker:
                 pass
             self._conversion_task = None
 
+        if self._readiness_task:
+            self._readiness_task.cancel()
+            try:
+                await self._readiness_task
+            except asyncio.CancelledError:
+                pass
+            self._readiness_task = None
+
         if hasattr(self.converter, 'close'):
             await self.converter.close()
 
         if self.room.isconnected():
             await self.room.disconnect()
             print("[Worker] Disconnected from room.")
+
+    @property
+    def is_ready(self) -> bool:
+        """Cheap, synchronous readiness read for high-frequency callers (e.g.
+        Twilio polling /api/call/wait every ~3s). Reflects the result of the
+        one-shot background probe started by start_readiness_probe(); False
+        until that probe resolves True."""
+        return self._ready
+
+    def start_readiness_probe(self, timeout: float):
+        """Kicks off a single background task that calls wait_until_ready() once
+        and caches the result in self._ready for the life of this worker. Must
+        be called at most once per worker (called from _do_start_bot right after
+        construction). Cancelled alongside _conversion_task in stop()."""
+        if self._readiness_task is not None:
+            return
+
+        async def _probe():
+            try:
+                self._ready = await self.wait_until_ready(timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[Worker] Readiness probe failed: {e}")
+                self._ready = False
+
+        self._readiness_task = asyncio.create_task(_probe())
 
     async def wait_until_ready(self, timeout: float) -> bool:
         """Fail-closed warm-gate probe (used by the caller before dialing/bridging
