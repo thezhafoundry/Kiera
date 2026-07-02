@@ -123,10 +123,27 @@ async function startShift() {
 
     warmupBtn.disabled = true;
     gpuIndicator.className = 'status-indicator warming';
-    gpuVal.innerText = 'Warming up...';
+    gpuVal.innerText = 'Starting GPU...';
+
+    // Animate status while waiting (GPU can take up to 6 minutes on cold start)
+    let dots = 0;
+    const loadingInterval = setInterval(() => {
+        dots = (dots + 1) % 4;
+        gpuVal.innerText = 'Starting GPU' + '.'.repeat(dots);
+    }, 800);
 
     try {
-        const resp = await fetch(`${API_BASE}/api/warmup`, { method: 'POST' });
+        // Use AbortController with a 7-minute timeout (server retries for up to 6 min)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 7 * 60 * 1000);
+
+        const resp = await fetch(`${API_BASE}/api/warmup`, {
+            method: 'POST',
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        clearInterval(loadingInterval);
+
         const data = await resp.json();
         
         if (data.status === 'success') {
@@ -137,15 +154,23 @@ async function startShift() {
             warmupBtn.innerText = 'Shift Started';
         } else {
             gpuIndicator.className = 'status-indicator error';
-            gpuVal.innerText = 'Cold / Error';
+            gpuVal.innerText = 'Cold / Error — try again';
             warmupBtn.disabled = false;
+            warmupBtn.innerText = 'Start Shift';
         }
     } catch (e) {
+        clearInterval(loadingInterval);
         gpuIndicator.className = 'status-indicator error';
-        gpuVal.innerText = 'Error connecting';
+        if (e.name === 'AbortError') {
+            gpuVal.innerText = 'Timed out — try again';
+        } else {
+            gpuVal.innerText = 'Error connecting';
+        }
         warmupBtn.disabled = false;
+        warmupBtn.innerText = 'Start Shift';
     }
 }
+
 
 // Deploy GPU to Modal from Render
 async function deployGPU() {
