@@ -59,6 +59,11 @@ image = (
             ".github",
         ],
     )
+    # Modal does not auto-bundle a sibling module just because worker.py imports
+    # it locally — that local import succeeding (during `modal deploy` itself)
+    # says nothing about what ships in the remote container. Explicitly mount
+    # streaming.py so `import streaming` resolves inside the container too.
+    .add_local_python_source("streaming")
 )
 
 
