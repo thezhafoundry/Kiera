@@ -1,12 +1,18 @@
 import asyncio
+import contextlib
+import json
+import logging
 import numpy as np
 import time
 from unittest.mock import AsyncMock, patch
 import httpx
+import websockets
+from websockets.exceptions import ConnectionClosed
 
 from backend.noise.noise_suppressor import WebRTCNoiseSuppressor
 from backend.converters.dummy import DummyVoiceConverter
 from backend.converters.rvc import RVCVoiceConverter
+from backend.converters.rvc_stream import RVCStreamingConverter
 
 async def test_noise_suppressor():
     print("\n--- Testing Noise Suppressor ---")
@@ -139,11 +145,252 @@ async def test_rvc_converter_mocked():
     await converter.close()
     print("RVC Voice Converter Test: SUCCESS")
 
+async def test_rvc_converter_empty_response():
+    print("\n--- Testing RVC Converter Empty-Response Leak Fix ---")
+
+    endpoint_url = "https://mock-rvc-gpu-endpoint.modal.run"
+    converter = RVCVoiceConverter(
+        endpoint_url=endpoint_url,
+        api_key="mock_secret_key",
+        pitch_shift=2,
+        budget_ms=3000.0
+    )
+
+    # Enough input to clear the >=640-byte buffered-input gate, so the empty
+    # response is what's actually under test (not the too-little-input gate).
+    t = np.linspace(0, 0.4, 6400, endpoint=False)
+    input_bytes = (np.sin(2 * np.pi * 440 * t) * 5000).astype(np.int16).tobytes()
+
+    async def chunk_generator():
+        yield input_bytes
+
+    # A 200 OK with an empty body -- the endpoint ran but produced nothing.
+    # Before the fix this used to fall through to leaking the raw input PCM.
+    mock_request = httpx.Request("POST", f"{endpoint_url}/convert")
+    mock_response = httpx.Response(200, content=b"", request=mock_request)
+
+    with patch.object(converter.client, 'post', new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_response
+
+        converted_chunks = []
+        async for chunk in converter.convert_stream(chunk_generator()):
+            converted_chunks.append(chunk)
+
+        mock_post.assert_called_once()
+
+        print(f"Chunks yielded for empty HTTP response: {len(converted_chunks)}")
+        assert len(converted_chunks) == 0, "Empty HTTP response must yield ZERO chunks (never leak raw PCM)!"
+
+    await converter.close()
+    print("RVC Voice Converter Empty-Response Test: SUCCESS")
+
+
+# ---------------------------------------------------------------------------
+# RVCStreamingConverter tests: exercised against a real, in-process fake
+# `/ws` server (websockets.serve) rather than mocks, so the WS handshake,
+# framing, ordering, and reconnect-with-backoff logic are all genuinely
+# driven end-to-end.
+# ---------------------------------------------------------------------------
+
+async def _fake_rvc_ws_handler(websocket):
+    """Minimal fake Modal /ws server: replies `{"type":"ready"}` to the config
+    handshake, then echoes each received binary frame back x3-upsampled
+    (mirrors the real 16kHz-in / 48kHz-out relationship -- no real RVC math
+    needed for these tests)."""
+    try:
+        await websocket.recv()  # the JSON config handshake message
+        await websocket.send(json.dumps({"type": "ready"}))
+        async for message in websocket:
+            if isinstance(message, (bytes, bytearray)):
+                samples = np.frombuffer(message, dtype=np.int16)
+                upsampled = np.repeat(samples, 3).astype(np.int16)
+                await websocket.send(upsampled.tobytes())
+            # ignore any stray text messages -- not sent by the client in these tests
+    except ConnectionClosed:
+        pass
+
+
+def _make_frame(value: int, n_samples: int = 160) -> bytes:
+    """A 320-byte (10ms @ 16kHz) frame whose samples all equal `value`, so the
+    x3-upsampled echo can be identified and order-checked trivially."""
+    return np.full(n_samples, value, dtype=np.int16).tobytes()
+
+
+def _decode_frame_value(chunk: bytes) -> int:
+    return int(np.frombuffer(chunk, dtype=np.int16)[0])
+
+
+def _make_fed_input():
+    """An async generator fed externally via an asyncio.Queue, so a test can
+    control precisely when frames enter the converter's input pump (e.g. to
+    send frames while a fake server is deliberately down)."""
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def gen():
+        while True:
+            item = await queue.get()
+            yield item
+
+    return gen(), queue
+
+
+class _ListLogHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def _capture_logs(logger_name: str):
+    """Captures log records from `logger_name` without silencing/duplicating
+    the module's normal logging (restores level/handlers on exit)."""
+    handler = _ListLogHandler()
+    logger = logging.getLogger(logger_name)
+    prev_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
+
+
+async def test_rvc_streaming_converter_basic():
+    print("\n--- Testing RVCStreamingConverter: handshake, ordered echo, close() cleanliness ---")
+
+    async with websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        converter = RVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+
+        in_gen, in_queue = _make_fed_input()
+        output_chunks = []
+
+        async def collect():
+            async for chunk in converter.convert_stream(in_gen):
+                output_chunks.append(chunk)
+
+        with _capture_logs("backend.converters.rvc_stream") as log_handler:
+            collect_task = asyncio.create_task(collect())
+
+            values = [1, 2, 3, 4, 5]
+            for v in values:
+                in_queue.put_nowait(_make_frame(v))
+
+            # Wait for the handshake + all 5 echoed frames.
+            deadline = time.monotonic() + 5.0
+            while len(output_chunks) < len(values) and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+
+            assert len(output_chunks) == len(values), (
+                f"expected {len(values)} echoed chunks, got {len(output_chunks)}"
+            )
+            for chunk, expected_value in zip(output_chunks, values):
+                assert len(chunk) == 320 * 3, "echoed chunk should be x3-upsampled (16kHz PCM -> 48kHz PCM)"
+                assert _decode_frame_value(chunk) == expected_value, "echoed chunks must arrive in send order"
+
+            print(f"Handshake + ordered echo of {len(values)} frames: OK")
+
+            await converter.close()
+            await asyncio.wait_for(collect_task, timeout=5.0)
+
+            error_records = [r for r in log_handler.records if r.levelno >= logging.ERROR]
+            assert not error_records, (
+                f"unexpected ERROR-level logs after close(): {[r.getMessage() for r in error_records]}"
+            )
+
+        assert converter._pump_task.done() and converter._conn_task.done(), (
+            "close() must leave no dangling background tasks"
+        )
+
+    print("RVCStreamingConverter basic (handshake/echo/close) test: SUCCESS")
+
+
+async def test_rvc_streaming_converter_reconnect():
+    print("\n--- Testing RVCStreamingConverter reconnect-with-backoff (never-raw during outage) ---")
+
+    server = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    converter = RVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+    in_gen, in_queue = _make_fed_input()
+    output_chunks = []
+
+    async def collect():
+        async for chunk in converter.convert_stream(in_gen):
+            output_chunks.append(chunk)
+
+    collect_task = asyncio.create_task(collect())
+    server2 = None
+    try:
+        # 1. Prove the happy path works before inducing an outage.
+        in_queue.put_nowait(_make_frame(1))
+        deadline = time.monotonic() + 3.0
+        while len(output_chunks) < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert len(output_chunks) == 1, "pre-outage frame was not echoed"
+        pre_outage_count = len(output_chunks)
+
+        # 2. Kill the server mid-stream (graceful close, no OS-level process
+        # kill needed -- Windows-friendly).
+        server.close()
+        await server.wait_closed()
+
+        # Frames sent during the outage must be buffered (bounded, replayed
+        # on reconnect), never dropped silently and never leaked raw.
+        in_queue.put_nowait(_make_frame(2))
+        in_queue.put_nowait(_make_frame(3))
+
+        # 3. Outage window: poll continuously and assert NOTHING is yielded
+        # while the server is down -- the never-raw invariant means silence,
+        # not raw/leaked audio, during an outage.
+        outage_window_s = 0.9
+        outage_deadline = time.monotonic() + outage_window_s
+        while time.monotonic() < outage_deadline:
+            assert len(output_chunks) == pre_outage_count, (
+                "converter yielded output during a WS outage -- never-raw invariant violated"
+            )
+            await asyncio.sleep(0.05)
+
+        # 4. Restart a fake server on the SAME port. The connection loop's
+        # backoff (0.5s -> 5s exponential, reset on each successful handshake)
+        # means the very next retry after this restart should succeed --
+        # only one reconnect cycle is needed to demonstrate the behavior.
+        server2 = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", port)
+
+        reconnect_deadline = time.monotonic() + 4.0
+        expected_count = pre_outage_count + 2
+        while len(output_chunks) < expected_count and time.monotonic() < reconnect_deadline:
+            await asyncio.sleep(0.05)
+
+        assert len(output_chunks) == expected_count, (
+            f"expected reconnect to replay buffered frames: got {len(output_chunks)}, wanted {expected_count}"
+        )
+        # Buffered frames must be replayed in the order they were produced.
+        assert _decode_frame_value(output_chunks[pre_outage_count]) == 2
+        assert _decode_frame_value(output_chunks[pre_outage_count + 1]) == 3
+        print("Reconnect-with-backoff: silence during outage, buffered replay in order: OK")
+    finally:
+        if server2 is not None:
+            server2.close()
+            await server2.wait_closed()
+        await converter.close()
+        await asyncio.wait_for(collect_task, timeout=5.0)
+
+    print("RVCStreamingConverter reconnect test: SUCCESS")
+
+
 async def main():
     print("Running automated pipeline verification tests...")
     await test_noise_suppressor()
     await test_dummy_converter()
     await test_rvc_converter_mocked()
+    await test_rvc_converter_empty_response()
+    await test_rvc_streaming_converter_basic()
+    await test_rvc_streaming_converter_reconnect()
     print("\nAll automated verification tests completed successfully!")
 
 if __name__ == "__main__":
