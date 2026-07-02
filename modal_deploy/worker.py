@@ -2,9 +2,17 @@ import os
 import sys
 import time
 import modal
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
 import asyncio
+
+# Pure numpy DSP for the /ws streaming path. Imported at module top (not deferred
+# inside the handler) so Modal's dependency analysis mounts streaming.py into the
+# container. The fallback covers running with modal_deploy/ directly on sys.path.
+try:
+    from modal_deploy import streaming as st
+except ImportError:  # pragma: no cover
+    import streaming as st
 
 
 app = modal.App("rvc-worker")
@@ -260,17 +268,26 @@ class RVCEngine:
 engine = RVCEngine()
 
 
+# ---- WebSocket streaming session state ----
+# MVP = a single concurrent /ws session. A second connection is told
+# {"type":"busy"} and closed. Both locks are module-level so they persist for the
+# life of the container (one process per Modal container).
+_session_active = False
+_session_lock = asyncio.Lock()   # guards the _session_active check-and-set
+_gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-tenant
+
+
 @app.function(
     image=image,
     gpu="T4",
     timeout=10800,
     volumes={"/root/rvc-models": volume},
     scaledown_window=120,   # keep container warm for 2 min between requests, then auto-shutdown
-    # Pin to Asia-Pacific so this GPU sits next to Render/Twilio once those also move to
-    # Singapore, instead of Virginia (~13-19,000km / a full extra transpacific round trip
-    # per RVC chunk). Narrow "ap-southeast" (Singapore) costs ~1.75x base GPU price vs
-    # ~1.5x for the broader "ap" — using the narrow pin here since this container talks to
-    # Render/Twilio in Singapore specifically, not elsewhere in APAC.
+    # Pin to Asia-Pacific so this GPU sits next to Render/Twilio in Singapore (Render moves
+    # there in Task 6), instead of Virginia (~13-19,000km / a full extra transpacific round
+    # trip per audio block on the persistent /ws stream). Narrow "ap-southeast" (Singapore)
+    # costs ~1.75x base GPU price vs ~1.5x for the broader "ap" — using the narrow pin here
+    # since this container talks to Render/Twilio in Singapore specifically, not elsewhere in APAC.
     region="ap-southeast",
 )
 @modal.asgi_app()
@@ -329,6 +346,151 @@ def fastapi_app():
                 content=str(e),
                 status_code=500,
             )
+
+    @web_app.websocket("/ws")
+    async def ws_stream(ws: WebSocket):
+        """Persistent streaming voice-conversion socket (see Task 1 protocol).
+
+        NEVER emits raw/unconverted voice: on inference failure it sends an
+        {"type":"error"} and keeps the session alive; the silence bypass emits
+        zeros. Single-tenant — a second connection is closed with {"type":"busy"}.
+        """
+        import json
+        import traceback
+        import numpy as np
+
+        global _session_active
+
+        await ws.accept()
+
+        # ---- Single-tenancy gate (MVP = 1 session) ----
+        async with _session_lock:
+            if _session_active:
+                await ws.send_json({"type": "busy"})
+                await ws.close()
+                return
+            _session_active = True
+
+        try:
+            # ---- Handshake: first message is the config JSON ----
+            first = await ws.receive()
+            if first.get("type") == "websocket.disconnect":
+                return
+            cfg = json.loads(first.get("text") or "{}")
+            cfg_pitch = int(cfg.get("pitch_shift", -1))
+            index_rate = float(cfg.get("index_rate", 0.75))
+            rms_mix_rate = float(cfg.get("rms_mix_rate", 0.75))
+            protect = float(cfg.get("protect", 0.33))
+
+            # Warm-gate: only reply "ready" when the engine is actually loaded AND
+            # (guaranteed above) no other session is active.
+            if not engine.ready:
+                await ws.send_json({"type": "error", "message": "engine not ready"})
+                await ws.close()
+                return
+            await ws.send_json({"type": "ready"})
+
+            # ---- Per-session streaming state ----
+            acc = st.BlockAccumulator()
+            pending_tail = np.zeros(0, dtype=np.int16)
+            # pitch_shift == -1 -> auto-detect once from the first non-silent block,
+            # then fixed for the whole session.
+            session_pitch = None if cfg_pitch == -1 else cfg_pitch
+
+            while True:
+                message = await ws.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                text = message.get("text")
+                if text is not None:
+                    data = json.loads(text)
+                    if data.get("type") == "ping":
+                        await ws.send_json({"type": "pong"})
+                    continue
+
+                payload = message.get("bytes")
+                if not payload:
+                    continue
+                if len(payload) % 2:
+                    payload = payload[:len(payload) - 1]  # keep int16 alignment
+                acc.push(np.frombuffer(payload, dtype=np.int16))
+
+                # Drain every complete 320 ms block currently buffered.
+                while True:
+                    popped = acc.pop_block()
+                    if popped is None:
+                        break
+                    infer_input, context_len, block = popped
+
+                    infer_ms = 0.0
+                    if st.block_rms(block) < st.SILENCE_RMS_THRESHOLD:
+                        # Silence bypass: skip the GPU, emit equal-duration 48 kHz
+                        # silence (3x samples), never raw audio. The extra crossfade of
+                        # zeros mirrors the +crossfade overlap that voiced blocks carry,
+                        # so after SOLA holds back its tail the net emitted duration is
+                        # still a full block (otherwise each silence block would lose one
+                        # crossfade, shortening pauses).
+                        out = np.zeros(len(block) * 3 + st.SOLA_CROSSFADE_SAMPLES, dtype=np.int16)
+                    else:
+                        # Resolve the session pitch once from the first non-silent audio.
+                        if session_pitch is None:
+                            probe_wav = st.pcm16_to_wav_bytes(infer_input)
+                            session_pitch = await asyncio.to_thread(
+                                engine._auto_detect_pitch, probe_wav
+                            )
+                        wav_bytes = st.pcm16_to_wav_bytes(infer_input)
+                        try:
+                            t0 = time.perf_counter()
+                            async with _gpu_lock:  # single-tenant GPU
+                                out_bytes = await asyncio.to_thread(
+                                    engine.run_conversion,
+                                    wav_bytes,
+                                    session_pitch,
+                                    index_rate,
+                                    3,             # filter_radius default
+                                    rms_mix_rate,
+                                    protect,
+                                )
+                            infer_ms = (time.perf_counter() - t0) * 1000.0
+                        except Exception as e:
+                            # Inference failed: report, emit NOTHING (never raw),
+                            # keep the session alive, hold the pending tail as-is.
+                            traceback.print_exc()
+                            await ws.send_json({"type": "error", "message": str(e)})
+                            continue
+
+                        out = np.frombuffer(out_bytes, dtype=np.int16)
+                        # Trim the converted context but RETAIN a crossfade's worth of
+                        # overlap so consecutive block outputs share overlapping content
+                        # for SOLA to align/merge (else the crossfade compresses time).
+                        out = st.trim_context(
+                            out,
+                            context_len,
+                            len(infer_input),
+                            overlap_keep=st.SOLA_CROSSFADE_SAMPLES,
+                        )
+
+                    emit, pending_tail = st.sola_crossfade(pending_tail, out)
+                    if len(emit):
+                        await ws.send_bytes(emit.tobytes())
+                    await ws.send_json({
+                        "type": "stats",
+                        "infer_ms": round(infer_ms, 2),
+                        "block_ms": st.BLOCK_MS,
+                    })
+
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                await ws.send_json({"type": "error", "message": str(e)})
+            except Exception:
+                pass
+        finally:
+            async with _session_lock:
+                _session_active = False
 
     return web_app
 
