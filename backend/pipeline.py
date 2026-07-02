@@ -39,6 +39,14 @@ class VoiceConversionWorker:
         self._audio_queue: Optional[asyncio.Queue] = None
         self._publish_lock: Optional[asyncio.Lock] = None
 
+        # Pre-buffer: hold back audio until 1.5s of converted audio is ready,
+        # then release it all at once so the lead hears smooth, uninterrupted speech.
+        # The RVC pipeline needs ~1.4s anyway, so this delay is imperceptible.
+        # 48000 samples/s × 2 bytes × 1.5s = 144000 bytes
+        self._PREBUFFER_BYTES = 48000 * 2 * 1          # 1 second of 48kHz 16-bit mono
+        self._prebuffer       = bytearray()
+        self._prebuffer_ready = False   # True once buffer has filled for the first time
+
     async def start(self):
         """Starts the worker, connects to the LiveKit room, and publishes the output track."""
         self.running = True
@@ -123,13 +131,17 @@ class VoiceConversionWorker:
         if self._pipeline_task:
             self._pipeline_task.cancel()
             self._pipeline_task = None
-        # Clear queue
+        # Clear audio queue
         if self._audio_queue:
             while not self._audio_queue.empty():
                 try:
                     self._audio_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+        # Reset pre-buffer so the next speech session starts fresh
+        self._prebuffer.clear()
+        self._prebuffer_ready = False
+        print("[Worker] Pre-buffer reset for new speech session.")
 
     async def stop(self):
         """Disconnects the worker and stops all background tasks."""
@@ -403,18 +415,29 @@ class VoiceConversionWorker:
         return audio_payload
 
     async def _publish_audio(self, audio_payload: bytes):
-        """Publish 48kHz PCM audio to LiveKit. Uses a lock so chunks never interleave."""
-        # Lock ensures two background publish tasks never write frames simultaneously
-        async with self._publish_lock:
-            # If the output buffer is already backed up, drop what's queued before
-            # adding more — better a tiny skip than a delay that compounds every chunk.
-            try:
-                queued = getattr(self.audio_source, "queued_duration", 0) or 0
-                if queued > 0.4 and hasattr(self.audio_source, "clear_queue"):
-                    self.audio_source.clear_queue()
-            except Exception:
-                pass
+        """Publish 48kHz PCM audio to LiveKit with a pre-buffer for smooth playback.
 
+        The first PREBUFFER_BYTES of audio are held back. Once the buffer fills,
+        the full buffer is released as a burst and streaming continues normally.
+        This hides the RVC cold-start jitter and keeps the lead's audio smooth.
+        """
+        async with self._publish_lock:
+            if not self._prebuffer_ready:
+                # Still filling the pre-buffer
+                self._prebuffer.extend(audio_payload)
+                buffered_secs = len(self._prebuffer) / (48000 * 2)
+                print(f"[Worker] Pre-buffering... {buffered_secs:.2f}s / {self._PREBUFFER_BYTES/(48000*2):.1f}s")
+
+                if len(self._prebuffer) >= self._PREBUFFER_BYTES:
+                    # Buffer is full — release everything and switch to streaming
+                    self._prebuffer_ready = True
+                    audio_payload = bytes(self._prebuffer)
+                    self._prebuffer.clear()
+                    print("[Worker] Pre-buffer full — starting smooth playback to lead.")
+                else:
+                    return  # Still filling, don't publish yet
+
+            # Normal frame-by-frame publish
             frame_size = 960  # 10ms at 48kHz mono 16-bit
             for i in range(0, len(audio_payload), frame_size):
                 slice_bytes = audio_payload[i:i + frame_size]
