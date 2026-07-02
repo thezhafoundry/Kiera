@@ -189,9 +189,14 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
         .with_ttl(datetime.timedelta(seconds=3600))
     
     # Choose voice conversion engine (priority: RVC > Dummy)
-    # Pitch shift: male agent → female Keira = +12, female agent → female Keira = 0
-    pitch_shift = 12 if agent_gender.lower() == "male" else 0
-    print(f"[Server] Agent gender: {agent_gender} → pitch_shift={pitch_shift}")
+    # pitch_shift = -1 tells the Modal GPU to auto-detect the speaker's gender from
+    # the live F0 (fundamental frequency) of the audio itself, rather than relying on
+    # a UI toggle. This is more accurate: the GPU uses autocorrelation to detect whether
+    # the speaker's F0 is above or below 145 Hz, then applies +12 semitones for male
+    # voices and 0 for female voices. The UI gender field is kept for future manual
+    # override but is not used for pitch right now.
+    pitch_shift = -1
+    print(f"[Server] Agent gender hint: {agent_gender} → using pitch_shift=-1 (auto-detect on GPU)")
 
     if RVC_ENDPOINT_URL:
         print(f"[Server] Spawning RVC Streaming Voice Changer (Endpoint: {RVC_ENDPOINT_URL})")
