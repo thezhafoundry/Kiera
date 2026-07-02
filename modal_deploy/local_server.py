@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 
 # ── Paths — adjust if your layout is different ────────────────────────────────
-RVC_ROOT      = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "Retrieval-based-Voice-Conversion-WebUI"))
+RVC_ROOT      = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "RVC"))
 MODEL_WEIGHTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "weights"))
 MODEL_LOGS    = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "models", "logs", "mi-test"))
 MODEL_NAME    = "mi-test.pth"

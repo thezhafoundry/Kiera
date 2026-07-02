@@ -47,7 +47,7 @@ image = (
         "modal_deploy/requirements.txt"
     )
     .add_local_dir(
-        "Retrieval-based-Voice-Conversion-WebUI",
+        "RVC",
         remote_path="/root/rvc",
         ignore=[
             "venv311",
