@@ -234,42 +234,34 @@ class VoiceConversionWorker:
 
         # Semaphore: cap concurrent RVC HTTP requests at 2
         rvc_semaphore = asyncio.Semaphore(2)
-
-        output_buffer = {}
-        publish_ready = asyncio.Event()
-        next_publish_seq = 0
+        # Lock ensures two chunks never interleave frames when publishing simultaneously
+        publish_seq_lock = asyncio.Lock()
         pending_seq = 0
 
-        async def ordered_publisher():
-            nonlocal next_publish_seq
-            while self.running:
-                await publish_ready.wait()
-                publish_ready.clear()
-                while next_publish_seq in output_buffer:
-                    chunk_start_t, payload = output_buffer.pop(next_publish_seq)
-                    
-                    # Calculate how old this audio chunk is
-                    age = time.time() - chunk_start_t
-                    if age > MAX_AGE_S:
-                        # Stale chunk — discard it to prevent permanent audio buffer backup/delay
-                        print(f"[Worker] Discarding stale chunk {next_publish_seq} (age: {age:.1f}s) to keep low latency")
-                    else:
-                        await self._publish_audio(payload)
-                    next_publish_seq += 1
-
-        async def convert_and_stage(chunk_with_carry: bytes, raw_chunk: bytes, carry_len: int, chunk_start_t: float, seq: int):
+        async def convert_and_publish(chunk_with_carry: bytes, raw_chunk: bytes, carry_len: int, chunk_start_t: float, seq: int):
+            """Convert one chunk and publish it immediately. No ordering required — a
+            slight reorder is imperceptible on voice, and ordered buffering was the root
+            cause of the cascading 26+ second latency backlog."""
             async with rvc_semaphore:
-                # Check if this chunk is already stale before making a slow remote RVC call
+                # Skip RVC entirely if the chunk is already stale waiting in queue
                 age_before = time.time() - chunk_start_t
                 if age_before > MAX_AGE_S:
                     print(f"[Worker] Queue backed up: skipping RVC for stale chunk {seq} (age: {age_before:.1f}s)")
                     audio = self._resample_16k_to_48k(raw_chunk)
                 else:
                     audio = await self._convert_chunk(chunk_with_carry, raw_chunk, carry_len, chunk_start_t)
-            output_buffer[seq] = (chunk_start_t, audio)
-            publish_ready.set()
 
-        publisher_task = asyncio.create_task(ordered_publisher())
+            # Re-check age after conversion — discard if too old to be useful
+            age_after = time.time() - chunk_start_t
+            if age_after > MAX_AGE_S * 3:
+                print(f"[Worker] Dropping post-conversion stale chunk {seq} (age: {age_after:.1f}s)")
+                return
+
+            # Publish immediately — use lock so frames from parallel chunks don't interleave
+            async with publish_seq_lock:
+                await self._publish_audio(audio)
+
+        publisher_task = None   # no longer used; publishing happens directly in convert_and_publish
         carry_over     = b""
 
         try:
@@ -318,7 +310,7 @@ class VoiceConversionWorker:
                           f"({len(chunk_bytes)} bytes incl. carry-over)")
 
                     # Fire RVC in background — immediately start collecting the next chunk
-                    asyncio.create_task(convert_and_stage(chunk_bytes, pcm_chunk, carry_len, chunk_start_t, pending_seq))
+                    asyncio.create_task(convert_and_publish(chunk_bytes, pcm_chunk, carry_len, chunk_start_t, pending_seq))
                     pending_seq += 1
 
                     # Safety valve: shed frames when the input queue falls behind (> 2 seconds queued)
@@ -341,11 +333,12 @@ class VoiceConversionWorker:
                     traceback.print_exc()
                     await asyncio.sleep(0.1)
         finally:
-            publisher_task.cancel()
-            try:
-                await publisher_task
-            except asyncio.CancelledError:
-                pass
+            if publisher_task:
+                publisher_task.cancel()
+                try:
+                    await publisher_task
+                except asyncio.CancelledError:
+                    pass
 
     def _resample_16k_to_48k(self, pcm_16k: bytes) -> bytes:
         """Resample 16kHz 16-bit mono PCM to 48kHz by tripling each sample (numpy, ~10x faster)."""
