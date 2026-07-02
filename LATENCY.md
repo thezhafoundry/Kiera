@@ -23,12 +23,12 @@ $$\text{Mouth-to-Ear Latency} = T_{\text{ingress}} + T_{\text{noise\_suppression
 | :--- | :--- | :--- |
 | **Ingress Network** | 20 - 45 ms | Browser capture, OPUS encoding, WebRTC transport to LiveKit, and forwarding to the Python worker at 16 kHz mono. |
 | **Noise Suppression** | 0.2 - 0.5 ms | `WebRTCNoiseSuppressor` processing of 10ms/320-byte frames. Sub-millisecond on CPU. |
-| **VAD Chunk Collection** | 250 - 700 ms | `_conversion_consumer` collects frames until a natural pause (150ms of silence, `webrtcvad`) or the 700ms hard cap, whichever comes first. Minimum 250ms so RVC has enough context for pitch extraction. A 100ms carry-over is prepended to the next chunk to smooth boundaries. |
+| **VAD Chunk Collection** | 450 - 700 ms | `_conversion_consumer` collects frames until a natural pause (150ms of silence, `webrtcvad`) or the 700ms hard cap, whichever comes first. Minimum raised from 250ms to 450ms (see §5) so RVC's fixed per-request overhead is amortized over more audio instead of falling behind during continuous speech. A 100ms carry-over is prepended to the next chunk to smooth boundaries. |
 | **RVC Conversion (warm GPU)** | ~150 - 700 ms | HTTP round trip to the Modal T4 endpoint (`RVC_ENDPOINT_URL`) — see [modal_deploy/worker.py](modal_deploy/worker.py). `pm` pitch extraction (not `rmvpe`) saves ~300ms/chunk. Bounded by a 2000ms budget (`asyncio.timeout`); on timeout it fails over to the raw denoised chunk resampled 16→48kHz instead of dropping audio. |
 | **RVC Conversion (cold GPU)** | 30 - 90+ s (first chunk only) | Modal spins up a new T4 container, loads the RVC model + HuBERT + index (`RVCEngine.startup`), and runs one silent warm-up inference before serving real requests. This only happens when no container has served a request in the last 120s (`scaledown_window=120`). **Measured live on 2026-07-02**: a `/health` ping against an idle container got no response at all for ~75s before the container came up as `{"status":"ready","cuda_available":true,"cuda_device":"Tesla T4"}` — noticeably longer than the ~8-30s the code comments assume. The 2000ms conversion budget means a cold GPU **always** fails over to raw voice for the first several chunks — see §4. |
-| **One-time Pre-buffer** | 1000 ms (once per speech session) | `VoiceConversionWorker._publish_audio` withholds the first 1s of converted audio and releases it as a burst, to hide RVC/GPU jitter. Paid once per call, not per chunk. |
+| **Standing Playout Buffer** | 400 - 1500 ms, adaptive (once per speech session) | `_run_playout` holds back playback until an adaptive target of *contiguous* converted audio is buffered (default 500ms; re-tuned per session from a rolling P95 of RVC latency — see §5). Unlike the old one-shot pre-buffer, this refills every session, not just the first one. |
 | **Egress Network** | 20 - 40 ms | Publishing 960-byte (10ms @ 48kHz) frames to LiveKit, then WebRTC + browser jitter-buffer playout to the lead. |
-| **Steady-state Total (warm GPU)** | **~450 - 1400 ms** | Per-chunk added latency once the GPU is warm and the pre-buffer has already been paid. |
+| **Steady-state Total (warm GPU)** | **~450 - 1400 ms** | Per-chunk added latency once the GPU is warm and the standing buffer is filled. |
 | **First-chunk Total (cold GPU)** | **30 - 90+ s of raw voice, then fail-over recovers** | The lead hears the agent's real (unconverted) voice for the first several chunks while the GPU boots; conversion kicks in once the container is warm. |
 
 Region note: the Modal function is pinned to `region="ap-southeast"` (Singapore), intended to
@@ -47,12 +47,12 @@ pass (§3) after any pipeline or model change and capture fresh numbers.
 Worker-side log lines (`backend/pipeline.py`) to watch during a call:
 
 ```text
-[Worker] VAD pipeline active. min=250ms silence_cut=150ms max=700ms carry-over=100ms max_age=1.0s max_concurrent_rvc=2
+[Worker] VAD pipeline active. min=450ms silence_cut=150ms max=700ms carry-over=100ms max_age=1.0s max_concurrent_rvc=2
 [Worker] Dispatching chunk 0: 480ms (8320 bytes incl. carry-over)
 [RVC Client] Server processing time: 612.4 ms
 [Latency] 891ms total (conversion: 640ms)
-[Worker] Pre-buffering... 0.62s / 1.0s
-[Worker] Pre-buffer full — starting smooth playback to lead.
+[Worker] Adaptive playout buffer target: 500ms (from 0 recent RVC latency samples)
+[Worker] Playout buffer full (0.52s) — starting playback.
 ```
 
 - `[Latency] {X}ms total (conversion: {Y}ms)` — `X` is the full added latency for that chunk
@@ -63,6 +63,15 @@ Worker-side log lines (`backend/pipeline.py`) to watch during a call:
   the GPU is cold or overloaded — see §4.
 - `[Worker] Queue backed up: skipping RVC for stale chunk N` — the input queue is more than
   1s behind; that chunk skips RVC entirely to keep the call from drifting further behind.
+- `[Worker] Adaptive playout buffer target: {X}ms (from {N} recent RVC latency samples)` —
+  logged whenever the standing buffer target is (re)computed (start of a session); grows/shrinks
+  with the P95 of the last 20 RVC round trips (400-1500ms range).
+- `[Worker] Playout buffer full ({X}s) — starting playback.` — the standing buffer reached its
+  target and `_run_playout` began draining chunks in order.
+- `[Worker] Playout: chunk N not ready after {X}ms — skipping to avoid stalling the call.` — the
+  next chunk in sequence didn't resolve within the 600ms reorder window, so playback skipped
+  past it rather than freezing the call waiting on one slow chunk. Frequent occurrences of this
+  usually mean the same underlying problem as fail-safes: the GPU is cold or overloaded.
 - The frontend also receives a `pipeline_latency_ms` / `is_fallback` data-channel message per
   chunk (see `_convert_chunk`), which the agent dashboard can surface live.
 
@@ -177,3 +186,48 @@ order:
    and rely on the automatic pre-warm ping fired in `_do_start_bot` on every bot spawn to
    overlap cold start with call setup/ringing rather than debugging a "slow first chunk" as if
    it were an outage.
+
+---
+
+## 5. Ordered Playout Queue (2026-07-02)
+
+The original pipeline had a one-shot pre-buffer: hold back the first 1s of converted audio,
+release it as a burst, then publish every subsequent chunk directly to LiveKit the moment its
+RVC call finished. That masked startup jitter but did nothing for the rest of the call — if RVC
+fell behind mid-conversation the lead would hear gaps or reordered audio with no buffer left to
+absorb it. `backend/pipeline.py` now separates *producing* converted audio from *playing it out*:
+
+- **`_conversion_consumer`** dispatches VAD-cut chunks to RVC (up to 2 concurrent, unchanged)
+  and hands each result — success, fail-safe raw fallback, or an explicit "skipped" marker for
+  a chunk too stale to bother with — to `_enqueue_chunk`, keyed by a monotonically increasing
+  sequence number. It never touches `capture_frame` directly.
+- **`_run_playout`** is the only thing that calls `capture_frame`. It has two phases per speech
+  session:
+  1. **Filling** — accumulate *contiguous* ready chunks (no gaps) until the adaptive target
+     (`_buffer_target_bytes`, §1) is met. This is the "standing buffer": unlike the old
+     pre-buffer it refills every session (triggered by `stop_pipeline` flipping
+     `_playout_active` back to `False`), not just the first one for the whole call.
+  2. **Draining** — publish chunks strictly in sequence. If the next expected chunk isn't ready,
+     wait up to 600ms (`_REORDER_WAIT_S`) for it before skipping past it, so one slow RVC call
+     can delay by at most 600ms rather than stalling the call indefinitely.
+- **Sequence numbers are never reset mid-call.** `stop_pipeline` (fired on `track_unsubscribed`)
+  only resets the *buffering phase*, not `_next_publish_seq` or `_pending_chunks` — the dispatch
+  counter in `_conversion_consumer` runs for the worker's whole lifetime, so resetting the
+  playout side out from under it would make the playout task wait forever for sequence numbers
+  that were already consumed.
+- **Buffer depth is adaptive** (`_recompute_buffer_target`): each session's target is the P95 of
+  the last 20 RVC round trips × 1.2, clamped to 400-1500ms. A call with a consistently fast GPU
+  gets a smaller, lower-latency buffer; one with more variance gets a deeper buffer automatically
+  rather than a fixed value that's wrong in one direction or the other.
+- **Chunking was widened from 250ms to 450ms minimum** (`MIN_CHUNK_MS` in `_conversion_consumer`)
+  because the real driver of "queue backed up" in the logs wasn't buffering depth at all — it was
+  throughput: VAD was cutting chunks almost every natural breath, and RVC's ~600-750ms fixed
+  per-request overhead doesn't amortize over chunks that short. Larger minimum chunks mean fewer,
+  cheaper-per-byte RVC round trips for the same amount of speech.
+
+**A known asyncio gotcha this design had to account for:** `asyncio.Condition.notify_all()` wakes
+*every* waiter, not just the one whose data actually arrived. `_run_playout`'s wait for a specific
+sequence number therefore loops against a wall-clock deadline (`time.monotonic()`) rather than
+doing a single `await cv.wait()` — otherwise an unrelated chunk resolving while we're waiting for
+a different one would look like our own wait timing out early, silently shrinking the effective
+reorder window.
