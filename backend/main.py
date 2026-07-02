@@ -75,6 +75,105 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
 active_workers = {}
 active_calls = {}
 
+
+async def _restrict_sip_audio(room_name: str, sip_identity: str = "sip-lead"):
+    """
+    Option A — Server-side SIP track isolation.
+
+    LiveKit's SIP bridge runs server-side and ignores browser-level
+    setTrackSubscriptionPermissions(), so the SIP participant always receives
+    a mix of EVERY audio track in the room — including the agent's raw mic.
+    The lead would hear the real agent voice on top of the converted Keira voice.
+
+    This helper uses LiveKit Room Service update_subscriptions() to explicitly
+    unsubscribe the SIP participant from the raw agent mic track so they ONLY
+    hear the bot's converted-audio track.
+
+    For outbound calls sip_identity is always "sip-lead" (set explicitly in
+    create_sip_participant). For inbound calls, LiveKit assigns a dynamic identity
+    from the caller's SIP URI — so we detect the SIP participant by exclusion:
+    whoever is NOT a voice-converter-bot and NOT an agent browser participant.
+
+    Retries up to max_attempts times to handle the window where the agent browser
+    and/or SIP participant hasn't joined yet.
+    """
+    if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
+        return
+
+    max_attempts = 8
+    retry_delay = 2.0  # seconds between attempts
+
+    for attempt in range(1, max_attempts + 1):
+        await asyncio.sleep(retry_delay)
+        lk = None
+        try:
+            lk = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+            resp = await lk.room.list_participants(
+                api.ListParticipantsRequest(room=room_name)
+            )
+
+            # Categorise every participant in the room
+            raw_agent_track_sids = []
+            bot_track_sids = []
+            resolved_sip_identity = None
+
+            for p in resp.participants:
+                identity = p.identity
+                is_bot = identity.startswith("voice-converter-bot")
+                is_agent = "agent" in identity.lower() and not is_bot
+                # SIP participant: matches the known identity OR is neither bot nor agent
+                is_sip = (identity == sip_identity) or \
+                          (not is_bot and not is_agent and identity != sip_identity and
+                           sip_identity not in ("sip-lead",))  # dynamic inbound detection
+
+                # For outbound: trust the explicit sip_identity
+                if identity == sip_identity:
+                    resolved_sip_identity = identity
+
+                # For inbound: the SIP participant identity is dynamic
+                if sip_identity == "sip-caller" and not is_bot and not is_agent:
+                    resolved_sip_identity = identity
+
+                for t in p.tracks:
+                    if t.type == 0:  # 0 = AUDIO
+                        if is_bot:
+                            bot_track_sids.append(t.sid)
+                        elif is_agent:
+                            raw_agent_track_sids.append(t.sid)
+
+            if not resolved_sip_identity:
+                print(f"[SIP Isolation] Attempt {attempt}: SIP participant not yet in room — retrying...")
+                continue
+
+            if not raw_agent_track_sids:
+                print(f"[SIP Isolation] Attempt {attempt}: No raw agent tracks found yet — retrying...")
+                continue
+
+            # Unsubscribe SIP participant from the raw agent mic track(s)
+            await lk.room.update_subscriptions(
+                api.UpdateSubscriptionsRequest(
+                    room=room_name,
+                    participant_identity=resolved_sip_identity,
+                    track_sids=raw_agent_track_sids,
+                    subscribe=False,
+                )
+            )
+            print(
+                f"[SIP Isolation] ✅ '{resolved_sip_identity}' unsubscribed from raw agent "
+                f"tracks {raw_agent_track_sids}. "
+                f"Only bot converted tracks {bot_track_sids} will reach the phone."
+            )
+            return  # done
+
+        except Exception as e:
+            print(f"[SIP Isolation] Attempt {attempt} failed: {e}")
+        finally:
+            if lk:
+                await lk.aclose()
+
+    print(f"[SIP Isolation] ⚠️ Could not restrict SIP subscriptions for room {room_name} after {max_attempts} attempts.")
+
+
 # Log Twilio configuration state at startup so misconfigurations are obvious in logs
 def _log_config():
     print("=== Keira Server Configuration ===")
@@ -437,6 +536,11 @@ async def call_outbound(request: OutboundCallRequest, background_tasks: Backgrou
         if lk:
             await lk.aclose()
 
+    # 3. Fire-and-forget: unsubscribe the SIP lead from the raw agent mic track so
+    # they ONLY hear the bot's converted Keira voice. The SIP bridge ignores
+    # browser-level setTrackSubscriptionPermissions — this must be done server-side.
+    asyncio.create_task(_restrict_sip_audio(room_name, sip_identity="sip-lead"))
+
     # Record active call details
     active_calls[room_name] = {
         "room_name": room_name,
@@ -626,6 +730,13 @@ async def call_accept(request: AcceptCallRequest):
 
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         raise HTTPException(status_code=500, detail="LiveKit server keys are not configured.")
+
+    # Fire-and-forget: unsubscribe the inbound SIP caller from the raw agent mic so
+    # they only hear the bot's converted Keira voice. For inbound calls the SIP
+    # participant identity is the caller's phone number (From field), but LiveKit
+    # names them by their From URI — we scan by exclusion instead of hardcoded identity.
+    # The helper retries until the agent browser joins and publishes their mic track.
+    asyncio.create_task(_restrict_sip_audio(room_name, sip_identity="sip-caller"))
 
     # Generate access token for the agent
     agent_token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
