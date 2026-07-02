@@ -279,7 +279,7 @@ async function startOutboundCall(phone, name) {
         const resp = await fetch(`${API_BASE}/api/call/outbound`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ phoneNumber: phone, agentIdentity })
+            body: JSON.stringify({ phoneNumber: phone, agentIdentity, agentGender: 'male' })
         });
         
         if (!resp.ok) {

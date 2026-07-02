@@ -21,10 +21,17 @@ load_dotenv()
 app = FastAPI(title="Keira MVP Voice Conversion Server")
 
 # Configure CORS
+# allow_origins=["*"] and allow_credentials=True cannot be combined (browsers reject it).
+# Use explicit origin list for credentialed requests; fall back to "*" only for non-credentialed.
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=(CORS_ORIGINS != ["*"]),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -50,7 +57,8 @@ TWILIO_SIP_TRUNK_ID = os.getenv("TWILIO_SIP_TRUNK_ID")
 TWILIO_SIP_URI = os.getenv("TWILIO_SIP_URI")
 # SIP credentials matching the Twilio Elastic SIP Trunk Credential List (set once via /api/setup)
 TWILIO_SIP_USERNAME = os.getenv("TWILIO_SIP_USERNAME", "Keira")
-TWILIO_SIP_PASSWORD = os.getenv("TWILIO_SIP_PASSWORD", "Zhafoundry@2026")
+# Do NOT hard-code a fallback password — require it to be set explicitly in env vars.
+TWILIO_SIP_PASSWORD = os.getenv("TWILIO_SIP_PASSWORD", "")
 # Public URL of this server — used by /api/setup to configure Twilio's inbound webhook.
 SERVER_URL = os.getenv("SERVER_URL")
 
@@ -308,6 +316,7 @@ async def stop_bot(request: TokenRequest):
 class OutboundCallRequest(BaseModel):
     phoneNumber: str
     agentIdentity: str
+    agentGender: str = "male"  # 'male' or 'female' — sets pitch shift automatically
 
 @app.post("/api/call/outbound")
 async def call_outbound(request: OutboundCallRequest, background_tasks: BackgroundTasks):
@@ -321,29 +330,34 @@ async def call_outbound(request: OutboundCallRequest, background_tasks: Backgrou
 
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         raise HTTPException(status_code=500, detail="LiveKit API keys are not configured.")
-    if not TWILIO_SIP_URI:
-        raise HTTPException(status_code=503, detail="TWILIO_SIP_URI is not set. Run /api/setup first.")
 
-    # Find the outbound SIP trunk ID
-    sip_trunk_id = TWILIO_SIP_TRUNK_ID
+    # Resolve the outbound SIP trunk ID.
+    # Always do a live lookup first (by name) so a stale TWILIO_SIP_TRUNK_ID env var
+    # never causes a 404 after /api/setup recreates the trunk.
+    sip_trunk_id = None
+    try:
+        lk_tmp = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        trunks = await lk_tmp.sip.list_outbound_trunk(api.ListSIPOutboundTrunkRequest())
+        trunk = next((t for t in trunks.items if t.name == "Keira Twilio Outbound"), None)
+        if trunk:
+            sip_trunk_id = trunk.sip_trunk_id
+            print(f"[Server] Resolved SIP trunk via live lookup: {sip_trunk_id}")
+        await lk_tmp.aclose()
+    except Exception as e:
+        print(f"[Server] Live trunk lookup failed ({e}); falling back to env var.")
+
+    # Fall back to the env var if the live lookup missed (e.g. name mismatch)
     if not sip_trunk_id:
-        try:
-            lk_tmp = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-            trunks = await lk_tmp.sip.list_outbound_trunk(api.ListSIPOutboundTrunkRequest())
-            trunk = next((t for t in trunks.items if t.name == "Keira Twilio Outbound"), None)
-            if trunk:
-                sip_trunk_id = trunk.sip_trunk_id
-            await lk_tmp.aclose()
-        except Exception:
-            pass
+        sip_trunk_id = TWILIO_SIP_TRUNK_ID
+
     if not sip_trunk_id:
         raise HTTPException(status_code=503, detail="No SIP outbound trunk found. Run /api/setup first.")
 
     room_name = f"outbound_{request.phoneNumber.replace('+', '').replace(' ', '')}_{int(time.time())}"
 
-    # 1. Spawn the conversion bot
+    # 1. Spawn the conversion bot (pass agent gender so pitch shift is correct)
     try:
-        await _do_start_bot(room_name, background_tasks)
+        await _do_start_bot(room_name, background_tasks, request.agentGender)
     except HTTPException:
         raise
     except Exception as e:
@@ -653,10 +667,12 @@ async def call_end(request: EndCallRequest):
         except Exception as e:
             print(f"[Server Error deleting room] {e}")
 
-    # 3. Twilio client hangup fallback
+    # 3. Twilio client hangup fallback (inbound calls have a Twilio CallSid).
+    # Outbound calls are LiveKit-originated SIP — there is no Twilio CallSid.
+    # Those are ended by deleting the LiveKit room (step 2 above).
     if twilio_client and room_name in active_calls:
         call_info = active_calls[room_name]
-        if "call_sid" in call_info:
+        if call_info.get("direction") == "inbound" and "call_sid" in call_info:
             try:
                 twilio_client.calls(call_info["call_sid"]).update(status="completed")
                 print(f"[Server] Twilio CallSid {call_info['call_sid']} hung up programmatically")
@@ -746,38 +762,45 @@ async def setup_integrations():
         try:
             lk = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
 
-            # Check if trunk already exists to avoid duplicates
+            # Check if trunk already exists to avoid recreating it on every /api/setup call.
+            # Recreating the trunk changes its ID, which breaks the TWILIO_SIP_TRUNK_ID env var
+            # and causes a 404 "object cannot be found" on the next outbound call.
             existing = await lk.sip.list_outbound_trunk(api.ListSIPOutboundTrunkRequest())
             existing_trunk = next((t for t in existing.items if t.name == "Keira Twilio Outbound"), None)
 
             clean_phone = TWILIO_PHONE_NUMBER.replace(" ", "")
-            # Delete and recreate if phone number may have changed or had spaces
-            if existing_trunk:
-                try:
-                    await lk.sip.delete_trunk(api.DeleteSIPTrunkRequest(sip_trunk_id=existing_trunk.sip_trunk_id))
-                    print(f"[Setup] Deleted old outbound trunk to recreate with clean number: {existing_trunk.sip_trunk_id}")
-                except Exception:
-                    pass
 
-            trunk_info = api.SIPOutboundTrunkInfo(
-                name="Keira Twilio Outbound",
-                address=TWILIO_SIP_URI,
-                numbers=[clean_phone],
-                auth_username=TWILIO_SIP_USERNAME,
-                auth_password=TWILIO_SIP_PASSWORD,
-            )
-            created = await lk.sip.create_outbound_trunk(
-                api.CreateSIPOutboundTrunkRequest(trunk=trunk_info)
-            )
-            trunk_id = created.sip_trunk_id
-            print(f"[Setup] Created LiveKit SIP Outbound Trunk: {trunk_id} with number {clean_phone}")
-            results["livekit_sip_trunk"] = {
-                "status": "created",
-                "trunk_id": trunk_id,
-                "address": TWILIO_SIP_URI,
-                "numbers": [clean_phone],
-                "action": f"Save TWILIO_SIP_TRUNK_ID={trunk_id} in your Render env vars then redeploy",
-            }
+            if existing_trunk:
+                # Reuse the existing trunk — its ID is stable and the env var stays valid.
+                trunk_id = existing_trunk.sip_trunk_id
+                print(f"[Setup] Reusing existing LiveKit SIP Outbound Trunk: {trunk_id}")
+                results["livekit_sip_trunk"] = {
+                    "status": "already_exists",
+                    "trunk_id": trunk_id,
+                    "address": existing_trunk.address,
+                    "numbers": list(existing_trunk.numbers),
+                    "note": "Trunk already exists and was reused. TWILIO_SIP_TRUNK_ID env var remains valid.",
+                }
+            else:
+                trunk_info = api.SIPOutboundTrunkInfo(
+                    name="Keira Twilio Outbound",
+                    address=TWILIO_SIP_URI,
+                    numbers=[clean_phone],
+                    auth_username=TWILIO_SIP_USERNAME,
+                    auth_password=TWILIO_SIP_PASSWORD,
+                )
+                created = await lk.sip.create_outbound_trunk(
+                    api.CreateSIPOutboundTrunkRequest(trunk=trunk_info)
+                )
+                trunk_id = created.sip_trunk_id
+                print(f"[Setup] Created LiveKit SIP Outbound Trunk: {trunk_id} with number {clean_phone}")
+                results["livekit_sip_trunk"] = {
+                    "status": "created",
+                    "trunk_id": trunk_id,
+                    "address": TWILIO_SIP_URI,
+                    "numbers": [clean_phone],
+                    "action": f"Save TWILIO_SIP_TRUNK_ID={trunk_id} in your Render env vars then redeploy",
+                }
         except Exception as e:
             _tb.print_exc()
             errors["livekit_sip_trunk"] = str(e)
