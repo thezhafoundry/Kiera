@@ -166,8 +166,12 @@ class RVCStreamingConverter(VoiceConverter):
             if task is not None:
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+                except asyncio.CancelledError:
+                    pass  # expected on teardown — not an error
+                except Exception:
+                    # A real fault in a background task (e.g. the in_audio iterator
+                    # raised) winds the call down to silence — log so it's traceable.
+                    logger.exception("[RVCStreamingConverter] background task failed during teardown")
 
     async def close(self) -> None:
         """Stop streaming and release the connection. Safe to call even if
@@ -283,6 +287,10 @@ class RVCStreamingConverter(VoiceConverter):
                     self._buffer_not_empty.set()
                 raise
             except Exception:
+                # Send failed on a still-"open" socket (mirror the reader-side
+                # log): requeue the un-acked frame and let the connection loop
+                # reconnect. Log so a flapping socket is diagnosable.
+                logger.warning("[RVCStreamingConverter] WS send failed — requeuing frame, will reconnect")
                 async with self._buffer_lock:
                     self._buffer.appendleft(frame)
                     self._buffered_bytes += len(frame)
