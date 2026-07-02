@@ -253,11 +253,47 @@ class VoiceConversionWorker:
         """Fail-closed warm-gate probe (used by the caller before dialing/bridging
         a lead): confirms the converter's backend can accept a session within
         `timeout` seconds. Converters without a real "warm" concept (e.g.
-        DummyVoiceConverter) are always considered ready."""
+        DummyVoiceConverter) are always considered ready.
+
+        NOTE: for RVCStreamingConverter this opens a real, short-lived `/ws` probe
+        session against the backend (see rvc_stream.py's wait_ready). The backend
+        enforces one concurrent session, so calling this concurrently with the
+        background task started by start_readiness_probe() races two probes
+        against each other and can spuriously starve one of them. Callers that
+        want a blocking readiness check on a worker that already has a background
+        probe running should await wait_for_readiness_probe() instead of calling
+        this directly."""
         wait_ready = getattr(self.converter, "wait_ready", None)
         if wait_ready is None:
             return True
         return await wait_ready(timeout)
+
+    async def wait_for_readiness_probe(self, fallback_timeout: float = 150.0) -> bool:
+        """Blocking readiness check that reuses the single background probe
+        started by start_readiness_probe(), instead of opening a second,
+        independent wait_ready() session. This is what fixes the outbound-call
+        race: previously call_outbound awaited worker.wait_until_ready(150.0)
+        directly, with no `await` between that and start_readiness_probe()
+        spawning its own background task — both ended up opening a /ws probe
+        connection to the (1-concurrent-session) backend in the same event-loop
+        window, so one of them would get {"type":"busy"} and report not-ready
+        even though the GPU was actually warm. Awaiting the *same* task here
+        means only one probe connection is ever opened per worker; this method
+        just waits for it to resolve and returns the cached result.
+
+        Degrades to a fresh wait_until_ready() call if start_readiness_probe()
+        was never invoked for this worker (shouldn't happen given current
+        wiring, but avoids a new failure mode — e.g. hanging forever — if it
+        ever does)."""
+        if self._readiness_task is None:
+            return await self.wait_until_ready(fallback_timeout)
+        try:
+            await self._readiness_task
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        return self.is_ready
 
     async def _run_audio_pipeline(self, track: rtc.RemoteAudioTrack):
         """Producer loop: Receives raw mic frames, applies noise suppression, and pushes to queue."""

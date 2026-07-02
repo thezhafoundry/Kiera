@@ -1,5 +1,4 @@
 webrtc-noise-gain>=0.0.1; sys_platform == "linux"
-webrtcvad>=2.0.10; sys_platform == "linux"
 setuptools<82; sys_platform == "linux"
 fastapi>=0.110.0
 uvicorn>=0.28.0

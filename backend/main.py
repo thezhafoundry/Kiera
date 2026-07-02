@@ -357,16 +357,32 @@ async def call_outbound(request: OutboundCallRequest, background_tasks: Backgrou
     # failure — publishing converted audio to a lead requires a ready GPU session
     # (the pipeline never falls back to raw voice; see pipeline.py), so an unready
     # engine here must abort the call, not proceed with silence.
+    #
+    # We await wait_for_readiness_probe() here rather than wait_until_ready()
+    # directly: _do_start_bot already kicked off a background readiness probe
+    # via worker.start_readiness_probe() with no `await` between that call and
+    # this one, so a direct wait_until_ready() call here would open a *second*,
+    # independent probe session racing the background one against the backend's
+    # 1-concurrent-session limit — the loser gets {"type":"busy"} and reports
+    # not-ready even when the GPU is actually warm. wait_for_readiness_probe()
+    # instead awaits that same background task, so exactly one probe connection
+    # is opened per outbound call.
     worker = active_workers.get(room_name)
-    if worker:
-        ok = await worker.wait_until_ready(150.0)
-        if not ok:
-            await worker.stop()
-            active_workers.pop(room_name, None)
-            raise HTTPException(
-                status_code=503,
-                detail="Voice engine not ready — GPU still warming. Try again shortly.",
-            )
+    if not worker:
+        # _do_start_bot() above sets active_workers[room_name] synchronously
+        # before returning (it's a plain await, not a BackgroundTasks entry),
+        # so reaching here with no worker is an invariant violation, not an
+        # expected "not started yet" state.
+        raise HTTPException(status_code=500, detail="Bot worker failed to initialize.")
+
+    ok = await worker.wait_for_readiness_probe(150.0)
+    if not ok:
+        await worker.stop()
+        active_workers.pop(room_name, None)
+        raise HTTPException(
+            status_code=503,
+            detail="Voice engine not ready — GPU still warming. Try again shortly.",
+        )
 
     # 2. LiveKit dials the lead via Twilio Elastic SIP Trunking.
     #    LiveKit → SIP trunk → Twilio → PSTN → lead's phone.

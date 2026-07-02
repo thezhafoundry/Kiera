@@ -13,6 +13,7 @@ from backend.noise.noise_suppressor import WebRTCNoiseSuppressor
 from backend.converters.dummy import DummyVoiceConverter
 from backend.converters.rvc import RVCVoiceConverter
 from backend.converters.rvc_stream import RVCStreamingConverter, _MAX_BUFFER_BYTES
+from backend.pipeline import VoiceConversionWorker
 
 async def test_noise_suppressor():
     print("\n--- Testing Noise Suppressor ---")
@@ -507,6 +508,66 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
     print("RVCStreamingConverter buffer-cap drop-oldest test: SUCCESS")
 
 
+async def test_worker_readiness_probe_dedup():
+    print("\n--- Testing VoiceConversionWorker readiness-probe dedup (outbound race fix) ---")
+
+    class _CountingReadyConverter:
+        """Stands in for RVCStreamingConverter's wait_ready(): counts how many
+        independent probe calls are made, so we can assert that starting the
+        background probe (as _do_start_bot does) and then awaiting the shared
+        result (as call_outbound now does) opens exactly ONE probe -- not two
+        racing ones against a 1-concurrent-session backend."""
+
+        def __init__(self):
+            self.call_count = 0
+
+        async def wait_ready(self, timeout):
+            self.call_count += 1
+            await asyncio.sleep(0.05)
+            return True
+
+    converter = _CountingReadyConverter()
+    worker = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=converter,
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+    )
+
+    # Reproduce _do_start_bot's sequence: kick off the background probe, then
+    # -- with no `await` in between, same as call_outbound -- have the caller
+    # block on readiness via the new shared accessor rather than calling
+    # wait_until_ready() directly (which would open a second probe session).
+    worker.start_readiness_probe(5.0)
+    ok = await worker.wait_for_readiness_probe(5.0)
+
+    assert ok is True, "expected the shared readiness probe to report ready"
+    assert converter.call_count == 1, (
+        "expected exactly one wait_ready() probe call shared between the "
+        f"background probe and the blocking waiter, got {converter.call_count}"
+    )
+    assert worker.is_ready is True, "is_ready should reflect the shared probe's result"
+    print(f"wait_ready() probe calls for background+outbound paths: {converter.call_count} (expected 1) OK")
+
+    # A worker with no background probe started (defensive/edge case, "shouldn't
+    # happen given current wiring") must still resolve correctly rather than
+    # hanging or crashing -- wait_for_readiness_probe() degrades to a direct
+    # wait_until_ready() call in that case.
+    converter2 = _CountingReadyConverter()
+    worker2 = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=converter2,
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+    )
+    ok2 = await worker2.wait_for_readiness_probe(5.0)
+    assert ok2 is True
+    assert converter2.call_count == 1
+    print("wait_for_readiness_probe() with no background probe started degrades to a direct probe: OK")
+
+    print("VoiceConversionWorker readiness-probe dedup test: SUCCESS")
+
+
 async def main():
     print("Running automated pipeline verification tests...")
     await test_noise_suppressor()
@@ -516,6 +577,7 @@ async def main():
     await test_rvc_streaming_converter_basic()
     await test_rvc_streaming_converter_reconnect()
     await test_rvc_streaming_converter_buffer_cap_drop_oldest()
+    await test_worker_readiness_probe_dedup()
     print("\nAll automated verification tests completed successfully!")
 
 if __name__ == "__main__":

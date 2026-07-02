@@ -291,12 +291,16 @@ work through these in order:
    visible in the Modal container logs (`modal app logs rvc-worker`).
 6. **A cold GPU now blocks the call, by design — it does not degrade to raw voice.** The old
    per-chunk `budget_ms=2000.0`/raw-fallback design is gone entirely (see the banner and §4.2).
-   Instead: outbound (`POST /api/call/outbound`) `await`s `worker.wait_until_ready(150.0)` after
-   spawning the bot and returns HTTP 503 without dialing the lead if the converter's backend
-   isn't ready in time; inbound (`POST /api/call/wait`) only bridges to LiveKit SIP once
-   `worker.is_ready` is true, otherwise it keeps returning hold-music TwiML and re-polling. This
-   is the fail-safe working as intended — a cold/unready GPU produces a bounded wait or a clean
-   503, never a period of the lead hearing the agent's real voice. Note `wait_until_ready` for
+   Instead: `_do_start_bot` kicks off a single background readiness probe via
+   `worker.start_readiness_probe()`; outbound (`POST /api/call/outbound`) `await`s
+   `worker.wait_for_readiness_probe()`, which shares that same background probe (rather than
+   opening a second, independent one) and returns HTTP 503 without dialing the lead if the
+   converter's backend isn't ready in time; inbound (`POST /api/call/wait`) only bridges to
+   LiveKit SIP once `worker.is_ready` is true (the cached result of that same background probe),
+   otherwise it keeps returning hold-music TwiML and re-polling. This is the gate working as
+   intended — fail-closed, not the old fail-safe raw fallback — a cold/unready GPU produces a
+   bounded wait or a clean 503, never a period of the lead hearing the agent's real voice. Note
+   `wait_until_ready`/`wait_ready` for
    `RVCStreamingConverter` opens a short-lived **`/ws` probe connection** (not a `/health` HTTP
    check) that expects `{"type":"ready"}` — if the server is already serving a real call (the
    1-concurrent-session MVP), that probe gets `{"type":"busy"}` and is treated as not-ready, so
