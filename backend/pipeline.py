@@ -259,9 +259,9 @@ class VoiceConversionWorker:
                 age_before = time.time() - chunk_start_t
                 if age_before > MAX_AGE_S:
                     print(f"[Worker] Queue backed up: skipping RVC for stale chunk {seq} (age: {age_before:.1f}s)")
-                    audio = self._resample_16k_to_48k(raw_chunk)
+                    audio, is_converted = self._resample_16k_to_48k(raw_chunk), False
                 else:
-                    audio = await self._convert_chunk(chunk_with_carry, raw_chunk, carry_len, chunk_start_t)
+                    audio, is_converted = await self._convert_chunk(chunk_with_carry, raw_chunk, carry_len, chunk_start_t)
 
             # Re-check age after conversion — discard if too old to be useful
             age_after = time.time() - chunk_start_t
@@ -271,7 +271,7 @@ class VoiceConversionWorker:
 
             # Publish immediately — use lock so frames from parallel chunks don't interleave
             async with publish_seq_lock:
-                await self._publish_audio(audio)
+                await self._publish_audio(audio, is_converted=is_converted)
 
         publisher_task = None   # no longer used; publishing happens directly in convert_and_publish
         carry_over     = b""
@@ -358,9 +358,9 @@ class VoiceConversionWorker:
         samples = np.frombuffer(pcm_16k, dtype=np.int16)
         return np.repeat(samples, 3).tobytes()
 
-    async def _convert_chunk(self, chunk_with_carry: bytes, raw_chunk: bytes, carry_len: int, chunk_start_t: float) -> bytes:
-        """Converts one chunk via the voice converter. Returns 48kHz PCM ready to publish."""
-
+    async def _convert_chunk(self, chunk_with_carry: bytes, raw_chunk: bytes, carry_len: int, chunk_start_t: float) -> tuple[bytes, bool]:
+        """Converts one chunk via the voice converter.
+        Returns (48kHz PCM, is_converted) where is_converted=False means fail-safe raw audio."""
         async def chunk_generator() -> AsyncIterator[bytes]:
             yield chunk_with_carry
 
@@ -395,35 +395,46 @@ class VoiceConversionWorker:
             else:
                 slice_len = 0
             audio_payload = bytes(converted_bytes[slice_len:])
+
+            # Emit latency metric to the room data channel for the frontend
+            if self.room and self.room.isconnected():
+                import json
+                async def safe_publish():
+                    try:
+                        await self.room.local_participant.publish_data(
+                            json.dumps({"pipeline_latency_ms": added_latency_ms, "is_fallback": False}).encode()
+                        )
+                    except Exception:
+                        pass
+                asyncio.create_task(safe_publish())
+
+            return audio_payload, True
         else:
             print(f"[Worker] Fail-safe fallback (latency: {added_latency_ms:.0f}ms)")
             # Fallback resamples the raw chunk without the carry-over context
             audio_payload = self._resample_16k_to_48k(raw_chunk)
+            return audio_payload, False
 
-        # Emit latency metric to the room data channel for the frontend
-        if self.room and self.room.isconnected():
-            import json
-            async def safe_publish():
-                try:
-                    await self.room.local_participant.publish_data(
-                        json.dumps({"pipeline_latency_ms": added_latency_ms, "is_fallback": not success}).encode()
-                    )
-                except Exception:
-                    pass
-            asyncio.create_task(safe_publish())
 
-        return audio_payload
-
-    async def _publish_audio(self, audio_payload: bytes):
+    async def _publish_audio(self, audio_payload: bytes, is_converted: bool = True):
         """Publish 48kHz PCM audio to LiveKit with a pre-buffer for smooth playback.
 
-        The first PREBUFFER_BYTES of audio are held back. Once the buffer fills,
+        The first PREBUFFER_BYTES of *converted* audio are held back. Once the buffer fills,
         the full buffer is released as a burst and streaming continues normally.
-        This hides the RVC cold-start jitter and keeps the lead's audio smooth.
+        Fail-safe (raw, unconverted) chunks are silently discarded during the pre-buffer phase
+        so the lead only ever hears Kiera's voice — never a leaking raw syllable.
+        Once streaming has started, fail-safe audio is accepted normally to prevent gaps.
         """
         async with self._publish_lock:
             if not self._prebuffer_ready:
-                # Still filling the pre-buffer
+                if not is_converted:
+                    # Discard fail-safe audio while pre-buffering — only real converted
+                    # audio should prime the buffer. This prevents the first syllable
+                    # ('Hey,') from leaking through in the original raw voice.
+                    print("[Worker] Pre-buffer: discarding fail-safe chunk (not converted).")
+                    return
+
+                # Add converted audio to the pre-buffer
                 self._prebuffer.extend(audio_payload)
                 buffered_secs = len(self._prebuffer) / (48000 * 2)
                 print(f"[Worker] Pre-buffering... {buffered_secs:.2f}s / {self._PREBUFFER_BYTES/(48000*2):.1f}s")
