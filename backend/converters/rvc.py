@@ -64,7 +64,8 @@ class RVCVoiceConverter(VoiceConverter):
             pcm_buffer.extend(chunk)
 
         if len(pcm_buffer) < 640:
-            yield bytes(pcm_buffer)
+            # Too little audio to bother converting — never leak raw PCM to the
+            # caller; just yield nothing.
             return
 
         wav_bytes = _build_wav(bytes(pcm_buffer), sample_rate=16000)
@@ -87,8 +88,7 @@ class RVCVoiceConverter(VoiceConverter):
         converted_pcm = resp.content
         if len(converted_pcm) > 0:
             yield converted_pcm
-        else:
-            yield bytes(pcm_buffer)
+        # Empty response: never leak raw/unconverted PCM — yield nothing.
 
 
     async def close(self) -> None:

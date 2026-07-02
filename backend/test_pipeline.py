@@ -71,11 +71,14 @@ async def test_dummy_converter():
     
     print(f"Dummy conversion took {duration_ms:.2f}ms for 500ms of audio")
     print(f"Input size: {len(input_bytes)} bytes, Output size: {len(output_bytes)} bytes")
-    assert len(output_bytes) == len(input_bytes), "Conversion output size mismatch!"
-    
-    # Ensure audio was modified
+    # DummyVoiceConverter now upsamples 16kHz -> 48kHz (3x) to match the
+    # streaming converter output contract (see backend/converters/dummy.py).
+    assert len(output_bytes) == len(input_bytes) * 3, "Conversion output size mismatch!"
+
+    # Ensure audio was modified. Undo the 3x sample repeat before comparing so
+    # the two arrays are the same shape as the original 16kHz signal.
     in_arr = np.frombuffer(input_bytes, dtype=np.int16)
-    out_arr = np.frombuffer(output_bytes, dtype=np.int16)
+    out_arr = np.frombuffer(output_bytes, dtype=np.int16)[::3]
     diff = np.mean(np.abs(in_arr - out_arr))
     print(f"Average signal modification delta: {diff:.1f}")
     assert diff > 10.0, "Audio was not modified by the dummy converter!"
