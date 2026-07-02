@@ -2,7 +2,7 @@
   "mcpServers": {
     "render": {
       "type": "http",
-      "url": "https://kiera.onrender.com",
+      "url": "https://mcp.render.com/mcp",
       "headers": {
         "Authorization": "Bearer rnd_gdLQ7lZZloEXKj2HNpvBXRIFHYpS"
       }

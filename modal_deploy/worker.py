@@ -266,6 +266,12 @@ engine = RVCEngine()
     timeout=10800,
     volumes={"/root/rvc-models": volume},
     scaledown_window=120,   # keep container warm for 2 min between requests, then auto-shutdown
+    # Pin to Asia-Pacific so this GPU sits next to Render/Twilio once those also move to
+    # Singapore, instead of Virginia (~13-19,000km / a full extra transpacific round trip
+    # per RVC chunk). Narrow "ap-southeast" (Singapore) costs ~1.75x base GPU price vs
+    # ~1.5x for the broader "ap" — using the narrow pin here since this container talks to
+    # Render/Twilio in Singapore specifically, not elsewhere in APAC.
+    region="ap-southeast",
 )
 @modal.asgi_app()
 def fastapi_app():

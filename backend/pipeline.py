@@ -98,7 +98,14 @@ class VoiceConversionWorker:
         # Publish the converted audio output track
         # We use 48kHz because RVC outputs 48kHz PCM.
         # Fallback audio (16kHz) will be resampled to 48kHz before publishing.
-        self.audio_source = rtc.AudioSource(48000, 1)
+        # queue_size_ms bounds LiveKit's internal playout buffer. The default (~1s)
+        # lets converted audio pile up mid-call, which is a major reason the lead's
+        # delay kept *growing* to 10-15s. A small buffer keeps end-to-end latency flat.
+        try:
+            self.audio_source = rtc.AudioSource(48000, 1, queue_size_ms=400)
+        except TypeError:
+            # Older livekit builds don't accept queue_size_ms
+            self.audio_source = rtc.AudioSource(48000, 1)
         self.published_track = rtc.LocalAudioTrack.create_audio_track(
             "converted-audio", 
             self.audio_source
@@ -191,19 +198,30 @@ class VoiceConversionWorker:
         FRAME_BYTES   = 320          # 10ms @ 16kHz 16-bit mono
         FRAME_MS      = 10
 
-        MIN_CHUNK_MS  = 600          # don't send anything shorter to RVC
-        MAX_CHUNK_MS  = 2500         # hard cap — prevents unbounded latency on long sentences
-        SILENCE_MS    = 300          # consecutive silence to trigger a chunk cut
+        # Low-latency chunking. The old values (min 600 / max 2500 / silence 300)
+        # meant that during continuous speech we waited up to 2.5s just to *collect*
+        # a chunk before sending it to RVC — the dominant source of the 8-15s delay.
+        # Smaller chunks cut collection latency to well under 1s. The 100ms carry-over
+        # still smooths chunk boundaries so speech stays continuous ("no interruptions").
+        MIN_CHUNK_MS  = 250          # don't send anything shorter to RVC (F0 needs some context)
+        MAX_CHUNK_MS  = max(int(self.chunk_duration_ms), 400)  # hard cap, honors config (default 700ms)
+        SILENCE_MS    = 150          # consecutive silence to trigger a natural-pause cut
+        CARRY_MS      = 100          # carry-over prepended to the next chunk
 
-        min_frames    = MIN_CHUNK_MS  // FRAME_MS   # 30 frames
-        max_frames    = MAX_CHUNK_MS  // FRAME_MS   # 250 frames
-        silence_limit = SILENCE_MS    // FRAME_MS   # 20 consecutive silent frames
+        # Any chunk older than this (measured from when its first frame was captured)
+        # is considered stale — we skip the RVC call / drop it rather than let the
+        # lead's audio fall further behind. Keeps end-to-end latency bounded.
+        MAX_AGE_S     = 1.0
 
-        carry_bytes   = int(SAMPLE_RATE * 2 * 0.20)   # 200ms carry-over
+        min_frames    = MIN_CHUNK_MS  // FRAME_MS
+        max_frames    = MAX_CHUNK_MS  // FRAME_MS
+        silence_limit = SILENCE_MS    // FRAME_MS
+
+        carry_bytes   = int(SAMPLE_RATE * 2 * (CARRY_MS / 1000.0))   # carry-over bytes
 
         print(f"[Worker] VAD pipeline active. "
               f"min={MIN_CHUNK_MS}ms  silence_cut={SILENCE_MS}ms  max={MAX_CHUNK_MS}ms  "
-              f"carry-over=200ms  max_concurrent_rvc=2")
+              f"carry-over={CARRY_MS}ms  max_age={MAX_AGE_S}s  max_concurrent_rvc=2")
 
         # Try to initialise webrtcvad for silence detection (falls back to fixed chunking)
         vad = None
@@ -232,7 +250,7 @@ class VoiceConversionWorker:
                     
                     # Calculate how old this audio chunk is
                     age = time.time() - chunk_start_t
-                    if age > 5.0:
+                    if age > MAX_AGE_S:
                         # Stale chunk — discard it to prevent permanent audio buffer backup/delay
                         print(f"[Worker] Discarding stale chunk {next_publish_seq} (age: {age:.1f}s) to keep low latency")
                     else:
@@ -243,7 +261,7 @@ class VoiceConversionWorker:
             async with rvc_semaphore:
                 # Check if this chunk is already stale before making a slow remote RVC call
                 age_before = time.time() - chunk_start_t
-                if age_before > 2.5:
+                if age_before > MAX_AGE_S:
                     print(f"[Worker] Queue backed up: skipping RVC for stale chunk {seq} (age: {age_before:.1f}s)")
                     audio = self._resample_16k_to_48k(raw_chunk)
                 else:
@@ -303,8 +321,8 @@ class VoiceConversionWorker:
                     asyncio.create_task(convert_and_stage(chunk_bytes, pcm_chunk, carry_len, chunk_start_t, pending_seq))
                     pending_seq += 1
 
-                    # Safety valve: shed frames only when severely behind (> 5 seconds queued)
-                    overload_frames = (5000 // FRAME_MS)
+                    # Safety valve: shed frames when the input queue falls behind (> 2 seconds queued)
+                    overload_frames = (2000 // FRAME_MS)
                     if self._audio_queue.qsize() > overload_frames:
                         shed = 0
                         while self._audio_queue.qsize() > overload_frames // 2:
@@ -359,8 +377,18 @@ class VoiceConversionWorker:
 
         if success:
             print(f"[Latency] {added_latency_ms:.0f}ms total (conversion: {(time.time()-start_request_t)*1000:.0f}ms)")
-            # Slice off the converted context (carry-over) to prevent repeating stutter
-            slice_len = carry_len * 3
+            # Slice off the converted carry-over context to prevent a repeating stutter
+            # at chunk boundaries. RVC does NOT guarantee the output length is exactly
+            # 3× the input length (it resamples internally and F0/pitch processing shifts
+            # sample counts), so a fixed carry_len*3 slice mis-cuts the boundary and clips
+            # words or leaks duplicated syllables. Slice *proportionally* to the real
+            # output length so the boundary stays aligned regardless of the output rate.
+            total_in = len(chunk_with_carry)
+            if total_in > 0 and carry_len > 0:
+                slice_len = int(round(len(converted_bytes) * (carry_len / total_in)))
+                slice_len -= slice_len % 2  # keep 16-bit sample alignment
+            else:
+                slice_len = 0
             audio_payload = bytes(converted_bytes[slice_len:])
         else:
             print(f"[Worker] Fail-safe fallback (latency: {added_latency_ms:.0f}ms)")
@@ -385,6 +413,15 @@ class VoiceConversionWorker:
         """Publish 48kHz PCM audio to LiveKit. Uses a lock so chunks never interleave."""
         # Lock ensures two background publish tasks never write frames simultaneously
         async with self._publish_lock:
+            # If the output buffer is already backed up, drop what's queued before
+            # adding more — better a tiny skip than a delay that compounds every chunk.
+            try:
+                queued = getattr(self.audio_source, "queued_duration", 0) or 0
+                if queued > 0.4 and hasattr(self.audio_source, "clear_queue"):
+                    self.audio_source.clear_queue()
+            except Exception:
+                pass
+
             frame_size = 960  # 10ms at 48kHz mono 16-bit
             for i in range(0, len(audio_payload), frame_size):
                 slice_bytes = audio_payload[i:i + frame_size]

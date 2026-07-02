@@ -154,7 +154,7 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
             endpoint_url=RVC_ENDPOINT_URL,
             api_key=RVC_API_KEY,
             pitch_shift=pitch_shift,
-            budget_ms=5000.0,
+            budget_ms=2000.0,
         )
     else:
         print("[Server] No RVC endpoint config found. Spawning Dummy Pitch Modulation Engine.")
@@ -163,11 +163,17 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
     # Initialize noise suppression (WebRTC)
     suppressor = WebRTCNoiseSuppressor(ns_level=3)
 
-    # Set chunk size and budget based on converter type
+    # Set chunk size and budget based on converter type.
+    #   chunk_ms  → hard cap on how long the pipeline collects speech before sending a
+    #               chunk to RVC (the VAD cuts earlier at natural pauses). Smaller = lower latency.
+    #   budget_ms → max time to wait for a conversion before failing over to the raw
+    #               denoised voice. A COLD GPU cannot beat this, so keep it small: the lead
+    #               hears the agent's real (unconverted) voice promptly instead of 8-10s of lag.
+    #               Warm T4 inference on a ~700ms chunk finishes well within 2s.
     is_rvc = isinstance(converter, RVCVoiceConverter)
     if is_rvc:
-        chunk_ms = 1000  # 1000ms: parallel pipeline overlaps collection+conversion → ~1.8s total latency
-        budget_ms = 8000.0  # 8s budget covers Modal cold start + network RTT + T4 inference
+        chunk_ms = 700
+        budget_ms = 2000.0
     else:
         chunk_ms = 300
         budget_ms = 300.0
@@ -195,6 +201,26 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
             active_workers.pop(room_name, None)
             await worker.stop()
             print(f"[Server] Bot cleaned up for room: {room_name}")
+
+    # Kick off a GPU warm-up ping the instant the bot starts. Modal cold-starts the
+    # T4 on the first request (~8-30s); firing /health now overlaps that cold start
+    # with call setup and the lead's phone ringing, so the GPU is (nearly) warm by the
+    # time the agent's first words arrive — instead of the cold start being added on
+    # top of the first converted audio. Fire-and-forget; failures are non-fatal.
+    if RVC_ENDPOINT_URL:
+        async def _prewarm_rvc():
+            try:
+                import httpx
+                health_url = (RVC_ENDPOINT_URL
+                              .replace("/convert", "/health")
+                              .replace("web-convert", "web-health")
+                              .replace("web_convert", "web_health"))
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    await client.get(health_url)
+                print("[Server] RVC pre-warm ping sent on bot start (overlaps GPU cold start with ringing)")
+            except Exception as e:
+                print(f"[Server] RVC pre-warm ping failed (non-fatal): {e}")
+        asyncio.create_task(_prewarm_rvc())
 
     background_tasks.add_task(run_worker_task)
     return {"status": "started", "botIdentity": bot_identity}
