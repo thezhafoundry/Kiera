@@ -555,6 +555,138 @@ def convert_file(audio_bytes: bytes, pitch: int = 0) -> bytes:
     return test_engine.run_conversion(audio_bytes, pitch=pitch)
 
 
+def _load_wav_as_pcm16_mono(audio_bytes: bytes):
+    import io
+    import wave
+    import numpy as np
+
+    with wave.open(io.BytesIO(audio_bytes)) as wf:
+        sr = wf.getframerate()
+        nch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
+
+    if sw != 2:
+        raise ValueError(f"expected 16-bit PCM, got sampwidth={sw}")
+
+    samples = np.frombuffer(raw, dtype=np.int16)
+    if nch > 1:
+        samples = samples.reshape(-1, nch)[:, 0]  # take first channel
+
+    if sr != st.SAMPLE_RATE_IN:
+        raise ValueError(
+            f"test file is {sr}Hz, expected {st.SAMPLE_RATE_IN}Hz (16kHz) -- the "
+            "production pipeline assumes 16kHz input; a mismatched sample rate "
+            "here would itself explain a pitch/identity difference, separately "
+            "from anything this diagnostic is trying to isolate."
+        )
+    return samples
+
+
+@app.function(
+    image=image,
+    gpu="T4",  # matches convert_file's GPU and the actually-deployed fastapi_app
+    timeout=10800,
+    volumes={"/root/rvc-models": volume},
+)
+def convert_file_chunked(audio_bytes: bytes, pitch: int = 12) -> bytes:
+    """
+    Diagnostic (2026-07-03): runs the SAME block-accumulate + SOLA-crossfade
+    pipeline the live /ws handler uses (see fastapi_app's ws_stream), but driven
+    by a static WAV file instead of a live WebSocket. Isolates whether the live
+    call's "doesn't sound like the trained voice" symptom comes from the
+    chunked-streaming architecture itself, on the exact same reference audio
+    convert_file() already produces a known single-pass conversion for.
+    """
+    import numpy as np
+
+    test_engine = RVCEngine()
+    test_engine.startup()
+
+    samples = _load_wav_as_pcm16_mono(audio_bytes)
+
+    acc = st.BlockAccumulator()
+    acc.push(samples)
+
+    pending_tail = np.zeros(0, dtype=np.int16)
+    emitted = []
+
+    while True:
+        popped = acc.pop_block()
+        if popped is None:
+            break
+        infer_input, context_len, block = popped
+
+        if st.block_rms(block) < st.SILENCE_RMS_THRESHOLD:
+            out = np.zeros(len(block) * 3 + st.SOLA_CROSSFADE_SAMPLES, dtype=np.int16)
+        else:
+            wav_bytes = st.pcm16_to_wav_bytes(infer_input)
+            out_bytes = test_engine.run_conversion(wav_bytes, pitch=pitch)
+            out = np.frombuffer(out_bytes, dtype=np.int16)
+            out = st.trim_context(
+                out, context_len, len(infer_input), overlap_keep=st.SOLA_CROSSFADE_SAMPLES
+            )
+
+        emit, pending_tail = st.sola_crossfade(pending_tail, out)
+        if len(emit):
+            emitted.append(emit.tobytes())
+
+    # ws_stream never flushes the held-back tail (a real call has no "end of
+    # stream" to flush at) -- a one-shot file test does, so flush it here or
+    # the last ~80ms crossfade tail is silently dropped from the output.
+    if len(pending_tail):
+        emitted.append(pending_tail.tobytes())
+
+    return b"".join(emitted)
+
+
+@app.local_entrypoint()
+def main_chunked(pitch: int = 12):
+    import struct
+
+    input_file = r"D:\Kiera\test1.wav"
+
+    print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch}")
+    print("[Chunked Test] Simulates the live /ws block-accumulate + SOLA-crossfade")
+    print("[Chunked Test] pipeline on a static file -- compare the output against")
+    print("[Chunked Test] test11.wav (convert_file's single-pass output) on the")
+    print("[Chunked Test] exact same input file.")
+
+    with open(input_file, "rb") as f:
+        audio_bytes = f.read()
+
+    output_pcm = convert_file_chunked.remote(audio_bytes, pitch=pitch)
+
+    sample_rate = 48000
+    num_channels = 1
+    bits_per_sample = 16
+    block_align = num_channels * (bits_per_sample // 8)
+    byte_rate = sample_rate * block_align
+    data_size = len(output_pcm)
+
+    header = bytearray(44)
+    header[0:4] = b'RIFF'
+    header[4:8] = struct.pack('<I', 36 + data_size)
+    header[8:12] = b'WAVE'
+    header[12:16] = b'fmt '
+    header[16:20] = struct.pack('<I', 16)
+    header[20:22] = struct.pack('<H', 1)
+    header[22:24] = struct.pack('<H', num_channels)
+    header[24:28] = struct.pack('<I', sample_rate)
+    header[28:32] = struct.pack('<I', byte_rate)
+    header[32:34] = struct.pack('<H', block_align)
+    header[34:36] = struct.pack('<H', bits_per_sample)
+    header[36:40] = b'data'
+    header[40:44] = struct.pack('<I', data_size)
+
+    output_path = r"D:\Kiera\test11_chunked.wav"
+    with open(output_path, "wb") as f:
+        f.write(bytes(header) + output_pcm)
+
+    print(f"[Chunked Test] Conversion complete -- saved {len(output_pcm)} bytes to {output_path}")
+    print("[Chunked Test] Compare against D:\\Kiera\\test11.wav (single-pass) on the same input.")
+
+
 @app.local_entrypoint()
 def main(pitch: int = -1):
     import struct
