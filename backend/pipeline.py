@@ -28,11 +28,21 @@ class VoiceConversionWorker:
     resumes yielding real converted audio — there is no raw-audio fallback path.
     """
 
-    # One-time jitter-buffer fill target before playout starts: hold converted
-    # output until this many bytes (100ms of 48kHz 16-bit mono) have accumulated,
-    # then publish continuously. After the initial fill, capture_frame's own
-    # backpressure paces playback — see _publish_frames / AudioSource queue_size_ms.
-    _JITTER_TARGET_BYTES = int(48000 * 2 * 0.1)
+    # Standing playout buffer (2026-07-03: latency is explicitly not a product
+    # priority here, voice continuity is). Converted output is never published
+    # directly off the converter's arrival timing -- it always goes through
+    # this buffer first, drained by a separate real-time-paced consumer task
+    # (_run_playout_consumer). This absorbs the case where one inference block
+    # takes longer than its real-time budget (confirmed in production: ~460-
+    # 590ms to convert a 320ms block even after the FAISS index caching fix)
+    # by growing the lead's delay instead of producing a silence gap.
+    #
+    # Target: initial cushion before playout starts (~3s of 48kHz 16-bit mono).
+    _PLAYOUT_BUFFER_TARGET_BYTES = int(48000 * 2 * 3.0)
+    # Cap: beyond this, drop the OLDEST buffered audio rather than let delay
+    # grow unbounded -- same policy as RVCStreamingConverter's reconnect
+    # buffer (backend/converters/rvc_stream.py, _MAX_BUFFER_BYTES).
+    _PLAYOUT_BUFFER_MAX_BYTES = int(48000 * 2 * 5.0)
 
     # If no converted audio has arrived for this long, the data-channel latency
     # metric reports is_fallback=True ("HOLDING") so the existing frontend badge
@@ -152,12 +162,13 @@ class VoiceConversionWorker:
 
         # Publish the converted audio output track
         # We use 48kHz because the converter (RVC-style engines) outputs 48kHz PCM.
-        # queue_size_ms bounds LiveKit's internal playout buffer. Lowered from the
-        # old 400ms to 200ms: the new consumer has its own small (100ms, one-shot)
-        # jitter buffer upstream of this, so a large LiveKit-side buffer on top of
-        # that would just add latency without absorbing any additional jitter —
-        # 200ms is enough headroom for capture_frame's pacing without letting
-        # converted audio pile up mid-call.
+        # queue_size_ms bounds LiveKit's OWN internal playout queue, which is
+        # deliberately small (200ms) -- it's just a thin real-time pacing buffer
+        # fed continuously by _run_playout_consumer's own much larger standing
+        # buffer (_PLAYOUT_BUFFER_TARGET_BYTES/_MAX_BYTES, several seconds).
+        # Growing this LiveKit-side queue wouldn't help: it's fed by our own
+        # consumer at a steady pace already, so 200ms is enough headroom for
+        # capture_frame's pacing without letting audio pile up in TWO places.
         try:
             self.audio_source = rtc.AudioSource(48000, 1, queue_size_ms=200)
         except TypeError:
@@ -408,18 +419,23 @@ class VoiceConversionWorker:
 
     async def _run_conversion_stream(self):
         """Drives the converter as ONE long-lived duplex stream for the life of the
-        worker's active pipeline: feeds 20ms frames in via _frame_pairs and
-        republishes whatever comes back, in arrival order — a single ordered
-        stream has nothing to reorder. Never falls back to raw audio: on outage
-        the converter simply stops yielding and output is silence until it
-        reconnects and resumes (see RVCStreamingConverter's own bounded
-        reconnect-buffer/backoff logic in converters/rvc_stream.py).
+        worker's active pipeline: feeds 20ms frames in via _frame_pairs and appends
+        whatever comes back, in arrival order, into a standing playout buffer that
+        _run_playout_consumer drains at a steady real-time pace -- see the class
+        docstring above _PLAYOUT_BUFFER_TARGET_BYTES for why. Never falls back to
+        raw audio: on outage the converter simply stops yielding and the buffer
+        just stops refilling until it reconnects and resumes (see
+        RVCStreamingConverter's own bounded reconnect-buffer/backoff logic in
+        converters/rvc_stream.py).
         """
         gen = self.converter.convert_stream(self._frame_pairs())
-        jitter_buffer = bytearray()
-        jitter_filled = False
         self._last_chunk_at = time.monotonic()
         watchdog_task = asyncio.create_task(self._holding_watchdog())
+
+        self._playout_buffer = bytearray()
+        self._playout_buffer_lock = asyncio.Lock()
+        self._playout_ready = asyncio.Event()
+        consumer_task = asyncio.create_task(self._run_playout_consumer())
 
         try:
             # contextlib.aclosing guarantees the async generator is properly closed
@@ -442,23 +458,60 @@ class VoiceConversionWorker:
                     if not converted_chunk:
                         continue
 
-                    if not jitter_filled:
-                        jitter_buffer.extend(converted_chunk)
-                        if len(jitter_buffer) >= self._JITTER_TARGET_BYTES:
-                            jitter_filled = True
-                            await self._publish_frames(bytes(jitter_buffer))
-                            jitter_buffer.clear()
-                    else:
-                        await self._publish_frames(converted_chunk)
+                    async with self._playout_buffer_lock:
+                        self._playout_buffer.extend(converted_chunk)
+                        overflow = len(self._playout_buffer) - self._PLAYOUT_BUFFER_MAX_BYTES
+                        if overflow > 0:
+                            # Sustained overload: even the cushion can't keep up.
+                            # Drop the OLDEST audio rather than let delay grow
+                            # unbounded -- logged because it means the block size
+                            # / GPU tier genuinely can't sustain this call's real-
+                            # time factor, not something a bigger buffer fixes.
+                            del self._playout_buffer[:overflow]
+                            print(
+                                f"[Worker] Playout buffer over {self._PLAYOUT_BUFFER_MAX_BYTES}-byte "
+                                f"cap — dropped {overflow} oldest bytes"
+                            )
+                        self._playout_ready.set()
         except asyncio.CancelledError:
             pass
         except Exception as e:
             print(f"[Worker Error in conversion stream] {e}")
             traceback.print_exc()
         finally:
+            consumer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer_task
             watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watchdog_task
+
+    async def _run_playout_consumer(self):
+        """Drains _playout_buffer into LiveKit at a steady pace, decoupled from
+        how bursty or delayed the converter's actual output is. Waits for the
+        initial cushion (_PLAYOUT_BUFFER_TARGET_BYTES) before the first publish,
+        then continuously publishes whatever has accumulated since the last
+        publish — _publish_frames' own capture_frame backpressure already paces
+        real playback correctly; this just guarantees it's never starved by one
+        slow block, because the buffer (not the converter's arrival timing)
+        decides what's available to publish next."""
+        filled = False
+        try:
+            while True:
+                async with self._playout_buffer_lock:
+                    if not filled and len(self._playout_buffer) < self._PLAYOUT_BUFFER_TARGET_BYTES:
+                        chunk = b""
+                    else:
+                        filled = True
+                        chunk = bytes(self._playout_buffer)
+                        self._playout_buffer.clear()
+                    self._playout_ready.clear()
+                if chunk:
+                    await self._publish_frames(chunk)
+                else:
+                    await self._playout_ready.wait()
+        except asyncio.CancelledError:
+            pass
 
     async def _publish_frames(self, audio_payload: bytes):
         """Slice 48kHz PCM into 10ms frames and push them to LiveKit."""

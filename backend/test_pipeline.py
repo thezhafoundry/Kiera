@@ -568,6 +568,133 @@ async def test_worker_readiness_probe_dedup():
     print("VoiceConversionWorker readiness-probe dedup test: SUCCESS")
 
 
+async def test_playout_buffer_smooths_bursty_converter_output():
+    print("\n--- Testing standing playout buffer (absorbs bursty/delayed converter output) ---")
+
+    class _BurstyConverter:
+        """Yields audio in an intentionally bursty pattern: a big delayed chunk
+        after a gap, then several small on-time chunks -- shaped like the real
+        GPU-behind-real-time symptom this buffer exists to absorb."""
+        async def convert_stream(self, in_audio):
+            # One big "late block" chunk (simulates a slow GPU block arriving
+            # all at once) -- bigger than the test's target cushion below.
+            yield b"\x00\x01" * 2000  # 4000 bytes
+            await asyncio.sleep(0.01)
+            for _ in range(5):
+                yield b"\x00\x01" * 500  # 1000 bytes each
+                await asyncio.sleep(0.01)
+
+    converter = _BurstyConverter()
+    worker = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=converter,
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+    )
+    # Bypass the real _publish_frames' internal 960-byte frame slicing
+    # entirely -- this test cares about what the playout consumer hands to
+    # _publish_frames in a single call (proving cushion-wait/batching), not
+    # how those bytes get sliced into LiveKit frames downstream (unrelated,
+    # unchanged behavior already exercised by production use).
+    published_payloads = []
+
+    async def fake_publish_frames(payload):
+        published_payloads.append(len(payload))
+
+    worker._publish_frames = fake_publish_frames
+    # Small test-scale cushion/cap so the test runs fast and deterministically
+    # -- same override pattern the buffer-cap test above uses on
+    # RVCStreamingConverter's _MAX_BUFFER_BYTES, applied here to the new
+    # playout buffer's class constants instead.
+    worker._PLAYOUT_BUFFER_TARGET_BYTES = 3000
+    worker._PLAYOUT_BUFFER_MAX_BYTES = 8000
+
+    conversion_task = asyncio.create_task(worker._run_conversion_stream())
+    try:
+        deadline = time.monotonic() + 3.0
+        total_expected = 4000 + 5 * 1000
+        while sum(published_payloads) < total_expected and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        published_total = sum(published_payloads)
+        assert published_total == total_expected, (
+            f"expected all {total_expected} converted bytes to eventually reach "
+            f"_publish_frames (buffer must never silently drop data below its cap), "
+            f"got {published_total}"
+        )
+        print(f"All {total_expected} bytes from a bursty converter reached _publish_frames: OK")
+
+        # The first _publish_frames call must not happen until the target
+        # cushion has accumulated -- proves this isn't just re-publishing each
+        # chunk immediately as it arrives (that would be the old one-shot-only
+        # behavior, not a standing buffer).
+        assert published_payloads[0] >= worker._PLAYOUT_BUFFER_TARGET_BYTES, (
+            "expected the first _publish_frames call to wait for the target cushion to fill, "
+            f"got a first call of only {published_payloads[0]} bytes "
+            f"(target was {worker._PLAYOUT_BUFFER_TARGET_BYTES})"
+        )
+        print(
+            f"First _publish_frames call waited for the {worker._PLAYOUT_BUFFER_TARGET_BYTES}-byte "
+            f"cushion (got {published_payloads[0]} bytes): OK"
+        )
+    finally:
+        conversion_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await conversion_task
+
+    print("Standing playout buffer test: SUCCESS")
+
+
+async def test_playout_buffer_drops_oldest_over_cap():
+    print("\n--- Testing standing playout buffer cap (bounded, drop-oldest) ---")
+
+    class _SlowTrickleConverter:
+        async def convert_stream(self, in_audio):
+            for i in range(20):
+                yield bytes([i % 256]) * 1000  # 1000 bytes per chunk, 20000 total
+                await asyncio.sleep(0.01)
+
+    worker = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=_SlowTrickleConverter(),
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+    )
+    # No audio_source needed: the target cushion below (50000 bytes) is set
+    # deliberately higher than everything the converter ever yields (20000
+    # bytes), so playout never starts and _publish_frames is never called --
+    # this test is purely about the producer-side overflow/drop-oldest trim,
+    # independent of how fast (or slow) playout itself is.
+    worker._PLAYOUT_BUFFER_TARGET_BYTES = 50000  # higher than total fed: publish never starts
+    worker._PLAYOUT_BUFFER_MAX_BYTES = 5000
+
+    conversion_task = asyncio.create_task(worker._run_conversion_stream())
+    try:
+        await asyncio.sleep(0.5)  # let all 20 chunks (20000 bytes) arrive and overflow the 5000 cap
+        assert len(worker._playout_buffer) == worker._PLAYOUT_BUFFER_MAX_BYTES, (
+            f"expected playout buffer to sit exactly at the {worker._PLAYOUT_BUFFER_MAX_BYTES}-byte "
+            f"cap, got {len(worker._playout_buffer)}"
+        )
+        # Drop-oldest means the buffer's tail must be the newest bytes fed
+        # (value 19, the last chunk's fill byte), not the oldest (value 0).
+        assert worker._playout_buffer[-1] == 19, (
+            f"expected the newest fed byte (19) to survive at the tail, got {worker._playout_buffer[-1]}"
+        )
+        assert worker._playout_buffer[0] != 0, (
+            "expected the oldest fed bytes (value 0) to have been dropped, but they're still at the head"
+        )
+        print(
+            f"Playout buffer capped at {worker._PLAYOUT_BUFFER_MAX_BYTES} bytes, "
+            "oldest bytes dropped, newest survive: OK"
+        )
+    finally:
+        conversion_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await conversion_task
+
+    print("Standing playout buffer cap/drop-oldest test: SUCCESS")
+
+
 async def main():
     print("Running automated pipeline verification tests...")
     await test_noise_suppressor()
@@ -578,6 +705,8 @@ async def main():
     await test_rvc_streaming_converter_reconnect()
     await test_rvc_streaming_converter_buffer_cap_drop_oldest()
     await test_worker_readiness_probe_dedup()
+    await test_playout_buffer_smooths_bursty_converter_output()
+    await test_playout_buffer_drops_oldest_over_cap()
     print("\nAll automated verification tests completed successfully!")
 
 if __name__ == "__main__":
