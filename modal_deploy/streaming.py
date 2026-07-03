@@ -20,8 +20,15 @@ import numpy as np
 SAMPLE_RATE_IN = 16000          # agent mic / inference input rate
 SAMPLE_RATE_OUT = 48000         # RVC / published track rate (3x input)
 
-BLOCK_MS = 320                  # NEW audio processed per inference block
-CONTEXT_MS = 160                # prior input prepended as left context
+# Latency is not a product priority for this app (2026-07-03 decision) --
+# voice QUALITY is. Bigger blocks give HuBERT/pitch tracking more context per
+# inference call and cut the SOLA crossfade seam rate (crossfade is a fixed
+# 80ms per block, so a 1000ms block has ~3x fewer seams per second of audio
+# than the old 320ms one). The added per-block delay is absorbed by the
+# playout buffer in backend/pipeline.py, not exposed to the lead as latency
+# they can't tolerate -- it's exposed as buffered delay instead.
+BLOCK_MS = 1000                 # NEW audio processed per inference block
+CONTEXT_MS = 400                # prior input prepended as left context
 
 BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000        # 5120
 CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000    # 2560
