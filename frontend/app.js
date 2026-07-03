@@ -16,8 +16,8 @@ let wsConn = null;
 // Mock Leads Array for MVP
 const LEADS = [
     { id: 1, name: "Alice Smith", phone: "+916281686616", company: "Acme Corp" },
-    { id: 2, name: "Bob Johnson", phone: "+15553334444", company: "Globex" },
-    { id: 3, name: "Charlie Brown", phone: "+15555556666", company: "Initech" },
+    { id: 2, name: "Bob Johnson", phone: "+919626811099", company: "Globex" },
+    { id: 3, name: "Charlie Brown", phone: "+919629419551", company: "Initech" },
     { id: 4, name: "Diana Prince", phone: "+15557778888", company: "Wayne Ent" }
 ];
 
