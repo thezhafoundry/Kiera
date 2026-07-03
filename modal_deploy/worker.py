@@ -596,7 +596,7 @@ def _load_wav_as_pcm16_mono(audio_bytes: bytes):
     timeout=10800,
     volumes={"/root/rvc-models": volume},
 )
-def convert_file_chunked(audio_bytes: bytes, pitch: int = 12) -> bytes:
+def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
     """
     Diagnostic (2026-07-03): runs the SAME block-accumulate + SOLA-crossfade
     pipeline the live /ws handler uses (see fastapi_app's ws_stream), but driven
@@ -604,6 +604,17 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = 12) -> bytes:
     call's "doesn't sound like the trained voice" symptom comes from the
     chunked-streaming architecture itself, on the exact same reference audio
     convert_file() already produces a known single-pass conversion for.
+
+    pitch=-1 (default, matches convert_file/main()'s own default) auto-detects
+    ONCE from the whole resampled file -- same as the single-pass reference --
+    then reuses that one value for every block. This deliberately does NOT
+    replicate ws_stream's own "detect from just the first non-silent block"
+    behavior: production no longer uses -1 at all (backend/main.py always
+    sends an explicit pitch_shift from the UI gender toggle now), so
+    replicating the old per-block/first-block detection here would test a
+    code path production doesn't actually use. Whole-file detection holds
+    "how pitch gets resolved" constant and known-good against the reference,
+    so only chunking+SOLA is the variable under test.
     """
     import numpy as np
 
@@ -611,6 +622,11 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = 12) -> bytes:
     test_engine.startup()
 
     samples = _load_wav_as_pcm16_mono(audio_bytes)
+
+    if pitch == -1:
+        probe_wav = st.pcm16_to_wav_bytes(samples)
+        pitch = test_engine._auto_detect_pitch(probe_wav)
+        print(f"[Chunked Test] Whole-file auto-detected pitch_shift={pitch} -- fixed for the whole test")
 
     acc = st.BlockAccumulator()
     acc.push(samples)
@@ -648,12 +664,12 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = 12) -> bytes:
 
 
 @app.local_entrypoint()
-def main_chunked(pitch: int = 12):
+def main_chunked(pitch: int = -1):
     import struct
 
     input_file = r"D:\Kiera\test1.wav"
 
-    print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch}")
+    print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch} (Note: -1 means whole-file auto-detect, matching main()'s default)")
     print("[Chunked Test] Simulates the live /ws block-accumulate + SOLA-crossfade")
     print("[Chunked Test] pipeline on a static file -- compare the output against")
     print("[Chunked Test] test11.wav (convert_file's single-pass output) on the")
