@@ -2,8 +2,10 @@
 
 ## Tech Stack
 - **Backend**: FastAPI (`backend/main.py`), async Python, `uvicorn`. Deployed to **Render**
-  (service `Kiera`, `srv-d92lh7navr4c738i03a0`), currently in **Oregon (us-west)** —
-  see [[subsystem-notes]] for why that matters.
+  (service `Kiera`, `srv-d932m4cvikkc73belt1g`), now in **Singapore** — colocated with the
+  Modal `ap-southeast` pin (verified live via Render API 2026-07-03; service ID changed from
+  the old `srv-d92lh7navr4c738i03a0`/Oregon deployment, so the region migration tracked in
+  [[active-backlog]] is done, not pending — see [[subsystem-notes]]).
 - **Media/Telephony**: LiveKit Cloud (WebRTC room + SIP), Twilio (Elastic SIP Trunk + PSTN
   phone number). Twilio webhook points at the Render server's `/api/call/inbound`.
 - **Voice conversion**: RVC v2 model served from a serverless **Modal** GPU worker
@@ -57,7 +59,7 @@
 | Path | Purpose |
 |---|---|
 | `backend/main.py` | FastAPI app: token broker, Twilio/SIP webhooks, `/api/setup`, warmup & deploy endpoints, WebSocket signaling, static hosting. |
-| `backend/pipeline.py` | `VoiceConversionWorker` — the LiveKit bot audio loop; drives the converter as one long-lived duplex stream (producer + `_run_conversion_stream`, no chunking/playout anymore). |
+| `backend/pipeline.py` | `VoiceConversionWorker` — the LiveKit bot audio loop; drives the converter as one long-lived duplex stream (`_run_conversion_stream`) feeding a bounded standing playout buffer drained by `_run_playout_consumer` (2026-07-03, see [[subsystem-notes]]/[[log]]). |
 | `backend/converters/base.py` | `VoiceConverter` ABC — pluggability seam #1. |
 | `backend/converters/rvc.py` | `RVCVoiceConverter` — HTTP client to the Modal RVC `/convert` endpoint. Offline-test-only now; not selected by `_do_start_bot`. |
 | `backend/converters/rvc_stream.py` | `RVCStreamingConverter` — WS client to the Modal RVC `/ws` endpoint; one persistent duplex session per call, bounded reconnect buffer + backoff. What `_do_start_bot` actually selects when `RVC_ENDPOINT_URL` is set. |

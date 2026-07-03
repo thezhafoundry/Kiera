@@ -5,20 +5,27 @@ wiki. This index is the first stop for any query — find the page here, then dr
 
 ## Concepts (evergreen explanations)
 - [audio-pipeline-latency-budget](pages/concepts/audio-pipeline-latency-budget.md) — full
-  mouth-to-ear latency breakdown, stage by stage, and why chunk size / conversion budget
-  were tuned against each other.
-- [adaptive-playout-buffer](pages/concepts/adaptive-playout-buffer.md) — how `_run_playout`
-  smooths jitter with a per-session adaptive buffer, and the asyncio gotcha it works around.
-- [buffering-history](pages/concepts/buffering-history.md) — the multi-attempt, one-revert
-  migration path that led to the current buffer design; check here before re-fixing an
-  old bug.
+  mouth-to-ear latency breakdown, stage by stage. **Partly stale** (2026-07-02 pre-rebuild
+  numbers) — as of 2026-07-03 latency is explicitly not a product priority, see
+  [[part-by-part-audio-investigation]].
+- [adaptive-playout-buffer](pages/concepts/adaptive-playout-buffer.md) — the current
+  (2026-07-03) standing playout buffer: bounded target/cap, drop-oldest overflow,
+  decoupled producer/consumer. Third distinct design this buffer has had.
+- [buffering-history](pages/concepts/buffering-history.md) — the five-attempt,
+  one-revert migration path that led to the current buffer design; check here before
+  re-fixing an old bug.
 - [rvc-cold-start](pages/concepts/rvc-cold-start.md) — Modal T4 cold-start behavior
-  (measured ~75s, not the assumed 8-30s), the intentional 2000ms fail-safe tradeoff, and
-  a confirmed production incident where a lead heard raw voice for a whole call.
+  (measured ~75s, not the assumed 8-30s) and a confirmed production incident where a lead
+  heard raw voice for a whole call (historical — raw fallback no longer exists at all
+  post-rebuild).
 
 ## Issues (open/resolved problems)
-- [modal-render-region-mismatch](pages/issues/modal-render-region-mismatch.md) — **open,
-  high priority.** Modal pinned to `ap-southeast`, Render actually in Oregon.
+- [part-by-part-audio-investigation](pages/issues/part-by-part-audio-investigation.md) —
+  **resolved 2026-07-03** (buffer fix not yet live-call-verified). Four distinct root
+  causes found via production logs: Modal container fan-out, unreliable pitch
+  auto-detection, FAISS index re-read-per-call, and a latency-vs-quality product tradeoff.
+- [modal-render-region-mismatch](pages/issues/modal-render-region-mismatch.md) —
+  **resolved 2026-07-03.** Render confirmed live in Singapore, colocated with Modal.
 - [render-autodeploy-kills-live-calls](pages/issues/render-autodeploy-kills-live-calls.md)
   — **open, medium priority.** Every push to `main` redeploys and kills in-flight calls.
 - [readme-latency-budget-contradiction](pages/issues/readme-latency-budget-contradiction.md)

@@ -1,37 +1,52 @@
 ---
-title: Adaptive standing playout buffer
+title: Standing playout buffer
 type: concept
 sources: [subsystem-notes, decisions-log]
-updated: 2026-07-02
+updated: 2026-07-03
 ---
 
-`_run_playout` in [backend/pipeline.py](../../../backend/pipeline.py) separates
-*producing* RVC conversions from *playing them out*, replacing an earlier design that
-published every RVC result the instant it finished (causing reordering and gaps when a
-chunk was slow).
+**This page describes the 2026-07-03 design.** The pre-2026-07-02 adaptive buffer this
+page used to document (`_run_playout`, P95-based adaptive sizing, `_REORDER_WAIT_S`
+reorder-wait) was removed entirely in the 2026-07-02 streaming rebuild, replaced with a
+one-shot 100ms jitter fill, which was itself replaced by the design below on 2026-07-03.
+Three distinct designs in one buffer's history — see [[buffering-history]] for the full
+migration path before assuming any of them is still current.
 
-**Two phases per speech session:**
-1. **Filling** — accumulate contiguous ready chunks until an adaptive target is met.
-2. **Draining** — publish chunks strictly in sequence; if the next expected chunk isn't
-   ready, wait up to 600ms (`_REORDER_WAIT_S`) before skipping past it, bounding how
-   long one slow RVC call can stall the whole call.
+**Why it exists (2026-07-03):** the 2026-07-02 rebuild's one-shot 100ms jitter buffer only
+smoothed the *start* of a call — once drained, any converter block slower than its
+real-time budget produced a silence gap (LiveKit's own `AudioSource` queue is only 200ms).
+This was confirmed as the direct cause of "part by part" broken-up call audio — see
+[[part-by-part-audio-investigation]]. Rather than re-chase real-time performance further,
+the product decision was made that call latency isn't a priority for this app — voice
+continuity is — so the fix trades delay for smoothness instead of trying to eliminate the
+delay.
 
-**Buffer target is adaptive, not fixed**: P95 of the last 20 RVC round trips × 1.2,
-clamped to 400–1500ms, recomputed at the start of every speech session (not just once
-per call). A session with a consistently fast GPU gets a smaller buffer; one with more
-variance gets a deeper one automatically.
+**Design**: `_run_conversion_stream` in
+[backend/pipeline.py](../../../backend/pipeline.py) is a producer that only appends
+converted audio to `self._playout_buffer` (a plain bounded `bytearray`, not a sequence-
+numbered reorder structure — the underlying stream is already strictly ordered, there's
+nothing to reorder). A separate `_run_playout_consumer` task drains it into
+`_publish_frames` at a steady pace:
+1. **Filling** — wait until at least `_PLAYOUT_BUFFER_TARGET_BYTES` (~3s of 48kHz 16-bit
+   mono) has accumulated before the first publish.
+2. **Draining** — after that, publish whatever has accumulated since the last publish,
+   continuously; `_publish_frames`' own `capture_frame` backpressure already paces real
+   playback correctly, so the consumer just has to never be starved by one slow block.
 
-**Sequence numbers are never reset mid-call** — `stop_pipeline` (fired on
-`track_unsubscribed`) only resets the buffering *phase*, not `_next_publish_seq` or
-`_pending_chunks`. The dispatch counter runs for the worker's whole lifetime; resetting
-the playout side would make it wait forever for sequence numbers already consumed.
+**Bounded, not adaptive**: unlike the old P95-based design, the target (~3s) and cap
+(~5s, `_PLAYOUT_BUFFER_MAX_BYTES`) are fixed constants, not recomputed per session. Beyond
+the cap, the **oldest** buffered audio is dropped (same policy as
+`RVCStreamingConverter`'s reconnect buffer, `backend/converters/rvc_stream.py`,
+`_MAX_BUFFER_BYTES`) rather than growing delay unboundedly — if this ever triggers in
+production, it means the sustained real-time factor is worse than the buffer's cushion can
+absorb, which is a signal to look at inference speed (GPU tier, ONNX/TensorRT), not to
+just raise the cap further.
 
-**Known asyncio gotcha this design has to account for**: `asyncio.Condition.notify_all()`
-wakes *every* waiter, not just the one whose data arrived. The wait for a specific
-sequence number therefore loops against a wall-clock deadline
-(`time.monotonic()`) instead of a single `await cv.wait()` — otherwise an unrelated
-chunk resolving can look like your own wait timing out early, silently shrinking the
-600ms reorder window.
+**Known gotcha found writing tests for this**: `rtc.AudioFrame.data` is an int16-typed
+`memoryview` — `len()` on it returns sample count, not byte count. Wrap it as
+`bytes(frame.data)` first for a real byte length.
 
-This is the *current* (as of `fe678d6`) iteration of a design with real history — see
-[[buffering-history]] for the migration path and the full revert cycle it went through.
+**Not yet manually verified**: this design has passed automated unit tests
+(`backend/test_pipeline.py`) but has not yet had LATENCY.md's spectral latency test run
+against it, nor final confirmation from a live call that "part by part" audio is actually
+gone. See [[active-backlog]].

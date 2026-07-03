@@ -1,28 +1,31 @@
 ---
 title: Modal/Render region mismatch
 type: issue
-status: open
+status: resolved
 sources: [decisions-log, subsystem-notes, stack-and-rules, active-backlog, latency-md]
-updated: 2026-07-02
+updated: 2026-07-03
 ---
 
 The Modal RVC worker ([modal_deploy/worker.py](../../../modal_deploy/worker.py)) is
 pinned `region="ap-southeast"` (Singapore) on the assumption that Render/Twilio
-infrastructure would be colocated nearby. The deployed Render service (`Kiera`,
-`srv-d92lh7navr4c738i03a0`) is actually in **Oregon (us-west)**.
+infrastructure would be colocated nearby.
 
-**Impact**: every RVC call currently pays a transpacific round trip on top of inference
-time, eating into the 2000ms conversion budget ([[rvc-cold-start]],
-[[audio-pipeline-latency-budget]]) and making timeouts (→ raw-voice fail-safe) more
-likely under load, especially once the GPU is warm and inference itself is fast.
+**Resolved 2026-07-03**: verified live via the Render API that the deployed Render service
+(`Kiera`, `srv-d932m4cvikkc73belt1g`) is now in **Singapore** — colocated with Modal. The
+service ID differs from the old `srv-d92lh7navr4c738i03a0`/Oregon deployment this page
+originally described, consistent with the migration having actually happened at some point
+without every doc (this page included) being updated to reflect it. All other pages/docs
+that cited "Render is in Oregon" (decisions log, subsystem notes, stack-and-rules, active
+backlog) have been corrected as of the same date.
 
-**Status**: confirmed open as of 2026-07-02 across every source that mentions it
-(decisions log, subsystem notes, stack-and-rules, active backlog). Not yet resolved.
+**Original impact (historical, no longer applies)**: every RVC call was paying a
+transpacific round trip on top of inference time, eating into the conversion latency
+budget ([[rvc-cold-start]], [[audio-pipeline-latency-budget]]).
 
-**Fix options on the table** (from [[active-backlog]], High priority):
-- Re-pin the Modal function to a US region (matches Render's actual location), or
-- Move the Render service to `ap-southeast` (matches Modal's current pin).
-
-Do not treat the `region="ap-southeast"` comment in `modal_deploy/worker.py` as
-authoritative without first checking Render's current region — the comment reflects the
-original (wrong) assumption, not current reality.
+**Lesson for future doc maintenance**: this mismatch sat "confirmed open" across five
+different docs for at least a day after it was actually fixed, because nothing prompted a
+re-check of live infra state — it was only caught because an unrelated debugging session
+(see [[part-by-part-audio-investigation]]) happened to query the Render API directly for
+other reasons. Consider periodically re-verifying infra-state claims (region, service IDs)
+against the live provider API rather than trusting docs indefinitely, especially for
+claims with no automated check behind them.

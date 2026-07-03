@@ -3,13 +3,18 @@
 <!-- One section per subsystem. Capture the WHY and the traps that are not obvious
      from reading the code — this is what the wiki/codebase cannot tell you. -->
 
-## Streaming pipeline (`backend/pipeline.py`, streaming rebuild 2026-07-02)
+## Streaming pipeline (`backend/pipeline.py`, streaming rebuild 2026-07-02, playout buffer reintroduced 2026-07-03)
 The old VAD-chunked, semaphore'd, reorder-buffer design (`_conversion_consumer`,
-`_run_playout`, adaptive standing playout buffer) was removed entirely, not just tuned —
-`webrtcvad` is no longer imported anywhere in this file. The converter is now driven as one
-long-lived duplex stream for the life of the worker's active pipeline
-(`_run_conversion_stream`); frames arrive back in the order they were sent, so there's
-nothing left to reorder. Load-bearing gotchas in the new design:
+`_run_playout`) was removed entirely in the 2026-07-02 rebuild, not just tuned —
+`webrtcvad` is no longer imported anywhere in this file. The converter is still driven as
+one long-lived duplex stream for the life of the worker's active pipeline
+(`_run_conversion_stream`); frames arrive back **in order**, so there's nothing to reorder.
+**However**, a standing playout buffer was reintroduced on 2026-07-03 (see the new
+"Playout buffer" subsection below) — don't assume "no chunking/no buffering anywhere" from
+the 2026-07-02 framing above; that only ever applied to the *input* side (no VAD chunking
+of the agent's mic audio) and briefly to the *output* side too, until the 2026-07-03 product
+decision that latency isn't a priority reversed that specific piece. Load-bearing gotchas in
+the duplex-stream design itself (still current):
 - **`contextlib.aclosing(gen)` around the conversion generator is not optional.**
   `_run_conversion_stream` wraps `converter.convert_stream(...)` in
   `async with contextlib.aclosing(gen):` specifically because a bare `async for chunk in gen`
@@ -39,6 +44,36 @@ nothing left to reorder. Load-bearing gotchas in the new design:
   before writing a new SOLA-adjacent test — boundary continuity alone proves nothing about
   whether the alignment search works.
 
+### Playout buffer (`backend/pipeline.py`, reintroduced 2026-07-03)
+2026-07-03 product decision: call **latency is explicitly not a priority** for this app —
+voice **continuity/quality** is. This directly reverses part of the 2026-07-02 rebuild's
+implicit latency-first design, so don't assume the newer decision is a regression of the
+older one; it's a deliberate tradeoff change, see [[log]]. Same decision also drove
+`modal_deploy/streaming.py`'s `BLOCK_MS`/`CONTEXT_MS` going from 320/160 to 1000/400 — bigger
+inference blocks give HuBERT/pitch tracking more context and cut the SOLA crossfade seam
+rate (fixed 80ms crossfade per block, so ~3x fewer seams per second of audio at the new
+size), at the cost of more per-block delay, which this buffer is what absorbs.
+- `_run_conversion_stream`'s old one-shot 100ms jitter fill (`_JITTER_TARGET_BYTES`) only
+  smoothed the *start* of a call — once drained, any converter block slower than its
+  real-time budget produced a silence gap, because LiveKit's own `AudioSource` queue
+  (`queue_size_ms=200`) is far too small to cover it. Confirmed in production: ~460-590ms to
+  convert a 320ms block even after the FAISS caching fix below (a ~1.5-1.8x real-time
+  factor), which reliably starved the old design.
+- Replaced with a producer/consumer split: `_run_conversion_stream` only appends converted
+  audio to `self._playout_buffer` (bounded, `_PLAYOUT_BUFFER_TARGET_BYTES` ~3s /
+  `_PLAYOUT_BUFFER_MAX_BYTES` ~5s cap, drop-oldest on overflow — same policy as
+  `RVCStreamingConverter`'s reconnect buffer, `backend/converters/rvc_stream.py`,
+  `_MAX_BUFFER_BYTES`). A separate `_run_playout_consumer` task drains it into
+  `_publish_frames` at a steady pace, decoupled from how bursty/delayed the converter's
+  arrival timing actually is. A slow block now grows delay instead of producing "part by
+  part" audio.
+- **`rtc.AudioFrame.data` is an int16-typed `memoryview` — `len()` on it returns *sample*
+  count, not byte count.** (`len(frame.data)` on a 960-byte/480-sample frame returns 480,
+  not 960.) Wrap it as `bytes(frame.data)` first if you need the real byte length — this is
+  exactly what `_run_audio_pipeline` already does before handing frames to the noise
+  suppressor. Tripped up a first draft of the playout-buffer tests in
+  `backend/test_pipeline.py` (a byte-count assertion silently checked half the real total).
+
 ## Modal RVC GPU worker (`modal_deploy/worker.py`)
 - Cold start is much slower than the code comments assume: measured live at ~75s with
   no `/health` response at all before `{"status":"ready"}` (see LATENCY.md §4.1), not the
@@ -63,11 +98,48 @@ nothing left to reorder. Load-bearing gotchas in the new design:
 - `RVCEngine.startup()` raises `RuntimeError("No FAISS index found.")` if the Modal
   volume's `logs/mi-test/*.index` is empty — looks like a hang from the caller's side but
   is a missing-model error, only visible in `modal app logs rvc-worker`.
-- **Region mismatch (open as of 2026-07-02):** the Modal function is pinned to
-  `region="ap-southeast"` on the assumption Render/Twilio are nearby, but the deployed
-  Render service is actually in Oregon (us-west) — every call currently pays a
-  transpacific round trip on top of inference. Fixing this (repin Modal to a US region,
-  or move Render) is tracked in [[active-backlog]].
+- **Region mismatch: RESOLVED as of 2026-07-03 (was open 2026-07-02).** The Modal function
+  is pinned `region="ap-southeast"`; the Render service is now confirmed live in
+  **Singapore** (`srv-d932m4cvikkc73belt1g`, verified via Render API), colocated with Modal.
+  The old "Render is in Oregon" claim was stale — the Render service ID also changed
+  (from `srv-d92lh7navr4c738i03a0`), consistent with a migration having happened. Don't
+  re-open this in [[active-backlog]] without re-checking Render's current region first.
+- **FAISS index re-read from disk on every conversion call — fixed 2026-07-03.**
+  `RVC/infer/modules/vc/pipeline.py` (vendored, not Keira's own code) calls
+  `faiss.read_index(file_index)` then `index.reconstruct_n(0, index.ntotal)`
+  **unconditionally on every `vc_single()`/`pipeline()` call** — fine for the original
+  WebUI's one-shot-per-file use case, catastrophic for streaming, where it was running once
+  per ~480ms audio block. Confirmed in production `[Timing]` logs: ~1.4-2.0s of the ~3.0-3.8s
+  total per-block conversion time was this alone (a 221MB index file). Fixed *without*
+  touching the vendored file: `worker.py` monkeypatches `faiss.read_index` at container
+  startup with an `lru_cache`-backed wrapper that also caches the `reconstruct_n` result
+  (overrides the returned index object's `reconstruct_n` method to return the precomputed
+  array). The existing GPU warm-up pass in `RVCEngine.startup()` naturally primes the cache
+  before any real caller connects. Post-fix: `npy` time dropped to ~0.05s, total
+  `run_conversion` to ~0.46-0.59s per block. If you ever see the old ~1.4-2.0s `npy` number
+  again, suspect the monkeypatch didn't survive a `worker.py` refactor, not a new bottleneck.
+- **`max_containers` was never set on `fastapi_app` — fixed 2026-07-03.** The in-process
+  `_session_active`/`_session_lock` single-tenancy gate (above) only enforces "1 session"
+  *inside a single already-running container* — it does nothing to stop Modal's autoscaler
+  from booting an additional (paid) GPU container for a connection attempt that arrives
+  while an existing container is still cold-starting (~75s) or mid-call. Confirmed live: 4
+  simultaneous `rvc-worker` containers were running at once in the Modal dashboard, each a
+  full GPU replica (~1.7-1.8GB loaded model each) — traced to WS reconnects/retries during
+  active test-calling landing on different containers rather than queuing against one. Fixed
+  by adding `max_containers=1` to the `@app.function(...)` decorator on `fastapi_app`
+  (`worker.py`) so extra connection attempts queue instead of spinning up parallel GPUs.
+- **Gender/pitch auto-detection is unreliable — reverted 2026-07-03.** `_auto_detect_pitch`'s
+  autocorrelation F0 estimate (male/female boundary at 145Hz) was intended to replace the
+  manual UI gender toggle (`a0f3c42`, "more accurate" at the time) but confirmed misdetecting
+  a known-male agent as female **twice** in production logs the same day (F0=222Hz/166Hz,
+  both classified Female, pitch_shift=0 applied instead of the correct +12) — feeding audio
+  outside the trained model's pitch range produces a "wrong identity" sounding voice, not
+  just a pitch error. It's also re-run from scratch on every WS reconnect (the detected
+  pitch is never reported back to/persisted by the client), so a single call could even
+  change identity mid-call. `backend/main.py`'s `_do_start_bot` now drives `pitch_shift`
+  from the UI's `agentGender` toggle again (`12 if male else 0`) instead of `-1` (GPU
+  auto-detect). The GPU-side `_auto_detect_pitch` code itself is untouched/still selectable
+  via `pitch=-1` — just no longer what the live call path uses.
 
 ## Render deployment
 - `autoDeploy: commit` means **every push to `main` redeploys immediately**, tearing down

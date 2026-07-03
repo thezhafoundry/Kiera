@@ -41,13 +41,15 @@ a fix from scratch.
   new entry below. This budget/raw-fallback design is kept here as historical context for why
   it existed (the tradeoff reasoning was real at the time), not as the current behavior.
 - **Modal region pinned to `ap-southeast`** on the assumption Render would be colocated.
-  Status: **currently wrong** — Render is in Oregon. Not yet resolved; see
-  [[active-backlog]]. Do not treat the region comment in `modal_deploy/worker.py` as
-  authoritative without checking current Render region first.
-  **2026-07-02 note**: the Modal pin itself was already correct/unchanged going into the
-  streaming rebuild and stays `ap-southeast` — see the new entry below. The Render side of
-  this mismatch (migrating Render to Singapore) is still pending, tracked as a separate task,
-  not done as part of this rebuild.
+  Status: **RESOLVED 2026-07-03** — Render is now confirmed live in Singapore
+  (`srv-d932m4cvikkc73belt1g`, verified via Render API), colocated with Modal. The
+  "Render is in Oregon" claim below and in [[active-backlog]]/[[subsystem-notes]] was stale;
+  the Render service ID also changed (from `srv-d92lh7navr4c738i03a0`), consistent with the
+  migration having actually happened at some point without the docs being updated.
+  **2026-07-02 note (historical, superseded by the above)**: the Modal pin itself was already
+  correct/unchanged going into the streaming rebuild and stayed `ap-southeast` — see the
+  2026-07-02 entry below. The Render side of this mismatch (migrating Render to Singapore)
+  was tracked as a separate, still-pending task as of that rebuild; it is no longer pending.
 
 ## 2026-07-02 — Streaming rebuild: persistent WS pipeline, never-raw fail-closed policy, fail-closed warm gate
 
@@ -96,3 +98,52 @@ holds the pure-numpy block/context/SOLA-crossfade DSP driving the server side of
 - Also out of scope for this rebuild, deliberately (not oversights): multi-call concurrency
   (the `/ws` endpoint is single-tenant, MVP), `min_containers` Modal keep-warm, and API
   auth/security hardening. See [[active-backlog]] for tracking.
+
+## 2026-07-03 — Cost/fan-out fixes, pitch-detection revert, latency-for-quality tradeoff
+
+Session triggered by the user asking why 4 `rvc-worker` GPU containers were running
+simultaneously in the Modal dashboard, which led into fixing several compounding issues in
+the same call path. All changes deployed (`modal deploy` + `git push`, Render auto-deploys).
+
+- **`max_containers=1` added to the Modal worker.** Why: the in-process single-tenancy gate
+  (`_session_active`) only holds within one container; Modal's autoscaler doesn't know only
+  one should ever run, and was spinning up a new paid GPU container per connection attempt
+  that arrived while another was cold-starting/busy. Rejected: leaving it unbounded (direct
+  cost bleed — 4x concurrent T4 GPU-seconds for an app designed for exactly 1 concurrent
+  call). See [[subsystem-notes]].
+- **Pitch/gender auto-detection reverted to the manual UI toggle.** Why: confirmed via
+  production Modal logs misdetecting a known-male agent as female twice the same day,
+  feeding audio outside the trained voice's pitch range (sounds like "not the trained voice,"
+  not just mis-pitched) — and it re-runs from scratch on every WS reconnect since the
+  detected value is never persisted/reported back to the client. Rejected: hardening the
+  autocorrelation detector instead (more effort, still heuristic) when the ground truth
+  (agent's own gender) is already known and available via the existing UI toggle — use it.
+  See [[subsystem-notes]].
+- **FAISS index caching (monkeypatch, not a vendored-code edit).** Why: `RVC/`'s own
+  `pipeline.py` re-reads and fully reconstructs a 221MB FAISS index from disk on every
+  `vc_single()` call — a non-issue for one-shot file conversion, ~1.4-2.0s of dead weight
+  per ~480ms streaming block. Rejected: editing the vendored `RVC/` file directly (this repo
+  treats `RVC/` as third-party, not Keira's own code to maintain) in favor of monkeypatching
+  `faiss.read_index` from `worker.py` instead — same effect, zero vendored-code changes. See
+  [[subsystem-notes]]. Confirmed in production logs: `npy` time dropped ~1.4-2.0s → ~0.05s.
+- **Explicit product decision: call latency is not a priority, voice continuity is.**
+  Directly reverses part of the 2026-07-02 streaming rebuild's implicit latency-first
+  framing — not a regression of that rebuild, a deliberate re-prioritization once the FAISS
+  fix alone wasn't enough to fully stop "part by part" audio. Drove two follow-on changes:
+  `BLOCK_MS`/`CONTEXT_MS` increased 320/160 → 1000/400 (more context per inference call,
+  ~3x fewer SOLA crossfade seams/second), and the one-shot 100ms jitter buffer replaced with
+  a bounded (~3s target/~5s cap, drop-oldest) standing playout buffer in `pipeline.py`
+  (`_run_playout_consumer`). Rejected: chasing a fully real-time-synchronous pipeline further
+  (e.g. GPU tier bump, ONNX/TensorRT) as the *first* lever, since those add engineering risk
+  for a latency goal the product no longer has — deferred to [[active-backlog]] as the next
+  lever only if the buffer approach proves insufficient on a live call. See
+  [[subsystem-notes]].
+- **Considered and explicitly rejected for now: swapping to a causal/streaming-native voice
+  model** (e.g. in the shape of Google's StreamVC) to eliminate block-based inference
+  entirely. Why rejected: HuBERT (RVC v2's feature extractor) is bidirectional/non-causal by
+  architecture, has no incremental mode — "removing chunking" would mean a different model
+  family and **retraining the Keira voice from scratch**, not a pipeline code change. The
+  current block+context+SOLA-crossfade approach is also not naive — it's the same technique
+  RVC's own real-time community tooling (w-okada's voice-changer) uses to make this model
+  family behave in near-real-time. Revisit only if inference-speed engineering (GPU tier,
+  ONNX/TensorRT) turns out insufficient.

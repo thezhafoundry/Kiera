@@ -2,11 +2,11 @@
 title: Buffering / playout migration history
 type: concept
 sources: [decisions-log, active-backlog]
-updated: 2026-07-02
+updated: 2026-07-03
 ---
 
-The playout buffering design has been rewritten several times, with **at least one full
-revert cycle**, before landing on the current [[adaptive-playout-buffer]]:
+The playout buffering design has been rewritten **five** times now, with at least one full
+revert cycle, before landing on the current [[adaptive-playout-buffer]]:
 
 1. `8aac8be` — replaced an ordered buffer with direct publish to cut a 26s latency
    backlog. Later found insufficient on its own (caused reordering/gaps).
@@ -18,12 +18,24 @@ revert cycle**, before landing on the current [[adaptive-playout-buffer]]:
    approach was rolled back.
 5. `2a20b3a` — removed an `age_before` check that was silently dropping/silencing lead
    audio; added a 4s pre-buffer timeout fallback.
-6. `fe678d6` — replaced the one-shot pre-buffer with the current adaptive, per-session
-   standing playout buffer ([[adaptive-playout-buffer]]).
+6. `fe678d6` — replaced the one-shot pre-buffer with an adaptive, per-session, P95-sized
+   standing playout buffer (sequence-numbered, reorder-wait based).
+7. **2026-07-02 streaming rebuild** (`f3c16ed`, Tasks 1-5) — removed the adaptive buffer
+   entirely, not just tuned. The new persistent-duplex-stream design made reordering a
+   non-problem (frames arrive strictly in order), so it was replaced with a much simpler
+   one-shot 100ms jitter fill.
+8. **2026-07-03** — the one-shot fill proved insufficient: it only smoothed the *start* of
+   a call, and any converter block slower than its real-time budget produced a silence gap
+   mid-call ("part by part" audio — see [[part-by-part-audio-investigation]]). Reintroduced
+   a standing buffer, but a differently-shaped one than step 6's: fixed target/cap (not
+   P95-adaptive) and drop-oldest-on-overflow (not sequence-numbered reorder-wait) — see
+   [[adaptive-playout-buffer]] for the current design. This time it's an explicit
+   latency-for-quality product tradeoff, not a bug fix.
 
 **Why this page exists**: if a buffering bug resurfaces, the `.agents/decisions/log.md`
 explicitly warns to check whether it's a regression of something already tried and
 reverted here before re-deriving a fix from scratch. [[active-backlog]] flags this area
 as high-risk for the same reason and requires re-running the spectral latency test
 (LATENCY.md §3) after any playout timing edit — there is no automated regression test
-for latency.
+for latency, and as of 2026-07-03 that manual test has **not yet** been re-run against
+step 8's design.
