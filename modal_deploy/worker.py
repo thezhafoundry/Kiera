@@ -14,6 +14,37 @@ try:
 except ImportError:  # pragma: no cover
     import streaming as st
 
+import faiss
+from functools import lru_cache
+
+# RVC/infer/modules/vc/pipeline.py calls faiss.read_index(file_index) then
+# index.reconstruct_n(0, index.ntotal) on EVERY vc_single() call — fine for
+# the original one-shot-per-file WebUI use case, but this app calls it once
+# per ~480ms streaming audio block, re-reading and re-materializing a 221MB
+# index from disk every time (confirmed ~1.4-2.0s of the ~3s per-block
+# latency in production [Timing] logs). Cache the loaded index and its full
+# reconstruction so only the first call (the GPU warm-up pass in
+# RVCEngine.startup(), before any real caller connects) pays that cost.
+_real_faiss_read_index = faiss.read_index
+
+
+@lru_cache(maxsize=4)
+def _cached_read_index(path: str) -> "faiss.Index":
+    index = _real_faiss_read_index(path)
+    cached_npy = index.reconstruct_n(0, index.ntotal)
+    index.reconstruct_n = lambda *args, **kwargs: cached_npy
+    return index
+
+
+def _install_faiss_index_cache():
+    if getattr(faiss.read_index, "_kiera_cached", False):
+        return  # already installed (e.g. re-imported in a test)
+    faiss.read_index = _cached_read_index
+
+
+_cached_read_index._kiera_cached = True
+_install_faiss_index_cache()
+
 
 app = modal.App("rvc-worker")
 
