@@ -62,3 +62,22 @@ found a contradiction: README states a 5000ms RVC fail-safe budget, LATENCY.md a
 directly — the actual configured value is 2000ms (README's 5000ms is an unused class
 default, not what's running). Filed as
 [readme-latency-budget-contradiction](pages/issues/readme-latency-budget-contradiction.md).
+
+## [2026-07-03] ingest | SIP audio isolation field-name bug (raw+converted voice mixing)
+
+User reported live-call voice "not clear, breaking." Traced to `_restrict_sip_audio`
+(`backend/main.py`, deployed commit `1324fe2`) silently failing on every call: it built
+`UpdateSubscriptionsRequest(participant_identity=..., ...)` but the real protobuf field is
+`identity` (confirmed via `livekit.protocol.room.UpdateSubscriptionsRequest
+.DESCRIPTOR.fields_by_name`). Confirmed 100% failure rate across every call sampled in
+Render production logs (`srv-d932m4cvikkc73belt1g`) -- no call ever showed the intended
+success line. Net effect: the lead was hearing the raw agent mic and the RVC-converted
+track mixed together for the whole call, the exact bug this helper was meant to prevent.
+Fixed (commit `cf60ca5`, one-line field-name change) but not yet pushed/verified live --
+see [active-backlog](pages/sources/active-backlog.md). Filed as
+[sip-audio-mixing-isolation-bug](pages/issues/sip-audio-mixing-isolation-bug.md).
+
+Also found and fixed a doc-drift bug while cross-referencing: `CLAUDE.md` still described
+the old one-shot jitter buffer / "no playout queue" design, superseded by the 2026-07-03
+standing playout buffer -- the sync commit for that change (`1b35d59`) never touched
+`CLAUDE.md`. Updated `CLAUDE.md` in place to match `.agents/context/subsystem-notes.md`.

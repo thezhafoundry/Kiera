@@ -20,6 +20,10 @@ wiki. This index is the first stop for any query — find the page here, then dr
   post-rebuild).
 
 ## Issues (open/resolved problems)
+- [sip-audio-mixing-isolation-bug](pages/issues/sip-audio-mixing-isolation-bug.md) —
+  **fix committed, not yet deployed/verified.** The "unsubscribe raw agent track from the
+  SIP leg" fix (`_restrict_sip_audio`) had a wrong protobuf field name and failed silently
+  on 100% of calls, so the lead heard raw+converted voice mixed the whole call.
 - [part-by-part-audio-investigation](pages/issues/part-by-part-audio-investigation.md) —
   **resolved 2026-07-03** (buffer fix not yet live-call-verified). Four distinct root
   causes found via production logs: Modal container fan-out, unreliable pitch

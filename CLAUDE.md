@@ -141,12 +141,16 @@ this from the running server if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set.
   stream for the life of the worker's active pipeline.
 - **No reordering, no semaphore.** `_run_conversion_stream()` republishes whatever the converter
   yields, in arrival order — a single ordered stream (WS or local generator) has nothing to
-  reorder, so the old parallel-RVC-request semaphore and ordered reorder/playout-buffer machinery
-  no longer exist (there is no `_run_playout` and no playout queue).
-- **One-shot jitter buffer**: `_run_conversion_stream` holds back the first ~100 ms
-  (`_JITTER_TARGET_BYTES`) of converted 48 kHz audio before publishing, then streams everything
-  after that straight through as it arrives — a small startup smoothing buffer, not a per-session
-  adaptive standing buffer.
+  reorder, so the old parallel-RVC-request semaphore no longer exists.
+- **Standing playout buffer (reintroduced 2026-07-03).** The original rebuild's one-shot ~100ms
+  jitter fill only smoothed the *start* of a call and starved on any slow block. It's since been
+  replaced by a producer/consumer split: `_run_conversion_stream` appends converted audio to a
+  bounded `self._playout_buffer` (~3s target/~5s cap, drop-oldest on overflow), and a separate
+  `_run_playout_consumer` task drains it into `_publish_frames` at a steady pace — a slow RVC
+  block now grows delay instead of producing "part by part" audio. This reflects a deliberate
+  2026-07-03 product decision that call latency is not a priority, voice continuity is — see
+  `.agents/context/subsystem-notes.md` for the full mechanism and `.agents/decisions/log.md` for
+  the tradeoff reasoning.
 - **Fail-CLOSED, never raw.** There is no raw-audio-fallback path — it was removed structurally,
   not just avoided. If the converter's backend connection drops or errors, output is **silence**
   (nothing published) until real converted audio resumes; the lead never hears the agent's

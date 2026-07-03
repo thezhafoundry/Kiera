@@ -138,6 +138,36 @@ the same call path. All changes deployed (`modal deploy` + `git push`, Render au
   for a latency goal the product no longer has — deferred to [[active-backlog]] as the next
   lever only if the buffer approach proves insufficient on a live call. See
   [[subsystem-notes]].
+## 2026-07-03 (later) — Root-caused "voice not clear / breaking" to a dead SIP-isolation fix, not the pipeline
+
+User-reported symptom ("voice was not clear and it was breaking" while speaking on a live
+call) turned out to be unrelated to the playout-buffer/FAISS work earlier the same day —
+traced instead to the *raw+converted audio mixing* bug that `_restrict_sip_audio`
+(`backend/main.py`, commit `1324fe2`, "made changes for getting mixed voices") was supposed
+to have already fixed.
+
+- **Root cause: wrong protobuf field name, 100% silent failure.** `_restrict_sip_audio` built
+  `api.UpdateSubscriptionsRequest(..., participant_identity=resolved_sip_identity, ...)` — but
+  the real field on that message is `identity`, not `participant_identity` (confirmed via
+  `livekit.protocol.room.UpdateSubscriptionsRequest.DESCRIPTOR.fields_by_name`). Every attempt
+  threw `Protocol message UpdateSubscriptionsRequest has no "participant_identity" field`,
+  confirmed via Render logs (`srv-d932m4cvikkc73belt1g`) across *every* call sampled — the
+  isolation logic never once succeeded, so the SIP/lead leg stayed subscribed to both the raw
+  agent mic track and the bot's converted track for the entire call. Two simultaneous copies
+  of the same speech (different pitch, different network timing) is what produced the
+  reported "not clear, breaking" audio — not a pipeline/latency issue.
+  Note: `CreateSIPParticipantRequest`'s `participant_identity="sip-lead"` field (`main.py:527`,
+  outbound dial) is a *different* message that genuinely has that field name — that call site
+  was already correct and was not touched.
+- **Fix**: changed the one call site to `identity=resolved_sip_identity` (commit `cf60ca5`).
+  Rejected: rewriting `_restrict_sip_audio`'s retry/detection logic — the detection logic
+  (finding the SIP participant and raw agent track SIDs) was working correctly per the logs;
+  only the final API call's field name was wrong, so a single-line fix was correct, not a
+  larger rework.
+  **Not yet verified live** — committed but not pushed as of this writing; see
+  [[active-backlog]]. Do not assume this is fixed in production until a live call shows a
+  `[SIP Isolation] ✅ unsubscribed` log line.
+
 - **Considered and explicitly rejected for now: swapping to a causal/streaming-native voice
   model** (e.g. in the shape of Google's StreamVC) to eliminate block-based inference
   entirely. Why rejected: HuBERT (RVC v2's feature extractor) is bidirectional/non-causal by

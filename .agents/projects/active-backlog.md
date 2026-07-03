@@ -3,6 +3,7 @@
 ## Backlog
 | Task | Priority | Status |
 |---|---|---|
+| Verify the SIP-isolation fix (`identity=` field-name bug in `_restrict_sip_audio`) actually succeeds on a live call — push the fix and confirm a `[SIP Isolation] ✅ unsubscribed` log line appears instead of the previous 100%-failure `Protocol message ... has no "participant_identity" field` error | High | Open, identified 2026-07-03 (see [[log]], [[subsystem-notes]]) — fix committed (`cf60ca5`) but not yet pushed/deployed as of this writing |
 | Verify the 2026-07-03 standing-playout-buffer + bigger-block fix actually eliminates "part by part" audio on a real live call (deployed, not yet confirmed) | High | Open, identified 2026-07-03 (see [[log]], [[subsystem-notes]]) |
 | If the buffer fix isn't sufficient: bump the Modal GPU tier (T4 → A10G/L4) — one-line `gpu=` change, no retraining, try this before ONNX/TensorRT | Medium | Open, identified 2026-07-03 (see [[log]]) |
 | If GPU tier bump isn't sufficient: ONNX export (or TensorRT) for the HuBERT/generator inference path — no retraining, but real export/verification effort; FAISS search and `pm` pitch estimation aren't neural nets so this only speeds up part of the pipeline | Low | Open, identified 2026-07-03, deferred pending the above (see [[log]]) |

@@ -141,6 +141,28 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   auto-detect). The GPU-side `_auto_detect_pitch` code itself is untouched/still selectable
   via `pitch=-1` — just no longer what the live call path uses.
 
+## SIP audio isolation (`backend/main.py::_restrict_sip_audio`, added 2026-07-03)
+- **Why this exists**: LiveKit's SIP bridge runs server-side and ignores browser-level
+  `setTrackSubscriptionPermissions()` — the SIP participant (the lead) receives a mix of
+  every audio track in the room by default, including the agent's raw mic, not just the
+  bot's converted track. `_restrict_sip_audio` is a fire-and-forget background task
+  (`asyncio.create_task`, up to 8 attempts / 2s apart) that calls LiveKit's
+  `update_subscriptions` to explicitly unsubscribe the SIP participant from the raw agent
+  track once both it and the raw track are visible in the room.
+- **Field-name trap, confirmed 100% failure in production before the fix**: the call built
+  `api.UpdateSubscriptionsRequest(participant_identity=..., ...)`, but that message's real
+  field is `identity` (verify with
+  `livekit.protocol.room.UpdateSubscriptionsRequest.DESCRIPTOR.fields_by_name`). Every one of
+  8 retries threw `Protocol message UpdateSubscriptionsRequest has no "participant_identity"
+  field` on every call sampled in Render logs — meaning the raw+converted mixing this helper
+  exists to prevent was still happening on every single call despite the helper being
+  deployed. Fixed 2026-07-03 (see [[log]]) by using `identity=`. **Don't confuse this with**
+  `CreateSIPParticipantRequest`'s `participant_identity` field (`main.py`, outbound dial) —
+  that's a different message where the field genuinely is named `participant_identity`.
+- **Not yet confirmed live** — look for `[SIP Isolation] ✅ ... unsubscribed` in logs after a
+  real call to verify the fix actually engages; absence of that line (only the retry/failure
+  lines) means the lead is still hearing both tracks mixed.
+
 ## Render deployment
 - `autoDeploy: commit` means **every push to `main` redeploys immediately**, tearing down
   the LiveKit worker and any in-flight `VoiceConversionWorker` mid-call. This was
