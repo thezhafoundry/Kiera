@@ -163,6 +163,55 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   real call to verify the fix actually engages; absence of that line (only the retry/failure
   lines) means the lead is still hearing both tracks mixed.
 
+## Modal deploy: local imports succeeding proves nothing about the remote container (2026-07-03)
+The streaming rebuild's first real `modal deploy modal_deploy/worker.py` (it had only ever been
+merged, never actually deployed, until this session) failed twice in a row:
+1. **Stale folder-name reference.** `worker.py`/`app.py`/`local_server.py`/`.gitignore` all
+   still said `Retrieval-based-Voice-Conversion-WebUI` after that folder was renamed to `RVC/` —
+   `modal deploy` failed immediately with `local dir ... does not exist`, on *any* machine, since
+   the code looked for the wrong name regardless of where it ran. Fixed by updating all four
+   references to `RVC` (commit `d82f22c`).
+2. **Sibling module never bundled into the container.** `worker.py` imports the sibling
+   `modal_deploy/streaming.py` at the top (`from modal_deploy import streaming as st`, falling
+   back to `import streaming as st`). That import succeeding *locally* while running
+   `modal deploy` (it does — cwd is on `sys.path`) says **nothing** about whether Modal actually
+   ships the file into the remote container. It didn't, by default, and the container
+   crash-looped with `ModuleNotFoundError: No module named 'streaming'`. Fixed by adding
+   `.add_local_python_source("streaming")` to the `Image` chain (commit `904757f`) — confirmed by
+   the deploy's mount list showing `Created mount PythonPackage:streaming` and a subsequent
+   `/health` returning `{"status":"ready",...}`.
+   **General rule**: every local file/module a Modal function needs beyond the entrypoint script
+   itself must be explicitly declared (`add_local_dir` / `add_local_file` /
+   `add_local_python_source`) — Modal does not auto-trace imports the way a normal Python
+   deployment might. If `worker.py` grows another sibling module, mount it the same way rather
+   than assuming a clean local `modal deploy` run proves it'll be there remotely. See
+   [wiki/pages/issues/modal-deploy-path-bugs.md](../../wiki/pages/issues/modal-deploy-path-bugs.md)
+   for the full incident writeup.
+- Side effect of bug 1: because `.gitignore` never matched the *current* folder name, it had
+  silently stopped excluding `RVC/` — confirmed ~195 files under `RVC/` are already tracked in
+  git. The `.gitignore` fix doesn't retroactively untrack them; see [[active-backlog]].
+
+## LiveKit SIP outbound trunk went stale — `404 object cannot be found` on dial (2026-07-03, open)
+First live outbound-call attempt after the Modal fixes above failed at the dial step (not the
+voice-conversion step): `lk.sip.create_sip_participant(...)` in `backend/main.py` raised
+`TwirpError(code=not_found, message=twirp error unknown: object cannot be found, status=404)`,
+even though the immediately-preceding `list_outbound_trunk` call had just successfully found the
+trunk by name and returned its ID (`ST_ruQpmqBLhYbj`). Root cause not fully diagnosed (possibly
+connected to whatever infra changes happened around the Render→Singapore migration, but not
+confirmed). **Fix**: `POST /api/setup` is designed to be safely re-runnable — it deletes the
+outbound/inbound trunks and dispatch rule by name and recreates them fresh. Re-running it
+produced new IDs (`ST_kFVkcpf5j8vh` outbound, `ST_U6rGLvrRy53H` inbound,
+`SDR_AmuRZmcQCRE7` dispatch rule), confirming the old ones really were stale. **Important**: if
+`TWILIO_SIP_TRUNK_ID` is set as an env var (locally or on Render), `_do_start_bot`'s outbound
+flow uses it directly and skips the dynamic by-name lookup entirely — recreating the trunk via
+`/api/setup` alone does *not* take effect until that env var is also updated to the new ID (or
+removed, which is more robust against this recurring, since the code falls back to the by-name
+lookup when it's unset). See
+[wiki/pages/issues/livekit-sip-trunk-stale.md](../../wiki/pages/issues/livekit-sip-trunk-stale.md)
+— still open as of this writing
+(Twilio-webhook-config step of the same `/api/setup` run 401'd separately — see [[active-backlog]]
+— and the actual retried call hasn't been confirmed successful yet).
+
 ## Render deployment
 - `autoDeploy: commit` means **every push to `main` redeploys immediately**, tearing down
   the LiveKit worker and any in-flight `VoiceConversionWorker` mid-call. This was

@@ -20,6 +20,13 @@ wiki. This index is the first stop for any query — find the page here, then dr
   post-rebuild).
 
 ## Issues (open/resolved problems)
+- [livekit-sip-trunk-stale](pages/issues/livekit-sip-trunk-stale.md) — **open.** First live
+  outbound call after the Modal worker came back up failed to dial (`404 object cannot be
+  found`); trunk recreated via `/api/setup`, but the Twilio webhook step 401'd separately and
+  the fixed call hasn't been retried yet.
+- [modal-deploy-path-bugs](pages/issues/modal-deploy-path-bugs.md) — **resolved.** First real
+  `modal deploy` of the streaming rebuild failed twice: a stale folder-name reference, then a
+  sibling module Modal never bundled into the container.
 - [sip-audio-mixing-isolation-bug](pages/issues/sip-audio-mixing-isolation-bug.md) —
   **fix committed, not yet deployed/verified.** The "unsubscribe raw agent track from the
   SIP leg" fix (`_restrict_sip_audio`) had a wrong protobuf field name and failed silently

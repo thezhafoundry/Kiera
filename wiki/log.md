@@ -81,3 +81,29 @@ Also found and fixed a doc-drift bug while cross-referencing: `CLAUDE.md` still 
 the old one-shot jitter buffer / "no playout queue" design, superseded by the 2026-07-03
 standing playout buffer -- the sync commit for that change (`1b35d59`) never touched
 `CLAUDE.md`. Updated `CLAUDE.md` in place to match `.agents/context/subsystem-notes.md`.
+
+## [2026-07-03] ingest | First real Modal deploy of the streaming rebuild + LiveKit SIP trunk staleness
+
+The 2026-07-02 streaming rebuild had been merged to `main` but never actually deployed to Modal
+until this session. Filed two new issue pages:
+
+- [modal-deploy-path-bugs](pages/issues/modal-deploy-path-bugs.md) -- resolved. The first real
+  `modal deploy` failed twice in a row: a stale `Retrieval-based-Voice-Conversion-WebUI` folder
+  name (the folder had been renamed to `RVC/`), then a `ModuleNotFoundError` because Modal never
+  auto-bundles a sibling local module (`streaming.py`) just because the entrypoint imports it --
+  needed an explicit `add_local_python_source("streaming")`. Both fixed and confirmed live
+  (`/health` returned `{"status":"ready",...}` with CUDA/T4 confirmed).
+- [livekit-sip-trunk-stale](pages/issues/livekit-sip-trunk-stale.md) -- open. First live outbound
+  dial after the GPU came up failed with a LiveKit 404 ("object cannot be found") on a trunk ID
+  that had just been successfully listed by name -- root cause not fully diagnosed. Re-running
+  `POST /api/setup` recreated the outbound trunk, inbound trunk, and dispatch rule from scratch
+  (new IDs confirm the old ones were genuinely stale), but the same `/api/setup` call's Twilio-
+  webhook step separately 401'd (stale/rotated `TWILIO_AUTH_TOKEN` on Render) -- still open. The
+  actual retried outbound call has not yet been confirmed to succeed.
+
+Also incidentally confirmed while chasing the folder-rename bug: ~195 files under `RVC/` are
+already committed to git despite the folder being intended as gitignored-and-too-large-for-
+GitHub -- `.gitignore` never matched the *current* folder name until this session's fix, so it
+had silently stopped excluding anything. Fixing the gitignore entry doesn't retroactively
+untrack the already-committed files; noted in `.agents/projects/active-backlog.md` as cleanup
+still needed.
