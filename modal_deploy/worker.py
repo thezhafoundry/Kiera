@@ -294,6 +294,12 @@ _gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-te
     # costs ~1.75x base GPU price vs ~1.5x for the broader "ap" — using the narrow pin here
     # since this container talks to Render/Twilio in Singapore specifically, not elsewhere in APAC.
     region="ap-southeast",
+    # _session_active (below) only enforces single-tenancy inside one already-running
+    # container — it does nothing to stop Modal's autoscaler from booting a second GPU
+    # container for a connection attempt that arrives while the first is still cold-starting
+    # (~75s) or mid-call. Cap at 1 so extra connection attempts queue against the single
+    # container instead of each paying for its own T4 GPU concurrently.
+    max_containers=1,
 )
 @modal.asgi_app()
 def fastapi_app():
