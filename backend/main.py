@@ -153,7 +153,7 @@ async def _restrict_sip_audio(room_name: str, sip_identity: str = "sip-lead"):
             await lk.room.update_subscriptions(
                 api.UpdateSubscriptionsRequest(
                     room=room_name,
-                    participant_identity=resolved_sip_identity,
+                    identity=resolved_sip_identity,
                     track_sids=raw_agent_track_sids,
                     subscribe=False,
                 )
