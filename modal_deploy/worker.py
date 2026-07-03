@@ -721,10 +721,16 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
 
 
 @app.local_entrypoint()
-def main_chunked(pitch: int = -1):
+def main_chunked(pitch: int = -1, input_file: str = r"D:\Kiera\test1.wav", output_file: str = ""):
     import struct
 
-    input_file = r"D:\Kiera\test1.wav"
+    if not output_file:
+        # Default output name derived from the input file, e.g.
+        # raw_call_audio.wav -> raw_call_audio_chunked.wav -- avoids overwriting
+        # test11_chunked.wav when testing a different input file.
+        import os as _os
+        base, ext = _os.path.splitext(input_file)
+        output_file = f"{base}_chunked{ext}"
 
     print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch} (Note: -1 means whole-file auto-detect, matching main()'s default)")
     print("[Chunked Test] Simulates the live /ws block-accumulate + SOLA-crossfade")
@@ -759,11 +765,10 @@ def main_chunked(pitch: int = -1):
     header[36:40] = b'data'
     header[40:44] = struct.pack('<I', data_size)
 
-    output_path = r"D:\Kiera\test11_chunked.wav"
-    with open(output_path, "wb") as f:
+    with open(output_file, "wb") as f:
         f.write(bytes(header) + output_pcm)
 
-    print(f"[Chunked Test] Conversion complete -- saved {len(output_pcm)} bytes to {output_path}")
+    print(f"[Chunked Test] Conversion complete -- saved {len(output_pcm)} bytes to {output_file}")
     print("[Chunked Test] Compare against D:\\Kiera\\test11.wav (single-pass) on the same input.")
 
 
