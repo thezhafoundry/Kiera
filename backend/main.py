@@ -44,6 +44,14 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 RVC_ENDPOINT_URL = os.getenv("RVC_ENDPOINT_URL")
 RVC_API_KEY = os.getenv("RVC_API_KEY", "")
 RVC_PITCH_SHIFT = int(os.getenv("RVC_PITCH_SHIFT", "0"))
+# Blend between FAISS-retrieved target-voice timbre (1.0) and raw HuBERT content
+# features (0.0), which still carry some of the original speaker's own vocal-tract
+# characteristics. Bumped from RVCStreamingConverter's 0.75 default (2026-07-03
+# experiment: live streamed calls sound less like the trained voice than the offline
+# `modal run` one-shot test, which uses the same 0.75 default -- so this alone isn't
+# confirmed as the cause, but it's cheap/reversible to test). Env var, not another
+# code deploy, so it can be re-tuned from Render without touching code again.
+RVC_INDEX_RATE = float(os.getenv("RVC_INDEX_RATE", "0.9"))
 
 # Twilio Configuration
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -307,6 +315,7 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
             endpoint_url=RVC_ENDPOINT_URL,
             api_key=RVC_API_KEY,
             pitch_shift=pitch_shift,
+            index_rate=RVC_INDEX_RATE,
         )
     else:
         print("[Server] No RVC endpoint config found. Spawning Dummy Pitch Modulation Engine.")
