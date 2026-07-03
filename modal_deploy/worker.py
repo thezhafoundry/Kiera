@@ -315,7 +315,7 @@ _gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-te
 
 @app.function(
     image=image,
-    gpu="T4",
+    gpu="L4",
     timeout=10800,
     volumes={"/root/rvc-models": volume},
     scaledown_window=120,   # keep container warm for 2 min between requests, then auto-shutdown
