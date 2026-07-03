@@ -528,7 +528,7 @@ def convert_file(audio_bytes: bytes, pitch: int = 0) -> bytes:
 def main(pitch: int = -1):
     import struct
 
-    input_file = r"D:\Voice Clon\Keira\test1.wav"
+    input_file =r"D:\Kiera\test1.wav"
 
     print(f"[Test] Input: {input_file} | pitch_shift={pitch} (Note: -1 means auto-detect)")
 
@@ -559,7 +559,7 @@ def main(pitch: int = -1):
     header[36:40] = b'data'
     header[40:44] = struct.pack('<I', data_size)
 
-    with open(r"D:\Voice Clon\Keira\converted50epoch.wav", "wb") as f:
+    with open(r"D:\Kiera\test11.wav", "wb") as f:
         f.write(bytes(header) + output_pcm)
 
     print(f"Conversion Complete — saved {len(output_pcm)} bytes of audio")
