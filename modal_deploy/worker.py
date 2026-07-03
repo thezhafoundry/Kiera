@@ -311,6 +311,17 @@ class RVCEngine:
 # Global engine instance — initialized once per container
 engine = RVCEngine()
 
+# Temporary diagnostic (2026-07-03) -- saves the raw pre-conversion audio from
+# one live call to the persistent volume, so it can be downloaded and listened
+# to directly instead of guessed at (see part-by-part-audio-investigation:
+# pitch, index_rate, chunking+SOLA, and noise suppression have all been ruled
+# out offline; this checks whether the live-only difference is upstream of
+# our code entirely -- real mic/room audio vs. the clean test1.wav reference).
+# Flip back to False and redeploy once the comparison is done -- this is not
+# meant to run on every future call indefinitely.
+_DEBUG_SAVE_RAW_AUDIO = True
+_DEBUG_RAW_AUDIO_MAX_SAMPLES = 16000 * 30  # cap at 30s of 16kHz audio per call
+
 
 # ---- WebSocket streaming session state ----
 # MVP = a single concurrent /ws session. A second connection is told
@@ -446,6 +457,8 @@ def fastapi_app():
             # pitch_shift == -1 -> auto-detect once from the first non-silent block,
             # then fixed for the whole session.
             session_pitch = None if cfg_pitch == -1 else cfg_pitch
+            debug_raw_chunks = [] if _DEBUG_SAVE_RAW_AUDIO else None
+            debug_raw_samples = 0
 
             while True:
                 message = await ws.receive()
@@ -472,6 +485,10 @@ def fastapi_app():
                     if popped is None:
                         break
                     infer_input, context_len, block = popped
+
+                    if debug_raw_chunks is not None and debug_raw_samples < _DEBUG_RAW_AUDIO_MAX_SAMPLES:
+                        debug_raw_chunks.append(block.tobytes())
+                        debug_raw_samples += len(block)
 
                     infer_ms = 0.0
                     if st.block_rms(block) < st.SILENCE_RMS_THRESHOLD:
@@ -539,6 +556,19 @@ def fastapi_app():
             except Exception:
                 pass
         finally:
+            if debug_raw_chunks:
+                try:
+                    raw_pcm = np.frombuffer(b"".join(debug_raw_chunks), dtype=np.int16)
+                    wav_bytes = st.pcm16_to_wav_bytes(raw_pcm)
+                    debug_dir = "/root/rvc-models/debug"
+                    os.makedirs(debug_dir, exist_ok=True)
+                    out_path = f"{debug_dir}/raw_call_audio_{int(time.time())}.wav"
+                    with open(out_path, "wb") as f:
+                        f.write(wav_bytes)
+                    volume.commit()
+                    print(f"[Debug] Saved {debug_raw_samples/16000:.1f}s of raw pre-conversion audio to {out_path}")
+                except Exception as e:
+                    print(f"[Debug] Failed to save raw audio: {e}")
             async with _session_lock:
                 _session_active = False
 
