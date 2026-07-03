@@ -556,9 +556,17 @@ def convert_file(audio_bytes: bytes, pitch: int = 0) -> bytes:
 
 
 def _load_wav_as_pcm16_mono(audio_bytes: bytes):
+    """Loads a WAV file and resamples it to the production pipeline's 16kHz
+    mono contract if it isn't already there -- test1.wav is a 48kHz recording,
+    not 16kHz, but that's just the test file's own native rate. Real agent mic
+    audio arrives to the live pipeline already resampled to 16kHz by LiveKit
+    (rtc.AudioStream(track, sample_rate=16000, ...) -- see backend/pipeline.py),
+    so resampling here reproduces the SAME 16kHz input the live path actually
+    sees, rather than testing on 48kHz audio the live path never encounters."""
     import io
     import wave
     import numpy as np
+    import librosa
 
     with wave.open(io.BytesIO(audio_bytes)) as wf:
         sr = wf.getframerate()
@@ -574,12 +582,11 @@ def _load_wav_as_pcm16_mono(audio_bytes: bytes):
         samples = samples.reshape(-1, nch)[:, 0]  # take first channel
 
     if sr != st.SAMPLE_RATE_IN:
-        raise ValueError(
-            f"test file is {sr}Hz, expected {st.SAMPLE_RATE_IN}Hz (16kHz) -- the "
-            "production pipeline assumes 16kHz input; a mismatched sample rate "
-            "here would itself explain a pitch/identity difference, separately "
-            "from anything this diagnostic is trying to isolate."
-        )
+        print(f"[Chunked Test] Resampling test file {sr}Hz -> {st.SAMPLE_RATE_IN}Hz to match what LiveKit actually delivers live")
+        float_samples = samples.astype(np.float32) / 32768.0
+        resampled = librosa.resample(float_samples, orig_sr=sr, target_sr=st.SAMPLE_RATE_IN)
+        samples = (resampled * 32767.0).clip(-32768, 32767).astype(np.int16)
+
     return samples
 
 
