@@ -77,6 +77,14 @@ image = (
     .pip_install_from_requirements(
         "modal_deploy/requirements.txt"
     )
+    # Diagnostic-only (2026-07-03): backend/requirements.txt (the Render side)
+    # installs this for WebRTCNoiseSuppressor, which runs on every 10ms frame of
+    # every live call before it ever reaches the converter -- but this Modal
+    # image never had it, so convert_file_chunked's offline A/B test was missing
+    # a real, active (Level 3, not passthrough -- confirmed in production logs)
+    # processing step the live path always applies. Not used by fastapi_app or
+    # convert_file, only by convert_file_chunked below.
+    .pip_install("webrtc-noise-gain")
     .add_local_dir(
         "RVC",
         remote_path="/root/rvc",
@@ -617,11 +625,30 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
     so only chunking+SOLA is the variable under test.
     """
     import numpy as np
+    from webrtc_noise_gain import AudioProcessor
 
     test_engine = RVCEngine()
     test_engine.startup()
 
     samples = _load_wav_as_pcm16_mono(audio_bytes)
+
+    # Replicate the live path's per-10ms-frame noise suppression
+    # (backend/pipeline.py's _run_audio_pipeline runs every frame through this
+    # before it ever reaches the converter -- confirmed active at Level 3 in
+    # production logs, not passthrough). This diagnostic never applied it
+    # until now -- a real, previously-untested difference from the offline
+    # reference, which also never went through it.
+    noise_processor = AudioProcessor(0, 3)  # auto_gain_dbfs=0, ns_level=3 -- matches backend/main.py's WebRTCNoiseSuppressor(ns_level=3)
+    frame_size = 320  # 10ms @ 16kHz mono 16-bit, WebRTCNoiseSuppressor's fixed frame contract
+    raw_bytes = samples.tobytes()
+    denoised_chunks = []
+    for i in range(0, len(raw_bytes), frame_size):
+        frame = raw_bytes[i:i + frame_size]
+        if len(frame) != frame_size:
+            denoised_chunks.append(frame)  # trailing partial frame: pass through unchanged, same as WebRTCNoiseSuppressor.process_frame does
+            continue
+        denoised_chunks.append(noise_processor.Process10ms(frame).audio)
+    samples = np.frombuffer(b"".join(denoised_chunks), dtype=np.int16)
 
     if pitch == -1:
         probe_wav = st.pcm16_to_wav_bytes(samples)
