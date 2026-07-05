@@ -188,10 +188,12 @@ class RVCEngine:
     def _auto_detect_pitch(self, wav_bytes: bytes) -> int:
         """
         Estimate speaker gender from audio and return pitch shift.
-        Voiced-frame analysis (ignores silence/noise) using autocorrelation.
-        Uses the median F0 across all voiced frames to identify speaker gender.
+        Uses autocorrelation to estimate fundamental frequency (F0).
         Male voices: F0 < 145 Hz  → pitch_shift = +12 (shift up to female range)
         Female voices: F0 >= 145 Hz → pitch_shift = 0  (already in female range)
+
+        Fallback is 0 (no shift) rather than +12: a missed female is far less
+        damaging than a false-positive octave shift on a real female voice.
         """
         import io
         import wave
@@ -204,43 +206,31 @@ class RVCEngine:
 
             audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Split into 50ms frames to detect voiced segments
-            frame_len = int(sr * 0.05)
-            if frame_len <= 0:
-                return 0
+            # Use first 1 second of audio (or all of it if shorter)
+            chunk = audio[:sr]
+            chunk = chunk - chunk.mean()  # remove DC offset
 
-            f0_estimates = []
+            # Autocorrelation pitch detection (80–300 Hz range)
             min_lag = int(sr / 300)   # 300 Hz upper limit
             max_lag = int(sr / 80)    # 80 Hz lower limit
 
-            for i in range(0, len(audio) - frame_len, frame_len):
-                frame = audio[i:i+frame_len]
-                # Silence threshold: RMS must be > 0.015 (about 500 in int16)
-                rms = np.sqrt(np.mean(frame * frame))
-                if rms < 0.015:
-                    continue
-
-                frame = frame - frame.mean()
-                corr = np.correlate(frame, frame, mode='full')
-                corr = corr[len(corr)//2:]
-
-                r = corr[min_lag:max_lag]
-                if len(r) > 0:
-                    peak_lag = np.argmax(r) + min_lag
-                    f0 = sr / peak_lag
-                    # Keep F0 in typical human speech range
-                    if 80.0 <= f0 <= 300.0:
-                        f0_estimates.append(f0)
-
-            if not f0_estimates:
-                print("[Gender Detection] No voiced audio found — defaulting to no shift (0)")
+            # Need at least ~125ms of audio for reliable pitch detection
+            if max_lag >= len(chunk) or len(chunk) < sr // 8:
+                print("[Gender Detection] Not enough audio — defaulting to no shift (0)")
                 return 0
 
-            # Use median F0 of voiced frames for robustness against outliers/harmonics
-            median_f0 = float(np.median(f0_estimates))
-            is_male = median_f0 < 145.0
+            corr = np.correlate(chunk, chunk, mode='full')
+            corr = corr[len(corr) // 2:]
+            corr = corr / (corr[0] + 1e-8)
+
+            peak_idx = np.argmax(corr[min_lag:max_lag]) + min_lag
+            f0 = sr / peak_idx
+
+            # 145 Hz boundary: catches contralto/mezzo voices that sit in 145–165 Hz
+            is_male = f0 < 145.0
             pitch_shift = 12 if is_male else 0
-            print(f"[Gender Detection] Voiced frames: {len(f0_estimates)} | Median F0: {median_f0:.1f} Hz → {'Male' if is_male else 'Female'} → pitch_shift={pitch_shift}")
+
+            print(f"[Gender Detection] F0={f0:.1f}Hz → {'Male' if is_male else 'Female'} → pitch_shift={pitch_shift}")
             return pitch_shift
 
         except Exception as e:
@@ -255,7 +245,6 @@ class RVCEngine:
         filter_radius: int = 3,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
-        f0_method: str = "pm",
     ) -> bytes:
         import numpy as np
 
@@ -271,14 +260,14 @@ class RVCEngine:
             f.write(audio_bytes)
 
         t1 = time.perf_counter()
-        print(f"[Timing] file-write: {(t1-t0)*1000:.1f}ms | pitch={pitch} index_rate={index_rate} f0_method={f0_method}")
+        print(f"[Timing] file-write: {(t1-t0)*1000:.1f}ms | pitch={pitch} index_rate={index_rate}")
 
         info, wav_opt = self.vc.vc_single(
             0,
             input_path,
             pitch,
             None,
-            f0_method,
+            "pm",          # switched from rmvpe → pm saves ~300ms per chunk for real-time
             self.index_path,
             "",
             index_rate,
@@ -367,7 +356,6 @@ def fastapi_app():
         index_rate: float = 0.75,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
-        f0_method: str = "pm",
     ):
         audio_bytes = await request.body()
 
@@ -384,7 +372,6 @@ def fastapi_app():
                 3,           # filter_radius default
                 rms_mix_rate,
                 protect,
-                f0_method,
             )
             elapsed = (time.perf_counter() - t_start) * 1000.0
             headers = {"X-Server-Time-Ms": f"{elapsed:.1f}"}
@@ -436,7 +423,6 @@ def fastapi_app():
             index_rate = float(cfg.get("index_rate", 0.75))
             rms_mix_rate = float(cfg.get("rms_mix_rate", 0.75))
             protect = float(cfg.get("protect", 0.33))
-            f0_method = cfg.get("f0_method", "pm")
 
             # Warm-gate: only reply "ready" when the engine is actually loaded AND
             # (guaranteed above) no other session is active.
@@ -507,7 +493,6 @@ def fastapi_app():
                                     3,             # filter_radius default
                                     rms_mix_rate,
                                     protect,
-                                    f0_method,
                                 )
                             infer_ms = (time.perf_counter() - t0) * 1000.0
                         except Exception as e:
@@ -611,7 +596,7 @@ def _load_wav_as_pcm16_mono(audio_bytes: bytes):
     timeout=10800,
     volumes={"/root/rvc-models": volume},
 )
-def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, f0_method: str = "pm") -> bytes:
+def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
     """
     Diagnostic (2026-07-03): runs the SAME block-accumulate + SOLA-crossfade
     pipeline the live /ws handler uses (see fastapi_app's ws_stream), but driven
@@ -659,7 +644,7 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, f0_method: str = "
             out = np.zeros(len(block) * 3 + st.SOLA_CROSSFADE_SAMPLES, dtype=np.int16)
         else:
             wav_bytes = st.pcm16_to_wav_bytes(infer_input)
-            out_bytes = test_engine.run_conversion(wav_bytes, pitch=pitch, f0_method=f0_method)
+            out_bytes = test_engine.run_conversion(wav_bytes, pitch=pitch)
             out = np.frombuffer(out_bytes, dtype=np.int16)
             out = st.trim_context(
                 out, context_len, len(infer_input), overlap_keep=st.SOLA_CROSSFADE_SAMPLES

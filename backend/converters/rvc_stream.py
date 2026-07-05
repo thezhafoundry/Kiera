@@ -65,7 +65,6 @@ class RVCStreamingConverter(VoiceConverter):
         index_rate: float = 0.75,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
-        f0_method: str = "",
         connect_timeout: float = 10.0,
     ):
         self.ws_url = (
@@ -78,7 +77,6 @@ class RVCStreamingConverter(VoiceConverter):
         self.index_rate = index_rate
         self.rms_mix_rate = rms_mix_rate
         self.protect = protect
-        self.f0_method = f0_method or os.getenv("RVC_F0_METHOD", "pm")
         self.connect_timeout = connect_timeout
 
         # Optional callback: on_stats(dict) — called with the server's raw
@@ -103,7 +101,6 @@ class RVCStreamingConverter(VoiceConverter):
             "index_rate": self.index_rate,
             "rms_mix_rate": self.rms_mix_rate,
             "protect": self.protect,
-            "f0_method": self.f0_method,
         })
 
     def _connect_kwargs(self) -> dict:
