@@ -51,7 +51,8 @@ RVC_PITCH_SHIFT = int(os.getenv("RVC_PITCH_SHIFT", "0"))
 # `modal run` one-shot test, which uses the same 0.75 default -- so this alone isn't
 # confirmed as the cause, but it's cheap/reversible to test). Env var, not another
 # code deploy, so it can be re-tuned from Render without touching code again.
-RVC_INDEX_RATE = float(os.getenv("RVC_INDEX_RATE", "0.9"))
+RVC_INDEX_RATE = float(os.getenv("RVC_INDEX_RATE", "0.75"))
+RVC_F0_METHOD = os.getenv("RVC_F0_METHOD", "pm")  # pm (parselmouth) or rmvpe
 
 # Twilio Configuration
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -296,18 +297,14 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
         .with_ttl(datetime.timedelta(seconds=3600))
     
     # Choose voice conversion engine (priority: RVC > Dummy)
-    # Pitch shift: male agent -> female Keira = +12, female agent -> female Keira = 0.
-    # Previously this was handed off to the GPU's auto-detect (pitch_shift=-1,
-    # autocorrelation F0 vs. a 145Hz threshold in worker.py's _auto_detect_pitch).
-    # That's unreliable in practice (confirmed 2026-07-03: a known-male agent was
-    # twice misdetected as female, F0=222Hz/167Hz — autocorrelation locking onto a
-    # harmonic instead of the true fundamental) and re-runs from scratch on every
-    # WS reconnect since the detected value is never reported back to/persisted by
-    # the client, so a single call could even change identity mid-call. The UI
-    # gender toggle is the ground truth the agent already knows about themselves,
-    # so drive pitch_shift from it directly instead of trusting a live guess.
-    pitch_shift = 12 if agent_gender.lower() == "male" else 0
-    print(f"[Server] Agent gender: {agent_gender} → pitch_shift={pitch_shift}")
+    # If RVC_PITCH_SHIFT is explicitly configured in the environment, respect it.
+    # Otherwise, fall back to the gender-based lookup.
+    if "RVC_PITCH_SHIFT" in os.environ:
+        pitch_shift = RVC_PITCH_SHIFT
+        print(f"[Server] Using explicit pitch shift from environment: {pitch_shift}")
+    else:
+        pitch_shift = 12 if agent_gender.lower() == "male" else 0
+        print(f"[Server] Agent gender: {agent_gender} → pitch_shift={pitch_shift}")
 
     if RVC_ENDPOINT_URL:
         print(f"[Server] Spawning RVC Streaming Voice Changer (Endpoint: {RVC_ENDPOINT_URL})")
@@ -316,6 +313,7 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
             api_key=RVC_API_KEY,
             pitch_shift=pitch_shift,
             index_rate=RVC_INDEX_RATE,
+            f0_method=RVC_F0_METHOD,
         )
     else:
         print("[Server] No RVC endpoint config found. Spawning Dummy Pitch Modulation Engine.")

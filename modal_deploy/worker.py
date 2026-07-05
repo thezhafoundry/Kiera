@@ -245,6 +245,7 @@ class RVCEngine:
         filter_radius: int = 3,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
+        f0_method: str = "pm",
     ) -> bytes:
         import numpy as np
 
@@ -260,14 +261,14 @@ class RVCEngine:
             f.write(audio_bytes)
 
         t1 = time.perf_counter()
-        print(f"[Timing] file-write: {(t1-t0)*1000:.1f}ms | pitch={pitch} index_rate={index_rate}")
+        print(f"[Timing] file-write: {(t1-t0)*1000:.1f}ms | pitch={pitch} index_rate={index_rate} f0_method={f0_method}")
 
         info, wav_opt = self.vc.vc_single(
             0,
             input_path,
             pitch,
             None,
-            "pm",          # switched from rmvpe → pm saves ~300ms per chunk for real-time
+            f0_method,
             self.index_path,
             "",
             index_rate,
@@ -356,6 +357,7 @@ def fastapi_app():
         index_rate: float = 0.75,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
+        f0_method: str = "pm",
     ):
         audio_bytes = await request.body()
 
@@ -372,6 +374,7 @@ def fastapi_app():
                 3,           # filter_radius default
                 rms_mix_rate,
                 protect,
+                f0_method,
             )
             elapsed = (time.perf_counter() - t_start) * 1000.0
             headers = {"X-Server-Time-Ms": f"{elapsed:.1f}"}
@@ -423,6 +426,7 @@ def fastapi_app():
             index_rate = float(cfg.get("index_rate", 0.75))
             rms_mix_rate = float(cfg.get("rms_mix_rate", 0.75))
             protect = float(cfg.get("protect", 0.33))
+            f0_method = cfg.get("f0_method", "pm")
 
             # Warm-gate: only reply "ready" when the engine is actually loaded AND
             # (guaranteed above) no other session is active.
@@ -493,6 +497,7 @@ def fastapi_app():
                                     3,             # filter_radius default
                                     rms_mix_rate,
                                     protect,
+                                    f0_method,
                                 )
                             infer_ms = (time.perf_counter() - t0) * 1000.0
                         except Exception as e:
@@ -596,7 +601,7 @@ def _load_wav_as_pcm16_mono(audio_bytes: bytes):
     timeout=10800,
     volumes={"/root/rvc-models": volume},
 )
-def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
+def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, f0_method: str = "pm") -> bytes:
     """
     Diagnostic (2026-07-03): runs the SAME block-accumulate + SOLA-crossfade
     pipeline the live /ws handler uses (see fastapi_app's ws_stream), but driven
@@ -644,7 +649,7 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
             out = np.zeros(len(block) * 3 + st.SOLA_CROSSFADE_SAMPLES, dtype=np.int16)
         else:
             wav_bytes = st.pcm16_to_wav_bytes(infer_input)
-            out_bytes = test_engine.run_conversion(wav_bytes, pitch=pitch)
+            out_bytes = test_engine.run_conversion(wav_bytes, pitch=pitch, f0_method=f0_method)
             out = np.frombuffer(out_bytes, dtype=np.int16)
             out = st.trim_context(
                 out, context_len, len(infer_input), overlap_keep=st.SOLA_CROSSFADE_SAMPLES
