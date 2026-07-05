@@ -95,29 +95,6 @@ image = (
     # says nothing about what ships in the remote container. Explicitly mount
     # streaming.py so `import streaming` resolves inside the container too.
     .add_local_python_source("streaming")
-    # trt_pipeline.py (Task 5/6) is a sibling module — same rule applies.
-    .add_local_python_source("trt_pipeline")
-)
-
-# TRT runtime image: existing image + ONNX/ORT/TensorRT stack.
-# Kept as a separate variable so the still-deployed PyTorch fastapi_app is
-# untouched until Task 8 flips it. tensorrt-cu12 ships its shared libs inside
-# site-packages/tensorrt_libs; ORT's TRT EP dlopen()s them via LD_LIBRARY_PATH.
-# Candidate pins (ORT 1.18 targets TRT 10.0 / CUDA 12 — see implementation_plan.md
-# Warning 4 for the full toolchain risk note):
-trt_image = (
-    image
-    .pip_install(
-        "onnx==1.16.1",
-        "onnxruntime-gpu==1.18.1",
-        "tensorrt-cu12==10.0.1",
-    )
-    .env({
-        "LD_LIBRARY_PATH": (
-            "/usr/local/lib/python3.10/site-packages/tensorrt_libs:"
-            "/usr/local/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
-        )
-    })
 )
 
 
@@ -131,10 +108,6 @@ class RVCEngine:
         self.config = None
         self.index_path = None
         self.ready = False
-        # TRT path (Task 8 Step 2)
-        self.trt_pipe = None
-        self.engine_kind = "pytorch"
-        self._trt_cache_hot = False
 
     def startup(self):
         import glob
@@ -207,46 +180,6 @@ class RVCEngine:
             print("GPU warm-up complete.")
         except Exception as e:
             print(f"[Warning] Warm-up failed (non-fatal): {e}")
-
-        # ---- Optional TRT path (USE_TRT=1). Fail-CLOSED philosophy is preserved:
-        # if TRT init fails we fall back to the PyTorch CONVERTED path (never raw),
-        # log loudly, and expose the degradation in /health.
-        if os.environ.get("USE_TRT", "0") == "1":
-            try:
-                import glob as _glob
-                try:
-                    from modal_deploy import trt_pipeline as tp
-                except ImportError:
-                    import trt_pipeline as tp
-                from infer.lib.rmvpe import MelSpectrogram
-                import torch as _torch
-
-                index = faiss.read_index(self.index_path)   # hits the lru_cache
-                big_npy = index.reconstruct_n(0, index.ntotal)
-                mel = MelSpectrogram(
-                    is_half=False, n_mel_channels=128, sampling_rate=16000,
-                    win_length=1024, hop_length=160, mel_fmin=30, mel_fmax=8000,
-                ).to("cuda" if _torch.cuda.is_available() else "cpu")
-                cache_dir = "/root/rvc-models/trt_cache"
-                self._trt_cache_hot = bool(_glob.glob(f"{cache_dir}/*.engine"))
-                print(
-                    f"[TRT] Engine cache "
-                    f"{'HOT' if self._trt_cache_hot else 'COLD — building now'}"
-                )
-                t0_trt = time.perf_counter()
-                self.trt_pipe = tp.TRTVoicePipeline(
-                    "/root/rvc-models/onnx", cache_dir, index, big_npy, mel,
-                )
-                self.trt_pipe.warmup()
-                self.engine_kind = "trt"
-                print(f"[TRT] Pipeline ready in {time.perf_counter() - t0_trt:.1f}s")
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                print(
-                    f"[TRT] Init FAILED ({e}) — falling back to PyTorch converted path"
-                )
-                self.trt_pipe = None
 
         self.ready = True
         print("GPU Worker Ready")
@@ -364,35 +297,6 @@ class RVCEngine:
         print(f"[Timing] total run_conversion: {(time.perf_counter()-t0)*1000:.1f}ms → {len(result)} bytes")
         return result
 
-    def convert_block(
-        self,
-        pcm_int16,          # np.int16 array, 16 kHz mono, <= 22400 samples
-        pitch: int = 0,
-        index_rate: float = 0.75,
-        rms_mix_rate: float = 0.75,
-        protect: float = 0.33,
-    ) -> bytes:
-        """Single streaming-block conversion. TRT path when loaded, else PyTorch.
-
-        Returns 48 kHz int16 bytes, exactly 3x the input sample duration either way.
-        Fail-CLOSED: on any error emits nothing (caller handles silence). No raw path.
-        """
-        import numpy as np
-        if self.trt_pipe is not None:
-            out = self.trt_pipe.convert_block(
-                pcm_int16, pitch, index_rate, rms_mix_rate, protect,
-            )
-            return out.tobytes()
-        # PyTorch fallback (converted voice — never raw)
-        try:
-            from modal_deploy import streaming as _st
-        except ImportError:
-            import streaming as _st
-        return self.run_conversion(
-            _st.pcm16_to_wav_bytes(pcm_int16), pitch, index_rate, 3,
-            rms_mix_rate, protect,
-        )
-
 
 # ---- ASGI Web App (HTTP endpoints for the backend) ----
 
@@ -410,7 +314,7 @@ _gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-te
 
 
 @app.function(
-    image=trt_image,   # switched from image → trt_image (Task 8 Step 1)
+    image=image,
     gpu="L4",
     timeout=10800,
     volumes={"/root/rvc-models": volume},
@@ -443,11 +347,6 @@ def fastapi_app():
             "cuda_available": torch.cuda.is_available(),
             "cuda_device": device_name,
             "rvc_device": str(engine.config.device) if engine.config else "None",
-            "engine": engine.engine_kind,
-            "trt_cache": (
-                ("hot" if getattr(engine, "_trt_cache_hot", False) else "cold")
-                if engine.engine_kind == "trt" else "n/a"
-            ),
         }
 
     @web_app.post("/convert")
@@ -582,14 +481,16 @@ def fastapi_app():
                             session_pitch = await asyncio.to_thread(
                                 engine._auto_detect_pitch, probe_wav
                             )
+                        wav_bytes = st.pcm16_to_wav_bytes(infer_input)
                         try:
                             t0 = time.perf_counter()
                             async with _gpu_lock:  # single-tenant GPU
                                 out_bytes = await asyncio.to_thread(
-                                    engine.convert_block,
-                                    infer_input,
+                                    engine.run_conversion,
+                                    wav_bytes,
                                     session_pitch,
                                     index_rate,
+                                    3,             # filter_radius default
                                     rms_mix_rate,
                                     protect,
                                 )
@@ -638,15 +539,13 @@ def fastapi_app():
 
 # ---- Local testing entrypoint (modal run) ----
 
-
 @app.function(
-    image=trt_image,   # switched from image → trt_image; T4 → L4 to match deployed tier
-    gpu="L4",
+    image=image,
+    gpu="T4",
     timeout=10800,
     volumes={"/root/rvc-models": volume},
 )
 def convert_file(audio_bytes: bytes, pitch: int = 0) -> bytes:
-
     """
     pitch: semitones to shift. 0 = female input (no shift), 12 = male input,
            -1 = auto-detect from audio (runs _auto_detect_pitch).
@@ -692,12 +591,12 @@ def _load_wav_as_pcm16_mono(audio_bytes: bytes):
 
 
 @app.function(
-    image=trt_image,   # switched from image → trt_image; gpu T4 → L4 (engines are SM89-specific)
-    gpu="L4",
+    image=image,
+    gpu="T4",  # matches convert_file's GPU and the actually-deployed fastapi_app
     timeout=10800,
     volumes={"/root/rvc-models": volume},
 )
-def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, use_trt: int = 1) -> bytes:
+def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
     """
     Diagnostic (2026-07-03): runs the SAME block-accumulate + SOLA-crossfade
     pipeline the live /ws handler uses (see fastapi_app's ws_stream), but driven
@@ -719,8 +618,6 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, use_trt: int = 1) 
     """
     import numpy as np
 
-    if use_trt:
-        os.environ["USE_TRT"] = "1"
     test_engine = RVCEngine()
     test_engine.startup()
 
@@ -746,7 +643,8 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, use_trt: int = 1) 
         if st.block_rms(block) < st.SILENCE_RMS_THRESHOLD:
             out = np.zeros(len(block) * 3 + st.SOLA_CROSSFADE_SAMPLES, dtype=np.int16)
         else:
-            out_bytes = test_engine.convert_block(infer_input, pitch=pitch)
+            wav_bytes = st.pcm16_to_wav_bytes(infer_input)
+            out_bytes = test_engine.run_conversion(wav_bytes, pitch=pitch)
             out = np.frombuffer(out_bytes, dtype=np.int16)
             out = st.trim_context(
                 out, context_len, len(infer_input), overlap_keep=st.SOLA_CROSSFADE_SAMPLES
@@ -766,7 +664,7 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, use_trt: int = 1) 
 
 
 @app.local_entrypoint()
-def main_chunked(pitch: int = -1, use_trt: int = 1):
+def main_chunked(pitch: int = -1):
     import struct
 
     input_file = r"D:\Kiera\test1.wav"
@@ -780,7 +678,7 @@ def main_chunked(pitch: int = -1, use_trt: int = 1):
     with open(input_file, "rb") as f:
         audio_bytes = f.read()
 
-    output_pcm = convert_file_chunked.remote(audio_bytes, pitch=pitch, use_trt=use_trt)
+    output_pcm = convert_file_chunked.remote(audio_bytes, pitch=pitch)
 
     sample_rate = 48000
     num_channels = 1

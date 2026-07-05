@@ -37,11 +37,8 @@ class VoiceConversionWorker:
     # 590ms to convert a 320ms block even after the FAISS index caching fix)
     # by growing the lead's delay instead of producing a silence gap.
     #
-    # Phase 1 of the TRT latency plan (2026-07-05): 1.25s is the floor for
-    # BLOCK_MS=1000 — converted audio arrives in ~1s bursts, so the cushion must
-    # exceed one block interval plus jitter. 0.25s (Phase 2) additionally requires
-    # shrinking BLOCK_MS and is gated on live TRT p95 <= 0.4x BLOCK_MS.
-    _PLAYOUT_BUFFER_TARGET_BYTES = int(48000 * 2 * 1.25)
+    # Target: initial cushion before playout starts (~3s of 48kHz 16-bit mono).
+    _PLAYOUT_BUFFER_TARGET_BYTES = int(48000 * 2 * 3.0)
     # Cap: beyond this, drop the OLDEST buffered audio rather than let delay
     # grow unbounded -- same policy as RVCStreamingConverter's reconnect
     # buffer (backend/converters/rvc_stream.py, _MAX_BUFFER_BYTES).
