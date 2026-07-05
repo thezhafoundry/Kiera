@@ -77,14 +77,6 @@ image = (
     .pip_install_from_requirements(
         "modal_deploy/requirements.txt"
     )
-    # Diagnostic-only (2026-07-03): backend/requirements.txt (the Render side)
-    # installs this for WebRTCNoiseSuppressor, which runs on every 10ms frame of
-    # every live call before it ever reaches the converter -- but this Modal
-    # image never had it, so convert_file_chunked's offline A/B test was missing
-    # a real, active (Level 3, not passthrough -- confirmed in production logs)
-    # processing step the live path always applies. Not used by fastapi_app or
-    # convert_file, only by convert_file_chunked below.
-    .pip_install("webrtc-noise-gain")
     .add_local_dir(
         "RVC",
         remote_path="/root/rvc",
@@ -311,17 +303,6 @@ class RVCEngine:
 # Global engine instance — initialized once per container
 engine = RVCEngine()
 
-# Temporary diagnostic (2026-07-03) -- saves the raw pre-conversion audio from
-# one live call to the persistent volume, so it can be downloaded and listened
-# to directly instead of guessed at (see part-by-part-audio-investigation:
-# pitch, index_rate, chunking+SOLA, and noise suppression have all been ruled
-# out offline; this checks whether the live-only difference is upstream of
-# our code entirely -- real mic/room audio vs. the clean test1.wav reference).
-# Flip back to False and redeploy once the comparison is done -- this is not
-# meant to run on every future call indefinitely.
-_DEBUG_SAVE_RAW_AUDIO = True
-_DEBUG_RAW_AUDIO_MAX_SAMPLES = 16000 * 30  # cap at 30s of 16kHz audio per call
-
 
 # ---- WebSocket streaming session state ----
 # MVP = a single concurrent /ws session. A second connection is told
@@ -457,8 +438,6 @@ def fastapi_app():
             # pitch_shift == -1 -> auto-detect once from the first non-silent block,
             # then fixed for the whole session.
             session_pitch = None if cfg_pitch == -1 else cfg_pitch
-            debug_raw_chunks = [] if _DEBUG_SAVE_RAW_AUDIO else None
-            debug_raw_samples = 0
 
             while True:
                 message = await ws.receive()
@@ -485,10 +464,6 @@ def fastapi_app():
                     if popped is None:
                         break
                     infer_input, context_len, block = popped
-
-                    if debug_raw_chunks is not None and debug_raw_samples < _DEBUG_RAW_AUDIO_MAX_SAMPLES:
-                        debug_raw_chunks.append(block.tobytes())
-                        debug_raw_samples += len(block)
 
                     infer_ms = 0.0
                     if st.block_rms(block) < st.SILENCE_RMS_THRESHOLD:
@@ -556,19 +531,6 @@ def fastapi_app():
             except Exception:
                 pass
         finally:
-            if debug_raw_chunks:
-                try:
-                    raw_pcm = np.frombuffer(b"".join(debug_raw_chunks), dtype=np.int16)
-                    wav_bytes = st.pcm16_to_wav_bytes(raw_pcm)
-                    debug_dir = "/root/rvc-models/debug"
-                    os.makedirs(debug_dir, exist_ok=True)
-                    out_path = f"{debug_dir}/raw_call_audio_{int(time.time())}.wav"
-                    with open(out_path, "wb") as f:
-                        f.write(wav_bytes)
-                    volume.commit()
-                    print(f"[Debug] Saved {debug_raw_samples/16000:.1f}s of raw pre-conversion audio to {out_path}")
-                except Exception as e:
-                    print(f"[Debug] Failed to save raw audio: {e}")
             async with _session_lock:
                 _session_active = False
 
@@ -655,30 +617,11 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
     so only chunking+SOLA is the variable under test.
     """
     import numpy as np
-    from webrtc_noise_gain import AudioProcessor
 
     test_engine = RVCEngine()
     test_engine.startup()
 
     samples = _load_wav_as_pcm16_mono(audio_bytes)
-
-    # Replicate the live path's per-10ms-frame noise suppression
-    # (backend/pipeline.py's _run_audio_pipeline runs every frame through this
-    # before it ever reaches the converter -- confirmed active at Level 3 in
-    # production logs, not passthrough). This diagnostic never applied it
-    # until now -- a real, previously-untested difference from the offline
-    # reference, which also never went through it.
-    noise_processor = AudioProcessor(0, 3)  # auto_gain_dbfs=0, ns_level=3 -- matches backend/main.py's WebRTCNoiseSuppressor(ns_level=3)
-    frame_size = 320  # 10ms @ 16kHz mono 16-bit, WebRTCNoiseSuppressor's fixed frame contract
-    raw_bytes = samples.tobytes()
-    denoised_chunks = []
-    for i in range(0, len(raw_bytes), frame_size):
-        frame = raw_bytes[i:i + frame_size]
-        if len(frame) != frame_size:
-            denoised_chunks.append(frame)  # trailing partial frame: pass through unchanged, same as WebRTCNoiseSuppressor.process_frame does
-            continue
-        denoised_chunks.append(noise_processor.Process10ms(frame).audio)
-    samples = np.frombuffer(b"".join(denoised_chunks), dtype=np.int16)
 
     if pitch == -1:
         probe_wav = st.pcm16_to_wav_bytes(samples)
