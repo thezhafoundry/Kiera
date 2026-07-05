@@ -159,9 +159,9 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   deployed. Fixed 2026-07-03 (see [[log]]) by using `identity=`. **Don't confuse this with**
   `CreateSIPParticipantRequest`'s `participant_identity` field (`main.py`, outbound dial) —
   that's a different message where the field genuinely is named `participant_identity`.
-- **Not yet confirmed live** — look for `[SIP Isolation] ✅ ... unsubscribed` in logs after a
-  real call to verify the fix actually engages; absence of that line (only the retry/failure
-  lines) means the lead is still hearing both tracks mixed.
+- **Confirmed live 2026-07-03**: `[SIP Isolation] ✅ ... unsubscribed` appears on every
+  outbound call sampled after deploy (15:05, 15:07, 16:10, 17:05, 17:07) — zero failure
+  lines in that window. The mixing bug is resolved.
 
 ## Modal deploy: local imports succeeding proves nothing about the remote container (2026-07-03)
 The streaming rebuild's first real `modal deploy modal_deploy/worker.py` (it had only ever been
@@ -211,6 +211,41 @@ lookup when it's unset). See
 — still open as of this writing
 (Twilio-webhook-config step of the same `/api/setup` run 401'd separately — see [[active-backlog]]
 — and the actual retried call hasn't been confirmed successful yet).
+
+## Offline diagnostic tooling (`modal_deploy/worker.py`, added 2026-07-03)
+Built while investigating "converted voice doesn't match the trained voice on live calls" —
+these are lasting tools, not throwaway debug code:
+- **`convert_file_chunked` / `main_chunked`**: replays the *exact* logic `ws_stream` uses
+  (block-accumulate via `st.BlockAccumulator`, per-block `run_conversion`, `trim_context`,
+  `sola_crossfade`) against a static WAV file instead of a live WebSocket — optionally also
+  running the same Level-3 `WebRTCNoiseSuppressor` processing the live path applies. Run via
+  `modal run modal_deploy/worker.py::main_chunked --input-file <path> --pitch <n>`. Use this
+  for any future "is it the pipeline's audio processing, or something live-only" question
+  before touching production — it isolates chunking/SOLA/noise-suppression from
+  network/SIP/telephony entirely. `pitch=-1` (default) auto-detects once from the *whole*
+  file, matching `main()`'s own reference behavior — **not** `ws_stream`'s per-first-block
+  detection, since production no longer uses `-1` live at all (see the pitch-detection
+  gotcha above). If you test a file that opens with a stretch of silence, prefer an explicit
+  `--pitch` over `-1` — `_auto_detect_pitch` has no silence check on its 1-second analysis
+  window and will produce an effectively random result on near-zero-amplitude input.
+- **`_DEBUG_SAVE_RAW_AUDIO`** (module-level flag, currently `True` in the deployed worker):
+  saves the first 30s of real pre-conversion PCM per live call to
+  `/root/rvc-models/debug/raw_call_audio_<timestamp>.wav` on the persistent volume — download
+  with `modal volume get rvc-models debug/<filename> <local-path>`. **Temporary** — flip back
+  to `False` and redeploy once the current voice-identity investigation concludes; not meant
+  to run indefinitely (per-call overhead, volume storage). See [[active-backlog]].
+
+## GPU tier: a committed code change isn't a deployed one (2026-07-03)
+`fastapi_app`'s `gpu=` was changed from `"T4"` to `"L4"` in a commit that landed on `main`,
+but `git push`/commit and `modal deploy` are two entirely separate actions — nothing about
+committing or pushing code touches what's actually running on Modal (unlike Render, which
+auto-deploys on every push). Confirmed via `/health` that the live container was still
+reporting `"Tesla T4"` well after the `L4` code was on `main`. An unrelated deploy (for the
+`_DEBUG_SAVE_RAW_AUDIO` capture above) incidentally picked up the pending change — the live
+worker is now genuinely on an `NVIDIA L4`. Lesson: always verify actual deployed state
+(`/health`'s `cuda_device`) rather than trusting the committed code when GPU tier or any
+other `@app.function` decorator setting matters to a live investigation — the two can silently
+diverge for as long as nobody runs `modal deploy`.
 
 ## Render deployment
 - `autoDeploy: commit` means **every push to `main` redeploys immediately**, tearing down

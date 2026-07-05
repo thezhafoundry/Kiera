@@ -73,6 +73,7 @@ updating `CLAUDE.md`'s "Audio Pipeline & Streaming" section in place to match
 
 ## Status
 
-Fix committed (`cf60ca5`) but **not yet pushed/deployed or verified on a live call** — see
-[[active-backlog]]. Don't mark this resolved-in-production until a real call's Render logs
-show `[SIP Isolation] ✅ ... unsubscribed` instead of the failure lines.
+**Confirmed live 2026-07-03.** The fix was pushed and deployed, and Render logs
+(`srv-d932m4cvikkc73belt1g`) now show `[SIP Isolation] ✅ 'sip-lead' unsubscribed from raw
+agent tracks [...]` on every outbound call sampled since (15:05:27, 15:07:21, 16:10:22,
+17:05:19, 17:07:43) — zero failure lines in that window. The mixing bug is resolved.

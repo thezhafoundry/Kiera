@@ -17,7 +17,8 @@ wiki. This index is the first stop for any query — find the page here, then dr
 - [rvc-cold-start](pages/concepts/rvc-cold-start.md) — Modal T4 cold-start behavior
   (measured ~75s, not the assumed 8-30s) and a confirmed production incident where a lead
   heard raw voice for a whole call (historical — raw fallback no longer exists at all
-  post-rebuild).
+  post-rebuild). **Note**: the live worker moved from T4 to L4 on 2026-07-03 (see
+  [[voice-identity-mismatch-investigation]]) — cold-start timing may no longer match exactly.
 
 ## Issues (open/resolved problems)
 - [livekit-sip-trunk-stale](pages/issues/livekit-sip-trunk-stale.md) — **open.** First live
@@ -28,9 +29,14 @@ wiki. This index is the first stop for any query — find the page here, then dr
   `modal deploy` of the streaming rebuild failed twice: a stale folder-name reference, then a
   sibling module Modal never bundled into the container.
 - [sip-audio-mixing-isolation-bug](pages/issues/sip-audio-mixing-isolation-bug.md) —
-  **fix committed, not yet deployed/verified.** The "unsubscribe raw agent track from the
-  SIP leg" fix (`_restrict_sip_audio`) had a wrong protobuf field name and failed silently
-  on 100% of calls, so the lead heard raw+converted voice mixed the whole call.
+  **resolved, confirmed live.** The "unsubscribe raw agent track from the SIP leg" fix
+  (`_restrict_sip_audio`) had a wrong protobuf field name and failed silently on 100% of
+  calls; fixed and now confirmed succeeding (`✅`) on every call sampled since.
+- [voice-identity-mismatch-investigation](pages/issues/voice-identity-mismatch-investigation.md)
+  — **open.** Converted voice doesn't match the trained voice on live calls (offline tests
+  sound correct). Five hypotheses ruled out with real evidence (pitch, `index_rate`,
+  chunking+SOLA, noise suppression, raw input quality); new reusable diagnostic tooling
+  (`convert_file_chunked`/`main_chunked`) built along the way.
 - [part-by-part-audio-investigation](pages/issues/part-by-part-audio-investigation.md) —
   **resolved 2026-07-03** (buffer fix not yet live-call-verified). Four distinct root
   causes found via production logs: Modal container fan-out, unreliable pitch

@@ -164,9 +164,9 @@ to have already fixed.
   (finding the SIP participant and raw agent track SIDs) was working correctly per the logs;
   only the final API call's field name was wrong, so a single-line fix was correct, not a
   larger rework.
-  **Not yet verified live** — committed but not pushed as of this writing; see
-  [[active-backlog]]. Do not assume this is fixed in production until a live call shows a
-  `[SIP Isolation] ✅ unsubscribed` log line.
+  **Confirmed live 2026-07-03**: pushed, deployed, and `[SIP Isolation] ✅ unsubscribed`
+  now appears on every outbound call sampled since (15:05, 15:07, 16:10, 17:05, 17:07),
+  zero failure lines. Resolved.
 
 - **Considered and explicitly rejected for now: swapping to a causal/streaming-native voice
   model** (e.g. in the shape of Google's StreamVC) to eliminate block-based inference
@@ -177,3 +177,45 @@ to have already fixed.
   RVC's own real-time community tooling (w-okada's voice-changer) uses to make this model
   family behave in near-real-time. Revisit only if inference-speed engineering (GPU tier,
   ONNX/TensorRT) turns out insufficient.
+
+## 2026-07-03 (later still) — Voice-identity mismatch: five hypotheses ruled out, new diagnostic tooling built
+
+Separate from both the buffer/latency work and the SIP-mixing fix above: converted voice
+still doesn't match the trained "Keira" voice on live calls, even with those two fixed. Full
+narrative in [wiki/pages/issues/voice-identity-mismatch-investigation.md](../../wiki/pages/issues/voice-identity-mismatch-investigation.md)
+— summary of decisions here:
+
+- **`RVC_INDEX_RATE` env var added, default bumped 0.75→0.9.** Why: hypothesis that not
+  enough FAISS-retrieved target timbre was coming through. **Ruled out empirically** — a
+  real call confirmed `index_rate=0.9` applied, symptom persisted. Rejected further
+  index_rate tuning as a lead; kept the env var (harmless, reversible) rather than reverting,
+  since re-tuning it costs nothing and it's now easy to test again if a future symptom
+  actually correlates with it.
+- **Built `convert_file_chunked`/`main_chunked` instead of guessing a fourth parameter.**
+  Why: two speculative parameter fixes (pitch — separately already fixed — and index_rate)
+  had both failed to explain a live-only symptom; continuing to guess parameters violates the
+  "3+ failed fixes → question the architecture, don't keep guessing" principle. Built a
+  diagnostic that replays the live pipeline's actual block+SOLA+noise-suppression logic
+  offline instead, so hypotheses could be tested with direct evidence rather than another live
+  call each time. Rejected: continuing to test only against the *live* path per hypothesis,
+  which is slower (needs a real call each time) and conflates multiple variables at once
+  (network, SIP, telephony) instead of isolating pipeline logic specifically. See
+  [[subsystem-notes]] for the tool itself.
+- **Chunking+SOLA and noise suppression both ruled out via that tool.** Both replayed offline
+  against the same reference file the known-good single-pass test uses, both still sounded
+  correct. This leaves the pipeline's own audio processing looking clean as far as it's been
+  possible to isolate and test.
+- **Added temporary raw-audio capture (`_DEBUG_SAVE_RAW_AUDIO`) to the live path rather than
+  keep guessing pipeline-side.** Why: after four pipeline-side hypotheses were ruled out, the
+  more informative move was checking whether the *input* itself differs live vs. offline
+  (real mic/room vs. a clean test file) rather than a fifth pipeline guess. This is a
+  production-code change to the live `/ws` handler, deployed deliberately (asked first, per
+  standing practice on this project) rather than assumed. **Not yet reverted** — must be
+  flipped back to `False` and redeployed once the investigation concludes; tracked in
+  [[active-backlog]] specifically so it isn't forgotten.
+- **GPU tier found stale (T4 deployed despite `gpu="L4"` committed) — not a decision, a
+  discovery.** Recorded here because it affects how to read every diagnostic comparison run
+  during this investigation: all of them (the T4-pinned `convert_file`/`convert_file_chunked`
+  tools, and the live calls tested against them) ran on matched T4 hardware. The live worker
+  is now on L4 as of an incidental redeploy — future live-call tests will not be GPU-matched
+  against the existing diagnostics unless that's revisited. See [[subsystem-notes]].

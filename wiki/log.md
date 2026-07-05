@@ -3,7 +3,23 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
-## [2026-07-02] ingest | Bootstrap: existing project docs
+## [2026-07-03] ingest | Voice-identity investigation (ongoing) + SIP fix confirmed live
+
+Confirmed [sip-audio-mixing-isolation-bug](pages/issues/sip-audio-mixing-isolation-bug.md)
+live via Render logs (`[SIP Isolation] ✅` on every call sampled since deploy) — updated its
+status from "committed, not deployed" to resolved, and updated `index.md` accordingly.
+
+Filed a new open issue,
+[voice-identity-mismatch-investigation](pages/issues/voice-identity-mismatch-investigation.md):
+converted voice doesn't match the trained voice on live calls, even with the choppiness and
+SIP-mixing bugs fixed. Five hypotheses ruled out with real evidence (pitch, `index_rate`,
+chunked-streaming architecture, noise suppression, raw input audio quality) by building a new
+reusable offline diagnostic (`convert_file_chunked`/`main_chunked` in
+`modal_deploy/worker.py`) that replays the live `/ws` pipeline's exact processing against a
+static file with no network/SIP involved. Also found and documented: a `gpu="L4"` change had
+been committed but never actually deployed (git push and `modal deploy` are separate actions)
+— the live worker was still on a T4 until an unrelated deploy activated it. Investigation is
+still open pending one more retest.
 
 Set up the wiki structure (`WIKI.md`, `index.md`, `pages/{sources,concepts,issues}/`)
 and did the first ingest pass over six existing docs, without duplicating any raw
