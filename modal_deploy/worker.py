@@ -188,12 +188,10 @@ class RVCEngine:
     def _auto_detect_pitch(self, wav_bytes: bytes) -> int:
         """
         Estimate speaker gender from audio and return pitch shift.
-        Uses autocorrelation to estimate fundamental frequency (F0).
+        Voiced-frame analysis (ignores silence/noise) using autocorrelation.
+        Uses the median F0 across all voiced frames to identify speaker gender.
         Male voices: F0 < 145 Hz  → pitch_shift = +12 (shift up to female range)
         Female voices: F0 >= 145 Hz → pitch_shift = 0  (already in female range)
-
-        Fallback is 0 (no shift) rather than +12: a missed female is far less
-        damaging than a false-positive octave shift on a real female voice.
         """
         import io
         import wave
@@ -206,31 +204,43 @@ class RVCEngine:
 
             audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Use first 1 second of audio (or all of it if shorter)
-            chunk = audio[:sr]
-            chunk = chunk - chunk.mean()  # remove DC offset
+            # Split into 50ms frames to detect voiced segments
+            frame_len = int(sr * 0.05)
+            if frame_len <= 0:
+                return 0
 
-            # Autocorrelation pitch detection (80–300 Hz range)
+            f0_estimates = []
             min_lag = int(sr / 300)   # 300 Hz upper limit
             max_lag = int(sr / 80)    # 80 Hz lower limit
 
-            # Need at least ~125ms of audio for reliable pitch detection
-            if max_lag >= len(chunk) or len(chunk) < sr // 8:
-                print("[Gender Detection] Not enough audio — defaulting to no shift (0)")
+            for i in range(0, len(audio) - frame_len, frame_len):
+                frame = audio[i:i+frame_len]
+                # Silence threshold: RMS must be > 0.015 (about 500 in int16)
+                rms = np.sqrt(np.mean(frame * frame))
+                if rms < 0.015:
+                    continue
+
+                frame = frame - frame.mean()
+                corr = np.correlate(frame, frame, mode='full')
+                corr = corr[len(corr)//2:]
+
+                r = corr[min_lag:max_lag]
+                if len(r) > 0:
+                    peak_lag = np.argmax(r) + min_lag
+                    f0 = sr / peak_lag
+                    # Keep F0 in typical human speech range
+                    if 80.0 <= f0 <= 300.0:
+                        f0_estimates.append(f0)
+
+            if not f0_estimates:
+                print("[Gender Detection] No voiced audio found — defaulting to no shift (0)")
                 return 0
 
-            corr = np.correlate(chunk, chunk, mode='full')
-            corr = corr[len(corr) // 2:]
-            corr = corr / (corr[0] + 1e-8)
-
-            peak_idx = np.argmax(corr[min_lag:max_lag]) + min_lag
-            f0 = sr / peak_idx
-
-            # 145 Hz boundary: catches contralto/mezzo voices that sit in 145–165 Hz
-            is_male = f0 < 145.0
+            # Use median F0 of voiced frames for robustness against outliers/harmonics
+            median_f0 = float(np.median(f0_estimates))
+            is_male = median_f0 < 145.0
             pitch_shift = 12 if is_male else 0
-
-            print(f"[Gender Detection] F0={f0:.1f}Hz → {'Male' if is_male else 'Female'} → pitch_shift={pitch_shift}")
+            print(f"[Gender Detection] Voiced frames: {len(f0_estimates)} | Median F0: {median_f0:.1f} Hz → {'Male' if is_male else 'Female'} → pitch_shift={pitch_shift}")
             return pitch_shift
 
         except Exception as e:

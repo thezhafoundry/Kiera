@@ -298,13 +298,14 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
     
     # Choose voice conversion engine (priority: RVC > Dummy)
     # If RVC_PITCH_SHIFT is explicitly configured in the environment, respect it.
-    # Otherwise, fall back to the gender-based lookup.
+    # Otherwise, set pitch_shift to -1 to automatically detect the speaker's F0 frequency
+    # and gender on the GPU worker.
     if "RVC_PITCH_SHIFT" in os.environ:
         pitch_shift = RVC_PITCH_SHIFT
         print(f"[Server] Using explicit pitch shift from environment: {pitch_shift}")
     else:
-        pitch_shift = 12 if agent_gender.lower() == "male" else 0
-        print(f"[Server] Agent gender: {agent_gender} → pitch_shift={pitch_shift}")
+        pitch_shift = -1
+        print("[Server] Pitch shift set to -1 (auto-detect speaker gender dynamically on GPU)")
 
     if RVC_ENDPOINT_URL:
         print(f"[Server] Spawning RVC Streaming Voice Changer (Endpoint: {RVC_ENDPOINT_URL})")
