@@ -313,9 +313,11 @@ class MultiHeadAttention(nn.Module):
     def _get_relative_embeddings(self, relative_embeddings, length):
         max_relative_position = 2 * self.window_size + 1
         # Pad first before slice to avoid using cond ops.
-
-        pad_length = torch.clamp(length - (self.window_size + 1), min=0)
-        slice_start_position = torch.clamp((self.window_size + 1) - length, min=0)
+        # length is a plain Python int (sequence-length dimension from .size()) in
+        # both eager-mode parity checks and static-shape ONNX tracing — use
+        # Python max() instead of torch.clamp() to avoid the Tensor-first-arg error.
+        pad_length = max(length - (self.window_size + 1), 0)
+        slice_start_position = max((self.window_size + 1) - length, 0)
         slice_end_position = slice_start_position + 2 * length - 1
         padded_relative_embeddings = F.pad(
             relative_embeddings,
