@@ -58,117 +58,102 @@ async def lifespan(app: FastAPI):
 web_app = FastAPI(lifespan=lifespan)
 
 
-# Persistent Modal Volume
-volume = modal.Volume.from_name(
-    "rvc-models",
-    create_if_missing=False,
-)
-
-# Image
-image = (
-    modal.Image.debian_slim(python_version="3.10")
-    .apt_install(
-        "git",
-        "ffmpeg",
-    )
-    .run_commands(
-        "python -m pip install --upgrade 'pip<24.1'"
-    )
-    .pip_install_from_requirements(
-        "modal_deploy/requirements.txt"
-    )
-    .add_local_dir(
-        "RVC",
-        remote_path="/root/rvc",
-        ignore=[
-            "venv311",
-            "dataset",
-            "logs",
-            "TEMP",
-            "__pycache__",
-            ".git",
-            ".github",
-        ],
-    )
-    # Modal does not auto-bundle a sibling module just because worker.py imports
-    # it locally — that local import succeeding (during `modal deploy` itself)
-    # says nothing about what ships in the remote container. Explicitly mount
-    # streaming.py so `import streaming` resolves inside the container too.
-    .add_local_python_source("streaming")
-)
+# Persistent Modal Volume and images — defined in modal_defs.py (single source of
+# truth) which is mounted into containers so compile_trt / export_onnx can also
+# import these without needing worker.py on the container path.
+try:
+    from modal_deploy.modal_defs import volume, image, trt_image
+except ImportError:   # inside container: modal_deploy package not present
+    from modal_defs import volume, image, trt_image
 
 
 # ---- Shared conversion logic (plain Python, no Modal decorators) ----
 
 class RVCEngine:
-    """Plain Python class that loads the RVC model and runs inference."""
+    """ONNX-based RVC model execution engine."""
 
     def __init__(self):
-        self.vc = None
-        self.config = None
+        self.vec_session = None
+        self.rvc_session = None
+        self.index = None
+        self.big_npy = None
         self.index_path = None
         self.ready = False
+        # TRT pipeline (set if USE_TRT=1 and init succeeds)
+        self.trt_pipe = None
+        self.engine_kind = "onnx-cuda"   # "onnx-cuda" (fallback) or "trt"
+        self._trt_cache_hot = False
 
     def startup(self):
         import glob
+        import faiss
+        import onnxruntime as ort
 
         print("=" * 80)
-        print("Starting RVC GPU Worker")
+        print("Starting RVC ONNX GPU Worker")
         print("=" * 80)
 
+        # Set path context
         os.chdir("/root/rvc")
-
         if "/root/rvc" not in sys.path:
             sys.path.insert(0, "/root/rvc")
 
-        from configs.config import Config
-        from infer.modules.vc.modules import VC
-
-        os.environ["weight_root"] = "/root/rvc-models/weights"
-        os.environ["index_root"] = "/root/rvc-models/logs/mi-test"
-        os.environ["rmvpe_root"] = "/root/rvc/assets/rmvpe"
-
-        print("Loading Config...")
-        self.config = Config()
-
-        print("Creating VC...")
-        self.vc = VC(self.config)
-
-        print("Loading model...")
-        self.vc.get_vc("mi-test.pth")
-
-        # Always prefer the added_* index (has full feature vectors)
-        # trained_* index is incomplete — only used as fallback
+        # A3: Fail-fast on missing FAISS index — a silent skip produces the
+        # "doesn't sound like the trained voice" symptom (documented in subsystem-notes).
+        # Always prefer the added_* index.
         index_files = glob.glob(
             "/root/rvc-models/logs/mi-test/added_*.index"
         )
         if not index_files:
-            # fallback to any index
             index_files = glob.glob(
                 "/root/rvc-models/logs/mi-test/*.index"
             )
 
         if not index_files:
-            raise RuntimeError("No FAISS index found.")
+            raise RuntimeError("No FAISS index found in /root/rvc-models/logs/mi-test/ — "
+                               "refusing to start without target-timbre index.")
+        self.index_path = sorted(index_files)[-1]
+        print(f"Loading FAISS Index: {self.index_path}")
+        self.index = faiss.read_index(self.index_path)
+        # Reconstruct the full index to big_npy (numpy array)
+        self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
+        print("Index loaded and reconstructed successfully.")
 
-        self.index_path = sorted(index_files)[-1]  # pick latest if multiple
-        print(f"Loaded Index: {self.index_path}")
+        # A1: Load the base (non-TRT) ONNX sessions only if the artifacts exist.
+        # They are the FALLBACK path; their absence must not crash a container whose
+        # TRT engines are fine. If neither path can load, startup fails loudly below.
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        vec_path = "/root/rvc-models/onnx/vec-768-layer-12.onnx"
+        rvc_path = "/root/rvc-models/onnx/mi-test.onnx"
 
-        from infer.modules.vc.utils import load_hubert
-        print("Loading HuBERT...")
-        self.vc.hubert_model = load_hubert(self.config)
-        print("HuBERT loaded.")
+        if os.path.exists(vec_path) and os.path.exists(rvc_path):
+            print("Loading ContentVec ONNX...")
+            self.vec_session = ort.InferenceSession(vec_path, providers=providers)
+            print("Loading RVC Generator ONNX...")
+            self.rvc_session = ort.InferenceSession(rvc_path, providers=providers)
+            print("ONNX Inference sessions initialized.")
+            # A2: Assert GPU execution is active — CPU cannot keep up with real-time.
+            for name, sess in [("vec", self.vec_session), ("rvc", self.rvc_session)]:
+                active = sess.get_providers()
+                if "CUDAExecutionProvider" not in active:
+                    raise RuntimeError(
+                        f"CUDAExecutionProvider not active for {name} session (got {active}) — "
+                        "CPU inference cannot keep up with real time; failing startup instead "
+                        "of serving broken audio."
+                    )
+        else:
+            print(f"[Warning] Base ONNX artifacts missing ({vec_path}, {rvc_path}) — "
+                  "fallback path unavailable; TRT path is required for this container.")
 
-        # Pre-load parselmouth (PM pitch method) to avoid cold-import delay on first request
+        # Pre-load parselmouth
         print("Pre-loading parselmouth (PM pitch method)...")
-        import parselmouth  # noqa — just importing triggers the native lib load
+        import parselmouth  # noqa
         print("parselmouth loaded.")
 
-        # Warm-up inference: run one silent audio chunk through the full pipeline
-        # so GPU kernels are JIT-compiled before the first real call arrives
+        # Warm-up inference
         print("Running GPU warm-up inference pass...")
         try:
-            import numpy as np, io, wave, struct
+            import numpy as np, io, wave
             silence_samples = np.zeros(3200, dtype=np.int16)  # 200ms at 16kHz
             buf = io.BytesIO()
             with wave.open(buf, "wb") as wf:
@@ -181,20 +166,56 @@ class RVCEngine:
         except Exception as e:
             print(f"[Warning] Warm-up failed (non-fatal): {e}")
 
+        # ---- Optional TRT path (USE_TRT=1). Fail-closed: if TRT init fails we fall
+        # back to the ONNX-CUDA path (never raw audio), log loudly, and expose the
+        # degradation in /health.
+        if os.environ.get("USE_TRT", "0") == "1":
+            try:
+                import glob as _glob
+                try:
+                    from modal_deploy import trt_pipeline as tp
+                except ImportError:
+                    import trt_pipeline as tp
+                from infer.lib.rmvpe import MelSpectrogram
+                import torch as _torch
+
+                # Reuse the already-loaded index from startup above
+                index = faiss.read_index(self.index_path)
+                big_npy = index.reconstruct_n(0, index.ntotal)
+                mel = MelSpectrogram(
+                    is_half=False, n_mel_channels=128, sampling_rate=16000,
+                    win_length=1024, hop_length=160, mel_fmin=30, mel_fmax=8000,
+                ).to("cuda" if _torch.cuda.is_available() else "cpu")
+                cache_dir = "/root/rvc-models/trt_cache"
+                self._trt_cache_hot = bool(_glob.glob(f"{cache_dir}/*.engine"))
+                print(f"[TRT] engine cache {'HOT' if self._trt_cache_hot else 'COLD -- building now (slow first boot)'}")
+                t0 = time.perf_counter()
+                self.trt_pipe = tp.TRTVoicePipeline(
+                    "/root/rvc-models/onnx", cache_dir, index, big_npy, mel,
+                )
+                self.trt_pipe.warmup()
+                self.engine_kind = "trt"
+                print(f"[TRT] pipeline ready in {time.perf_counter()-t0:.1f}s")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                # A4: truthful label — the PyTorch path no longer exists; fallback is ONNX-CUDA
+                print(f"[TRT] init FAILED ({e}) -- falling back to onnx-cuda path")
+                self.trt_pipe = None
+                self.engine_kind = "onnx-cuda"
+
+        # A1: Fail-closed — at least one engine must be ready before reporting healthy.
+        # This guard runs after the TRT branch so `ready` truly means "an engine works".
+        if self.trt_pipe is None and self.vec_session is None:
+            raise RuntimeError(
+                "No conversion engine available: TRT init failed/disabled AND base ONNX "
+                "artifacts are missing. Refusing to start (fail-closed, never raw)."
+            )
+
         self.ready = True
         print("GPU Worker Ready")
 
-
     def _auto_detect_pitch(self, wav_bytes: bytes) -> int:
-        """
-        Estimate speaker gender from audio and return pitch shift.
-        Uses autocorrelation to estimate fundamental frequency (F0).
-        Male voices: F0 < 145 Hz  → pitch_shift = +12 (shift up to female range)
-        Female voices: F0 >= 145 Hz → pitch_shift = 0  (already in female range)
-
-        Fallback is 0 (no shift) rather than +12: a missed female is far less
-        damaging than a false-positive octave shift on a real female voice.
-        """
         import io
         import wave
         import numpy as np
@@ -205,18 +226,13 @@ class RVCEngine:
                 raw = wf.readframes(wf.getnframes())
 
             audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
-            # Use first 1 second of audio (or all of it if shorter)
             chunk = audio[:sr]
-            chunk = chunk - chunk.mean()  # remove DC offset
+            chunk = chunk - chunk.mean()
 
-            # Autocorrelation pitch detection (80–300 Hz range)
-            min_lag = int(sr / 300)   # 300 Hz upper limit
-            max_lag = int(sr / 80)    # 80 Hz lower limit
+            min_lag = int(sr / 300)
+            max_lag = int(sr / 80)
 
-            # Need at least ~125ms of audio for reliable pitch detection
             if max_lag >= len(chunk) or len(chunk) < sr // 8:
-                print("[Gender Detection] Not enough audio — defaulting to no shift (0)")
                 return 0
 
             corr = np.correlate(chunk, chunk, mode='full')
@@ -226,76 +242,163 @@ class RVCEngine:
             peak_idx = np.argmax(corr[min_lag:max_lag]) + min_lag
             f0 = sr / peak_idx
 
-            # 145 Hz boundary: catches contralto/mezzo voices that sit in 145–165 Hz
             is_male = f0 < 145.0
             pitch_shift = 12 if is_male else 0
-
-            print(f"[Gender Detection] F0={f0:.1f}Hz → {'Male' if is_male else 'Female'} → pitch_shift={pitch_shift}")
             return pitch_shift
-
         except Exception as e:
-            print(f"[Gender Detection] Error: {e} — defaulting to no shift (0)")
             return 0
 
     def run_conversion(
         self,
         audio_bytes: bytes,
-        pitch: int = -1,    # -1 = auto-detect gender, 0 = female input, 12 = male input
+        pitch: int = -1,
         index_rate: float = 0.75,
         filter_radius: int = 3,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
     ) -> bytes:
         import numpy as np
+        import librosa
+        import wave
+        import io
 
         t0 = time.perf_counter()
 
-        # Auto-detect pitch shift from audio if not specified
+        # 1. Parse WAV bytes to float32 numpy array
+        with wave.open(io.BytesIO(audio_bytes)) as wf:
+            sr = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+            
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        
+        # Resample to 16kHz if needed (ContentVec and F0 Predictor expect 16kHz)
+        if sr != 16000:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+
+        # Auto-detect pitch shift if not specified
         if pitch == -1:
             pitch = self._auto_detect_pitch(audio_bytes)
 
-        # /tmp on Modal containers is a tmpfs (RAM-based) — no directory creation overhead
-        input_path = "/tmp/rvc_input.wav"
-        with open(input_path, "wb") as f:
-            f.write(audio_bytes)
-
         t1 = time.perf_counter()
-        print(f"[Timing] file-write: {(t1-t0)*1000:.1f}ms | pitch={pitch} index_rate={index_rate}")
+        
+        # 2. Extract ContentVec features
+        feats_input = np.expand_dims(np.expand_dims(audio, 0), 0)
+        vec_input_name = self.vec_session.get_inputs()[0].name
+        vec_outputs = self.vec_session.run(None, {vec_input_name: feats_input})
 
-        info, wav_opt = self.vc.vc_single(
-            0,
-            input_path,
-            pitch,
-            None,
-            "pm",          # switched from rmvpe → pm saves ~300ms per chunk for real-time
-            self.index_path,
-            "",
-            index_rate,
-            filter_radius,
-            0,
-            rms_mix_rate,
-            protect,
-        )
-
+        # Ensure feats layout is (1, seq_len, 768)
+        feats = vec_outputs[0]
+        if feats.shape[1] == 768:
+            feats = feats.transpose(0, 2, 1)
+        
         t2 = time.perf_counter()
-        print(f"[Timing] vc_single: {(t2-t1)*1000:.1f}ms | {info}")
-
-        sample_rate, audio = wav_opt
-
-        if sample_rate is None or audio is None:
-            raise RuntimeError(info)
-
-
-
-        if audio.dtype != np.int16:
-            if audio.dtype == np.float32 or audio.dtype == np.float64:
-                audio = (audio * 32767).clip(-32768, 32767).astype(np.int16)
-            else:
-                audio = audio.astype(np.int16)
-
-        result = audio.tobytes()
-        print(f"[Timing] total run_conversion: {(time.perf_counter()-t0)*1000:.1f}ms → {len(result)} bytes")
+        
+        # 3. Perform index search and feature blending (numpy)
+        feats0 = feats.copy()
+        if self.index is not None and self.big_npy is not None and index_rate > 0:
+            npy = feats[0].astype("float32")
+            score, ix = self.index.search(npy, k=8)
+            weight = np.square(1.0 / (score + 1e-8))
+            weight /= weight.sum(axis=1, keepdims=True)
+            blended_npy = np.sum(self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
+            feats = blended_npy * index_rate + (1 - index_rate) * feats[0]
+            feats = np.expand_dims(feats, 0)
+            
+        # 4. Interpolate features (upsample by 2)
+        feats = np.repeat(feats, 2, axis=1)
+        feats0 = np.repeat(feats0, 2, axis=1)
+        
+        # 5. Compute F0 and coarse pitch
+        p_len = feats.shape[1]
+        
+        from infer.lib.infer_pack.modules.F0Predictor.PMF0Predictor import PMF0Predictor
+        f0_predictor = PMF0Predictor(hop_length=160, sampling_rate=16000)
+        
+        pitchf = f0_predictor.compute_f0(audio, p_len)
+        if len(pitchf) < p_len:
+            pitchf = np.pad(pitchf, (0, p_len - len(pitchf)), mode="edge")
+        elif len(pitchf) > p_len:
+            pitchf = pitchf[:p_len]
+            
+        pitchf = pitchf * (2 ** (pitch / 12))
+        
+        f0_min = 50
+        f0_max = 1100
+        f0_mel_min = 1127 * np.log(1 + f0_min / 700)
+        f0_mel_max = 1127 * np.log(1 + f0_max / 700)
+        
+        f0_mel = 1127 * np.log(1 + pitchf / 700)
+        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * 254 / (
+            f0_mel_max - f0_mel_min
+        ) + 1
+        f0_mel[f0_mel <= 1] = 1
+        f0_mel[f0_mel > 255] = 255
+        pitch_coarse = np.rint(f0_mel).astype(np.int64)
+        
+        # 6. Consonant protection
+        if protect < 0.5:
+            pitchff = pitchf.copy()
+            pitchff[pitchf > 0] = 1.0
+            pitchff[pitchf < 1] = protect
+            pitchff = np.expand_dims(pitchff, (0, -1))
+            feats = feats * pitchff + feats0 * (1.0 - pitchff)
+            
+        # 7. Prepare inputs for RVC generator ONNX model
+        pitchf_input = np.expand_dims(pitchf.astype(np.float32), 0)
+        pitch_coarse_input = np.expand_dims(pitch_coarse, 0)
+        phone_lengths_input = np.array([p_len]).astype(np.int64)
+        ds_input = np.array([0]).astype(np.int64)
+        rnd_input = np.random.randn(1, 192, p_len).astype(np.float32)
+        
+        onnx_inputs = {
+            self.rvc_session.get_inputs()[0].name: feats.astype(np.float32),
+            self.rvc_session.get_inputs()[1].name: phone_lengths_input,
+            self.rvc_session.get_inputs()[2].name: pitch_coarse_input,
+            self.rvc_session.get_inputs()[3].name: pitchf_input,
+            self.rvc_session.get_inputs()[4].name: ds_input,
+            self.rvc_session.get_inputs()[5].name: rnd_input,
+        }
+        
+        t3 = time.perf_counter()
+        audio_opt = self.rvc_session.run(None, onnx_inputs)[0]
+        t4 = time.perf_counter()
+        
+        print(f"[Timing] RVC ONNX session.run: {(t4-t3)*1000:.1f}ms")
+        
+        audio_opt = audio_opt.squeeze()
+        if audio_opt.dtype != np.int16:
+            audio_opt = (audio_opt * 32767).clip(-32768, 32767).astype(np.int16)
+            
+        result = audio_opt.tobytes()
+        print(f"[Timing] total run_conversion: {(time.perf_counter()-t0)*1000:.1f}ms | feats={p_len} → {len(result)} bytes")
         return result
+
+    def convert_block(
+        self,
+        pcm_int16,                      # np.int16 array, 16 kHz, <= CANONICAL_IN samples
+        pitch: int = 0,
+        index_rate: float = 0.75,
+        rms_mix_rate: float = 0.75,
+        protect: float = 0.33,
+    ) -> bytes:
+        """Single streaming-block conversion. TRT path when loaded, else the
+        existing PyTorch run_conversion via WAV bytes. Returns 48 kHz int16 bytes,
+        ~3x the input duration either way."""
+        if self.trt_pipe is not None:
+            out = self.trt_pipe.convert_block(
+                pcm_int16, pitch, index_rate, rms_mix_rate, protect,
+            )
+            return out.tobytes()
+        # PyTorch fallback: wrap in WAV and call run_conversion
+        try:
+            from modal_deploy import streaming as _st
+        except ImportError:
+            import streaming as _st
+        return self.run_conversion(
+            _st.pcm16_to_wav_bytes(pcm_int16), pitch, index_rate, 3,
+            rms_mix_rate, protect,
+        )
 
 
 # ---- ASGI Web App (HTTP endpoints for the backend) ----
@@ -314,7 +417,7 @@ _gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-te
 
 
 @app.function(
-    image=image,
+    image=trt_image,   # includes ORT + TRT stack; required for USE_TRT to work at runtime
     gpu="L4",
     timeout=10800,
     volumes={"/root/rvc-models": volume},
@@ -331,6 +434,7 @@ _gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-te
     # (~75s) or mid-call. Cap at 1 so extra connection attempts queue against the single
     # container instead of each paying for its own T4 GPU concurrently.
     max_containers=1,
+    env={"USE_TRT": "1"},
 )
 @modal.asgi_app()
 def fastapi_app():
@@ -346,7 +450,11 @@ def fastapi_app():
             "model": "mi-test.pth",
             "cuda_available": torch.cuda.is_available(),
             "cuda_device": device_name,
-            "rvc_device": str(engine.config.device) if engine.config else "None",
+            "rvc_device": "cuda" if torch.cuda.is_available() else "cpu",
+            "engine": engine.engine_kind,
+            "trt_cache": (
+                "hot" if getattr(engine, "_trt_cache_hot", False) else "cold"
+            ) if engine.engine_kind == "trt" else "n/a",
         }
 
     @web_app.post("/convert")
@@ -458,7 +566,7 @@ def fastapi_app():
                     payload = payload[:len(payload) - 1]  # keep int16 alignment
                 acc.push(np.frombuffer(payload, dtype=np.int16))
 
-                # Drain every complete 320 ms block currently buffered.
+                # Drain every complete 1000 ms block currently buffered.
                 while True:
                     popped = acc.pop_block()
                     if popped is None:
@@ -481,16 +589,14 @@ def fastapi_app():
                             session_pitch = await asyncio.to_thread(
                                 engine._auto_detect_pitch, probe_wav
                             )
-                        wav_bytes = st.pcm16_to_wav_bytes(infer_input)
                         try:
                             t0 = time.perf_counter()
                             async with _gpu_lock:  # single-tenant GPU
                                 out_bytes = await asyncio.to_thread(
-                                    engine.run_conversion,
-                                    wav_bytes,
+                                    engine.convert_block,
+                                    infer_input,
                                     session_pitch,
                                     index_rate,
-                                    3,             # filter_radius default
                                     rms_mix_rate,
                                     protect,
                                 )
@@ -540,10 +646,11 @@ def fastapi_app():
 # ---- Local testing entrypoint (modal run) ----
 
 @app.function(
-    image=image,
-    gpu="T4",
+    image=trt_image,
+    gpu="L4",   # L4 (SM89) matches fastapi_app and TRT engine cache
     timeout=10800,
     volumes={"/root/rvc-models": volume},
+    env={"USE_TRT": "1"},
 )
 def convert_file(audio_bytes: bytes, pitch: int = 0) -> bytes:
     """
@@ -591,32 +698,25 @@ def _load_wav_as_pcm16_mono(audio_bytes: bytes):
 
 
 @app.function(
-    image=image,
-    gpu="T4",  # matches convert_file's GPU and the actually-deployed fastapi_app
+    image=trt_image,
+    gpu="L4",   # L4 (SM89) matches fastapi_app; TRT engines are SM89-specific
     timeout=10800,
     volumes={"/root/rvc-models": volume},
 )
-def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
+def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, use_trt: int = 0) -> bytes:
     """
-    Diagnostic (2026-07-03): runs the SAME block-accumulate + SOLA-crossfade
-    pipeline the live /ws handler uses (see fastapi_app's ws_stream), but driven
-    by a static WAV file instead of a live WebSocket. Isolates whether the live
-    call's "doesn't sound like the trained voice" symptom comes from the
-    chunked-streaming architecture itself, on the exact same reference audio
-    convert_file() already produces a known single-pass conversion for.
+    Diagnostic: runs the SAME block-accumulate + SOLA-crossfade pipeline the live
+    /ws handler uses, driven by a static WAV file. Isolates whether the live call
+    quality comes from the chunked-streaming architecture itself.
 
-    pitch=-1 (default, matches convert_file/main()'s own default) auto-detects
-    ONCE from the whole resampled file -- same as the single-pass reference --
-    then reuses that one value for every block. This deliberately does NOT
-    replicate ws_stream's own "detect from just the first non-silent block"
-    behavior: production no longer uses -1 at all (backend/main.py always
-    sends an explicit pitch_shift from the UI gender toggle now), so
-    replicating the old per-block/first-block detection here would test a
-    code path production doesn't actually use. Whole-file detection holds
-    "how pitch gets resolved" constant and known-good against the reference,
-    so only chunking+SOLA is the variable under test.
+    use_trt=1 enables the TRT path (sets USE_TRT=1 in the environment before
+    engine startup), so you can A/B compare PyTorch vs TRT offline before live rollout.
     """
     import numpy as np
+    import os
+
+    if use_trt:
+        os.environ["USE_TRT"] = "1"
 
     test_engine = RVCEngine()
     test_engine.startup()
@@ -626,7 +726,7 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
     if pitch == -1:
         probe_wav = st.pcm16_to_wav_bytes(samples)
         pitch = test_engine._auto_detect_pitch(probe_wav)
-        print(f"[Chunked Test] Whole-file auto-detected pitch_shift={pitch} -- fixed for the whole test")
+        print(f"[Chunked Test] Whole-file auto-detected pitch_shift={pitch}")
 
     acc = st.BlockAccumulator()
     acc.push(samples)
@@ -643,8 +743,10 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
         if st.block_rms(block) < st.SILENCE_RMS_THRESHOLD:
             out = np.zeros(len(block) * 3 + st.SOLA_CROSSFADE_SAMPLES, dtype=np.int16)
         else:
-            wav_bytes = st.pcm16_to_wav_bytes(infer_input)
-            out_bytes = test_engine.run_conversion(wav_bytes, pitch=pitch)
+            t0 = time.perf_counter()
+            out_bytes = test_engine.convert_block(infer_input, pitch=pitch)
+            infer_ms = (time.perf_counter() - t0) * 1000
+            print(f"[Timing] convert_block: {infer_ms:.1f}ms ({test_engine.engine_kind})")
             out = np.frombuffer(out_bytes, dtype=np.int16)
             out = st.trim_context(
                 out, context_len, len(infer_input), overlap_keep=st.SOLA_CROSSFADE_SAMPLES
@@ -654,9 +756,7 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
         if len(emit):
             emitted.append(emit.tobytes())
 
-    # ws_stream never flushes the held-back tail (a real call has no "end of
-    # stream" to flush at) -- a one-shot file test does, so flush it here or
-    # the last ~80ms crossfade tail is silently dropped from the output.
+    # Flush the held-back SOLA tail
     if len(pending_tail):
         emitted.append(pending_tail.tobytes())
 
@@ -664,12 +764,12 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1) -> bytes:
 
 
 @app.local_entrypoint()
-def main_chunked(pitch: int = -1):
+def main_chunked(pitch: int = -1, use_trt: int = 0):
     import struct
 
     input_file = r"D:\Kiera\test1.wav"
 
-    print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch} (Note: -1 means whole-file auto-detect, matching main()'s default)")
+    print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch} | use_trt={use_trt}")
     print("[Chunked Test] Simulates the live /ws block-accumulate + SOLA-crossfade")
     print("[Chunked Test] pipeline on a static file -- compare the output against")
     print("[Chunked Test] test11.wav (convert_file's single-pass output) on the")
@@ -678,7 +778,7 @@ def main_chunked(pitch: int = -1):
     with open(input_file, "rb") as f:
         audio_bytes = f.read()
 
-    output_pcm = convert_file_chunked.remote(audio_bytes, pitch=pitch)
+    output_pcm = convert_file_chunked.remote(audio_bytes, pitch=pitch, use_trt=use_trt)
 
     sample_rate = 48000
     num_channels = 1
@@ -702,12 +802,26 @@ def main_chunked(pitch: int = -1):
     header[36:40] = b'data'
     header[40:44] = struct.pack('<I', data_size)
 
+    import os
     output_path = r"D:\Kiera\test11_chunked.wav"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    base, ext = os.path.splitext(output_path)
+    counter = 1
+    while os.path.exists(output_path):
+        output_path = f"{base}_{counter}{ext}"
+        counter += 1
+
     with open(output_path, "wb") as f:
         f.write(bytes(header) + output_pcm)
 
     print(f"[Chunked Test] Conversion complete -- saved {len(output_pcm)} bytes to {output_path}")
     print("[Chunked Test] Compare against D:\\Kiera\\test11.wav (single-pass) on the same input.")
+
+
+# A6: export_model_to_onnx() removed — its two jobs (ContentVec download and
+# mi-test.onnx export) are now consolidated in modal_deploy/export_onnx.py
+# as export_fallback(), which reuses the same checkpoint/config code as
+# export_generator() and pins the ContentVec download to a specific revision.
 
 
 @app.local_entrypoint()
@@ -745,7 +859,16 @@ def main(pitch: int = -1):
     header[36:40] = b'data'
     header[40:44] = struct.pack('<I', data_size)
 
-    with open(r"D:\Kiera\test11.wav", "wb") as f:
+    import os
+    output_path = r"D:\Kiera\test11.wav"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    base, ext = os.path.splitext(output_path)
+    counter = 1
+    while os.path.exists(output_path):
+        output_path = f"{base}_{counter}{ext}"
+        counter += 1
+
+    with open(output_path, "wb") as f:
         f.write(bytes(header) + output_pcm)
 
     print(f"Conversion Complete — saved {len(output_pcm)} bytes of audio")
