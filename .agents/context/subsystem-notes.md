@@ -141,8 +141,33 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   auto-detect). The GPU-side `_auto_detect_pitch` code itself is untouched/still selectable
   via `pitch=-1` — just no longer what the live call path uses.
 
-## TensorRT/ONNX migration (in progress 2026-07-05/06, uncommitted working tree)
-Full spec: `implementation_plan.md` (repo root); review status: [[active-backlog]] TensorRT row.
+## TensorRT/ONNX migration (live on trt-migration branch, 2026-07-06)
+Full spec: `implementation_plan.md` (repo root); branch: `trt-migration` (not yet merged to main).
+
+### C3 benchmark results (2026-07-06, NVIDIA L4, ap-southeast)
+Block geometry: 1400ms audio in (BLOCK_MS=1000 + CONTEXT_MS=400), 48kHz out.
+Engine build + warmup (cold cache): **22.1s** (one-time cost, then cached on volume).
+
+| Metric | ms | vs gate |
+|---|---|---|
+| min | 65 | — |
+| **median** | **66** | ✅ ≤ 400ms |
+| p95 | 68 | — |
+| max | 68 | — |
+
+All three sessions confirmed on TensorrtExecutionProvider (hubert FP16, generator FP32, rmvpe FP16).
+**21× real-time** — gate PASSED. C4 (A/B WAVs) and C5 (listen test) pending.
+
+### Shims committed to trt-migration branch
+- `attentions_onnx.py`: `torch.clamp(int, min=int)` → `max(int, int)` — `.size()` dims are Python
+  ints in PyTorch 2.5 eager mode, `torch.clamp` requires a Tensor first arg.
+- `models_onnx.py` (3 sites): `torch.randn_like`/`torch.rand` → `torch.zeros_like`/`torch.zeros`
+  in `PosteriorEncoder.forward`, `SineGen._f02sine`, `SineGen.forward`. These emitted ONNX
+  `RandomNormal`/`RandomUniform` nodes that TRT Myelin cannot compile
+  (`randomFill.cpp::replaceFillNodesForMyelin` assertion). Effect: deterministic mean-path inference;
+  breath/consonant texture loses stochasticity (Finding 4 — evaluate in C5 listen test).
+
+### Load-bearing gotchas
 Load-bearing gotchas found during the three review rounds:
 - **TensorRT cannot compile ONNX random ops** (`RandomNormal`/`RandomUniform` from
   `torch.rand`/`randn_like`). The generator's NSF `SineGen` uses both internally, so the
