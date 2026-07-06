@@ -2,8 +2,13 @@
 title: Standing playout buffer
 type: concept
 sources: [subsystem-notes, decisions-log]
-updated: 2026-07-03
+updated: 2026-07-05
 ---
+
+> **Pending change (2026-07-05):** a phased reduction of the ~3s target was approved as
+> part of the TensorRT migration — 1.25s after TRT is live-verified (Phase 1), 0.25s +
+> smaller blocks only if live benchmarks prove headroom (Phase 2). The 3s numbers below
+> describe the currently-deployed behavior. See [[tensorrt-migration]].
 
 **This page describes the 2026-07-03 design.** The pre-2026-07-02 adaptive buffer this
 page used to document (`_run_playout`, P95-based adaptive sizing, `_REORDER_WAIT_S`
