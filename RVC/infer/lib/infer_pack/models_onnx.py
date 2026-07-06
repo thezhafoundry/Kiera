@@ -205,7 +205,10 @@ class PosteriorEncoder(nn.Module):
         x = self.enc(x, x_mask, g=g)
         stats = self.proj(x) * x_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
-        z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
+        # TRT shim: torch.randn_like emits ONNX RandomNormal which TRT Myelin cannot
+        # compile. At inference time the posterior mean (m) is a sufficient sample;
+        # replaced with zeros so the reparameterisation collapses to the mean path.
+        z = (m + torch.zeros_like(m) * torch.exp(logs)) * x_mask
         return z, m, logs, x_mask
 
     def remove_weight_norm(self):
@@ -341,7 +344,11 @@ class SineGen(torch.nn.Module):
         rad = rad.reshape(f0.shape[0], -1, 1)
         b = torch.arange(1, self.dim + 1, dtype=f0.dtype, device=f0.device).reshape(1, 1, -1)
         rad *= b
-        rand_ini = torch.rand(1, 1, self.dim, device=f0.device)
+        # TRT shim: torch.rand emits ONNX RandomUniform which TRT Myelin cannot compile.
+        # Phase offset = 0 gives a fully deterministic harmonic excitation signal, which
+        # is acceptable for voice conversion (the trained voice identity comes from the
+        # FAISS-blended features, not the source phase).
+        rand_ini = torch.zeros(1, 1, self.dim, device=f0.device)
         rand_ini[..., 0] = 0
         rad += rand_ini
         sines = torch.sin(2 * np.pi * rad)
@@ -362,7 +369,10 @@ class SineGen(torch.nn.Module):
                 uv.transpose(2, 1), scale_factor=float(upp), mode="nearest"
             ).transpose(2, 1)
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-            noise = noise_amp * torch.randn_like(sine_waves)
+            # TRT shim: torch.randn_like emits ONNX RandomNormal which TRT Myelin cannot
+            # compile. Unvoiced noise is zeroed out — breath/consonant texture becomes
+            # fully deterministic on the TRT path (documented Finding 4 risk; acceptable).
+            noise = noise_amp * torch.zeros_like(sine_waves)
             sine_waves = sine_waves * uv + noise
         return sine_waves, uv, noise
 
