@@ -249,3 +249,14 @@ narrative in [wiki/pages/issues/voice-identity-mismatch-investigation.md](../../
   tools, and the live calls tested against them) ran on matched T4 hardware. The live worker
   is now on L4 as of an incidental redeploy — future live-call tests will not be GPU-matched
   against the existing diagnostics unless that's revisited. See [[subsystem-notes]].
+
+- **Keep-warm loop: env-gated (option b), default OFF (2026-07-06).** The `_rvc_keepwarm_loop()`
+  in `backend/main.py` now exits immediately unless `RVC_KEEPWARM=1` is set in Render's env.
+  Rationale: 24/7 keep-warm on an L4 costs ~$550–600/mo for a capability that's only needed
+  during active shifts. The env-gate preserves the capability with zero redeploy cost — set
+  `RVC_KEEPWARM=1` at shift start from the Render dashboard, clear it at end-of-shift.
+  Cold-start risk (~75s) is accepted during unwarmed periods; the fail-closed engine check
+  (A1) ensures the container never serves raw audio while loading, so the user hears silence
+  (or a hold message) rather than the agent's real voice during that window.
+  Rejected: option (a) delete entirely (loses the capability permanently without a code deploy),
+  option (c) keep 24/7 (unacceptable ongoing cost).
