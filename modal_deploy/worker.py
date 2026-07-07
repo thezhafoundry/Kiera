@@ -434,7 +434,7 @@ _gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-te
     # container for a connection attempt that arrives while the first is still cold-starting
     # (~75s) or mid-call. Cap at 1 so extra connection attempts queue against the single
     # container instead of each paying for its own T4 GPU concurrently.
-    max_containers=1,
+    max_containers=2,
     env={"USE_TRT": "1"},
 )
 @modal.asgi_app()
