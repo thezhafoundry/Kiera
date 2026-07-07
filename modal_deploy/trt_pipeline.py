@@ -229,6 +229,10 @@ class TRTVoicePipeline:
         feats = apply_protect(feats, feats_raw, pitchf, protect)
 
         # ---- Engine 2: generator ----
+        # sine_noise: audio-rate N(0,1) noise for SineGen unvoiced segments.
+        # Generated here (numpy RNG) rather than inside the ONNX graph so TRT
+        # Myelin never sees a RandomNormal op. Shape [1, OUT_PADDED_48K, 1].
+        sine_noise = self._rng.standard_normal((1, OUT_PADDED_48K, 1)).astype(np.float32)
         out = self.s_gen.run(None, {
             "phone": feats.astype(np.float32),
             "phone_lengths": np.array([GEN_FRAMES], dtype=np.int64),
@@ -236,7 +240,8 @@ class TRTVoicePipeline:
             "pitchf": pitchf[None, :],
             "sid": np.array([0], dtype=np.int64),
             "rnd": self._rng.standard_normal((1, 192, GEN_FRAMES)).astype(np.float32),
-        })[0].reshape(-1)                                   # [163200] float32
+            "sine_noise": sine_noise,
+        })[0].reshape(-1)                                   # [OUT_PADDED_48K] float32
 
         # ---- trim fixed pad, then the zero-fill's share, then rms mix ----
         out = out[T_PAD_TGT: T_PAD_TGT + OUT_48K]
