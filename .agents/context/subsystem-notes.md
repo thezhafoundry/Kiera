@@ -141,8 +141,10 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   auto-detect). The GPU-side `_auto_detect_pitch` code itself is untouched/still selectable
   via `pitch=-1` — just no longer what the live call path uses.
 
-## TensorRT/ONNX migration (live on trt-migration branch, 2026-07-06)
-Full spec: `implementation_plan.md` (repo root); branch: `trt-migration` (not yet merged to main).
+## TensorRT/ONNX migration (merged to main 2026-07-07, merge commit `9c1093a`)
+Full spec: `implementation_plan.md` / `TRT_ROLLOUT_STEPS.md` (repo root). `trt-migration`
+branch is merged into `main`; C4 (A/B WAVs), C5 (listen test) and live-rollout confirmation
+(plan Task 10, USER-RUN) are still pending — see [[active-backlog]].
 
 ### C3 benchmark results (2026-07-06, NVIDIA L4, ap-southeast)
 Block geometry: 1400ms audio in (BLOCK_MS=1000 + CONTEXT_MS=400), 48kHz out.
@@ -171,13 +173,12 @@ All three sessions confirmed on TensorrtExecutionProvider (hubert FP16, generato
 Load-bearing gotchas found during the three review rounds:
 - **TensorRT cannot compile ONNX random ops** (`RandomNormal`/`RandomUniform` from
   `torch.rand`/`randn_like`). The generator's NSF `SineGen` uses both internally, so the
-  working tree carries edits to **vendored** `RVC/infer/lib/infer_pack/models_onnx.py`
+  tree carries edits to **vendored** `RVC/infer/lib/infer_pack/models_onnx.py`
   (deterministic linspace phases + sin-hash pseudo-noise) and `attentions_onnx.py`
-  (int-vs-tensor guard). These shims are what make `generator.onnx` TRT-compilable —
-  they are UNCOMMITTED and `RVC/` is slated for `git rm -r --cached` ([[active-backlog]]),
-  a combination that would silently erase them. Commit or relocate to export-time
-  monkeypatches (the fairseq `pad_to_multiple` patch in `export_onnx.py` shows the pattern)
-  BEFORE any RVC/ git cleanup.
+  (int-vs-tensor guard). These shims are what make `generator.onnx` TRT-compilable — they
+  are now **committed** (`4bdbe5f`, `cd7749c`) with `.gitignore` negation entries keeping
+  them tracked despite `RVC/` being ignored, so the `RVC/` `git rm -r --cached` cleanup
+  ([[active-backlog]]) is unblocked.
 - **TRT Myelin FP16 compiler bug on the generator**: `trt_fp16_enable` is deliberately
   `False` for the generator session (fp16 stays on for hubert/rmvpe) — see
   `trt_pipeline.py`'s provider options. Don't "optimize" it back to fp16 without re-testing;

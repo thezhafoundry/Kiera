@@ -3,14 +3,17 @@ title: TensorRT migration (RMVPE re-enable + phased latency plan)
 type: issue
 status: open
 sources: [decisions-log, subsystem-notes, active-backlog]
-updated: 2026-07-06
+updated: 2026-07-07
 ---
 
-**Status as of 2026-07-06: three review rounds complete; implementation is now credible
-and lives entirely in the UNCOMMITTED working tree** (all 2026-07-05 commits were
-reverted). Remaining before rollout: 9 open review findings (hardening, not design), the
-Task 9 GPU verification chain (probe → exports → engine build with its ≤400 ms gate →
-offline A/B listen test), and the user-run deploy.
+**Status as of 2026-07-07: merged to `main`** (merge commit `9c1093a`). All round-3
+hardening findings landed as real commits, including the previously-uncommitted vendored
+ONNX-export shims (`4bdbe5f`, `cd7749c`). The C3 GPU benchmark passed on a live L4
+(median 66ms / p95 68ms vs. the ≤400ms gate, 2026-07-06 ap-southeast run). Remaining
+before full close-out: C4 (offline A/B WAVs) and C5 (listen test for the deterministic-
+noise shim's breathiness tradeoff), plus confirming the live Modal deploy is actually
+serving the TRT path (`/api/health` → `"engine": "trt"`) rather than assuming it from
+committed code alone.
 
 ## Review arc (2026-07-05 → 2026-07-06)
 

@@ -260,3 +260,13 @@ narrative in [wiki/pages/issues/voice-identity-mismatch-investigation.md](../../
   (or a hold message) rather than the agent's real voice during that window.
   Rejected: option (a) delete entirely (loses the capability permanently without a code deploy),
   option (c) keep 24/7 (unacceptable ongoing cost).
+
+## 2026-07-07 — TensorRT migration merged to main
+
+`trt-migration` branch merged into `main` (merge commit `9c1093a`, done directly by the
+project owner). Carries all round-3 hardening fixes, the committed vendored ONNX-export
+shims (`4bdbe5f`, `cd7749c`), and the passed C3 GPU benchmark (median 66ms/p95 68ms vs.
+≤400ms gate, 2026-07-06 L4 ap-southeast run). Still open post-merge: C4/C5 (offline A/B +
+listen test for the deterministic-noise shim's breathiness tradeoff) and confirming the
+live Modal deploy actually serves TRT (`/api/health` → `"engine": "trt"`) rather than
+inferring it from committed code — see [[active-backlog]], [[subsystem-notes]].

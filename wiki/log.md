@@ -3,6 +3,15 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
+## [2026-07-07] ingest | TensorRT migration merged to main
+
+Updated [tensorrt-migration](pages/issues/tensorrt-migration.md) status: `trt-migration`
+branch merged into `main` (merge commit `9c1093a`), previously-uncommitted vendored
+ONNX-export shims now committed, C3 GPU benchmark passed (median 66ms/p95 68ms). Remaining
+open: C4/C5 (offline A/B + listen test) and confirming the live deploy actually serves TRT.
+Also corrected stale "uncommitted working tree" language in `.agents/projects/active-backlog.md`
+and `.agents/context/subsystem-notes.md`, which still described the pre-merge state.
+
 ## [2026-07-03] ingest | Voice-identity investigation (ongoing) + SIP fix confirmed live
 
 Confirmed [sip-audio-mixing-isolation-bug](pages/issues/sip-audio-mixing-isolation-bug.md)
