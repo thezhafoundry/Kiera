@@ -119,56 +119,13 @@ class RVCEngine:
         self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
         print("Index loaded and reconstructed successfully.")
 
-        # A1: Load the base (non-TRT) ONNX sessions only if the artifacts exist.
-        # They are the FALLBACK path; their absence must not crash a container whose
-        # TRT engines are fine. If neither path can load, startup fails loudly below.
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        vec_path = "/root/rvc-models/onnx/vec-768-layer-12.onnx"
-        rvc_path = "/root/rvc-models/onnx/mi-test.onnx"
-
-        if os.path.exists(vec_path) and os.path.exists(rvc_path):
-            print("Loading ContentVec ONNX...")
-            self.vec_session = ort.InferenceSession(vec_path, providers=providers)
-            print("Loading RVC Generator ONNX...")
-            self.rvc_session = ort.InferenceSession(rvc_path, providers=providers)
-            print("ONNX Inference sessions initialized.")
-            # A2: Assert GPU execution is active — CPU cannot keep up with real-time.
-            for name, sess in [("vec", self.vec_session), ("rvc", self.rvc_session)]:
-                active = sess.get_providers()
-                if "CUDAExecutionProvider" not in active:
-                    raise RuntimeError(
-                        f"CUDAExecutionProvider not active for {name} session (got {active}) — "
-                        "CPU inference cannot keep up with real time; failing startup instead "
-                        "of serving broken audio."
-                    )
-        else:
-            print(f"[Warning] Base ONNX artifacts missing ({vec_path}, {rvc_path}) — "
-                  "fallback path unavailable; TRT path is required for this container.")
-
-        # Pre-load parselmouth
+        # ---- Pre-load parselmouth ----
         print("Pre-loading parselmouth (PM pitch method)...")
         import parselmouth  # noqa
         print("parselmouth loaded.")
 
-        # Warm-up inference
-        print("Running GPU warm-up inference pass...")
-        try:
-            import numpy as np, io, wave
-            silence_samples = np.zeros(3200, dtype=np.int16)  # 200ms at 16kHz
-            buf = io.BytesIO()
-            with wave.open(buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(silence_samples.tobytes())
-            self.run_conversion(buf.getvalue(), pitch=0)
-            print("GPU warm-up complete.")
-        except Exception as e:
-            print(f"[Warning] Warm-up failed (non-fatal): {e}")
-
-        # ---- Optional TRT path (USE_TRT=1). Fail-closed: if TRT init fails we fall
-        # back to the ONNX-CUDA path (never raw audio), log loudly, and expose the
-        # degradation in /health.
+        # ---- Attempt TRT path first if USE_TRT=1 ----
+        trt_loaded = False
         if os.environ.get("USE_TRT", "0") == "1":
             try:
                 import glob as _glob
@@ -196,6 +153,7 @@ class RVCEngine:
                 self.trt_pipe.warmup()
                 self.engine_kind = "trt"
                 print(f"[TRT] pipeline ready in {time.perf_counter()-t0:.1f}s")
+                trt_loaded = True
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -204,8 +162,50 @@ class RVCEngine:
                 self.trt_pipe = None
                 self.engine_kind = "onnx-cuda"
 
+        # ---- Fallback / Base ONNX loading ----
+        # Load the base (non-TRT) ONNX sessions only if TRT didn't load or is disabled.
+        # This saves ~7+ seconds of model loading and GPU warm-up time during normal TRT boots.
+        if not trt_loaded:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            vec_path = "/root/rvc-models/onnx/vec-768-layer-12.onnx"
+            rvc_path = "/root/rvc-models/onnx/mi-test.onnx"
+
+            if os.path.exists(vec_path) and os.path.exists(rvc_path):
+                print("Loading ContentVec ONNX...")
+                self.vec_session = ort.InferenceSession(vec_path, providers=providers)
+                print("Loading RVC Generator ONNX...")
+                self.rvc_session = ort.InferenceSession(rvc_path, providers=providers)
+                print("ONNX Inference sessions initialized.")
+                # A2: Assert GPU execution is active — CPU cannot keep up with real-time.
+                for name, sess in [("vec", self.vec_session), ("rvc", self.rvc_session)]:
+                    active = sess.get_providers()
+                    if "CUDAExecutionProvider" not in active:
+                        raise RuntimeError(
+                            f"CUDAExecutionProvider not active for {name} session (got {active}) — "
+                            "CPU inference cannot keep up with real time; failing startup instead "
+                            "of serving broken audio."
+                        )
+            else:
+                print(f"[Warning] Base ONNX artifacts missing ({vec_path}, {rvc_path}) — "
+                      "fallback path unavailable; TRT path is required for this container.")
+
+            # Warm-up inference on fallback sessions
+            print("Running GPU warm-up inference pass for base ONNX...")
+            try:
+                import numpy as np, io, wave
+                silence_samples = np.zeros(3200, dtype=np.int16)  # 200ms at 16kHz
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(silence_samples.tobytes())
+                self.run_conversion(buf.getvalue(), pitch=0)
+                print("GPU warm-up complete.")
+            except Exception as e:
+                print(f"[Warning] Warm-up failed (non-fatal): {e}")
+
         # A1: Fail-closed — at least one engine must be ready before reporting healthy.
-        # This guard runs after the TRT branch so `ready` truly means "an engine works".
         if self.trt_pipe is None and self.vec_session is None:
             raise RuntimeError(
                 "No conversion engine available: TRT init failed/disabled AND base ONNX "
@@ -214,6 +214,7 @@ class RVCEngine:
 
         self.ready = True
         print("GPU Worker Ready")
+
 
     def _auto_detect_pitch(self, wav_bytes: bytes) -> int:
         import io
