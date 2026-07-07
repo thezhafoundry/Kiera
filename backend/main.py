@@ -2,6 +2,7 @@ import os
 import asyncio
 import datetime
 import time
+from typing import Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Form, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +20,14 @@ from .pipeline import VoiceConversionWorker
 load_dotenv()
 
 app = FastAPI(title="Keira MVP Voice Conversion Server")
+
+
+@app.on_event("startup")
+async def _on_startup():
+    global _rvc_keepwarm_task
+    _rvc_keepwarm_task = asyncio.create_task(_rvc_keepwarm_loop())
+    print("[Server] RVC keep-warm loop started (pings every 90s).")
+
 
 # Configure CORS
 # allow_origins=["*"] and allow_credentials=True cannot be combined (browsers reject it).
@@ -82,6 +91,42 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
 # Global tracking
 active_workers = {}
 active_calls = {}
+
+# Background keep-warm task handle
+_rvc_keepwarm_task: Optional[asyncio.Task] = None
+
+
+async def _rvc_keepwarm_loop():
+    """Pings the Modal RVC /health endpoint every 90 seconds to keep the GPU
+    container warm between calls. Modal's scaledown_window=120s means the
+    container shuts down after 2 minutes of inactivity — pinging every 90s
+    keeps it alive so calls never hit a cold start.
+    Timeout is 150s to cover Modal cold-start time (~60-90s).
+
+    Disabled by default to avoid 24/7 GPU billing (~$550-600/mo on the L4).
+    Enable at shift start via Render env: RVC_KEEPWARM=1. No redeploy needed.
+    """
+    # Phase D decision (2026-07-06): env-gated to save cost; default OFF.
+    if os.getenv("RVC_KEEPWARM", "0") != "1":
+        return
+    if not RVC_ENDPOINT_URL:
+        return
+    health_url = (
+        RVC_ENDPOINT_URL
+        .replace("/convert", "/health")
+        .replace("web-convert", "web-health")
+        .replace("web_convert", "web_health")
+    )
+    import httpx
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=150.0) as client:
+                resp = await client.get(health_url)
+            print(f"[Server] RVC keep-warm ping → {resp.status_code} (container warm)")
+        except Exception as e:
+            print(f"[Server] RVC keep-warm ping failed (non-fatal): {e}")
+        await asyncio.sleep(90)
+
 
 
 async def _restrict_sip_audio(room_name: str, sip_identity: str = "sip-lead"):
@@ -316,6 +361,7 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
             api_key=RVC_API_KEY,
             pitch_shift=pitch_shift,
             index_rate=RVC_INDEX_RATE,
+            connect_timeout=150.0,  # allow full Modal cold-start window (~60-90s)
         )
     else:
         print("[Server] No RVC endpoint config found. Spawning Dummy Pitch Modulation Engine.")

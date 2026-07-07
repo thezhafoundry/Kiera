@@ -141,6 +141,63 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   auto-detect). The GPU-side `_auto_detect_pitch` code itself is untouched/still selectable
   via `pitch=-1` — just no longer what the live call path uses.
 
+## TensorRT/ONNX migration (live on trt-migration branch, 2026-07-06)
+Full spec: `implementation_plan.md` (repo root); branch: `trt-migration` (not yet merged to main).
+
+### C3 benchmark results (2026-07-06, NVIDIA L4, ap-southeast)
+Block geometry: 1400ms audio in (BLOCK_MS=1000 + CONTEXT_MS=400), 48kHz out.
+Engine build + warmup (cold cache): **22.1s** (one-time cost, then cached on volume).
+
+| Metric | ms | vs gate |
+|---|---|---|
+| min | 65 | — |
+| **median** | **66** | ✅ ≤ 400ms |
+| p95 | 68 | — |
+| max | 68 | — |
+
+All three sessions confirmed on TensorrtExecutionProvider (hubert FP16, generator FP32, rmvpe FP16).
+**21× real-time** — gate PASSED. C4 (A/B WAVs) and C5 (listen test) pending.
+
+### Shims committed to trt-migration branch
+- `attentions_onnx.py`: `torch.clamp(int, min=int)` → `max(int, int)` — `.size()` dims are Python
+  ints in PyTorch 2.5 eager mode, `torch.clamp` requires a Tensor first arg.
+- `models_onnx.py` (3 sites): `torch.randn_like`/`torch.rand` → `torch.zeros_like`/`torch.zeros`
+  in `PosteriorEncoder.forward`, `SineGen._f02sine`, `SineGen.forward`. These emitted ONNX
+  `RandomNormal`/`RandomUniform` nodes that TRT Myelin cannot compile
+  (`randomFill.cpp::replaceFillNodesForMyelin` assertion). Effect: deterministic mean-path inference;
+  breath/consonant texture loses stochasticity (Finding 4 — evaluate in C5 listen test).
+
+### Load-bearing gotchas
+Load-bearing gotchas found during the three review rounds:
+- **TensorRT cannot compile ONNX random ops** (`RandomNormal`/`RandomUniform` from
+  `torch.rand`/`randn_like`). The generator's NSF `SineGen` uses both internally, so the
+  working tree carries edits to **vendored** `RVC/infer/lib/infer_pack/models_onnx.py`
+  (deterministic linspace phases + sin-hash pseudo-noise) and `attentions_onnx.py`
+  (int-vs-tensor guard). These shims are what make `generator.onnx` TRT-compilable —
+  they are UNCOMMITTED and `RVC/` is slated for `git rm -r --cached` ([[active-backlog]]),
+  a combination that would silently erase them. Commit or relocate to export-time
+  monkeypatches (the fairseq `pad_to_multiple` patch in `export_onnx.py` shows the pattern)
+  BEFORE any RVC/ git cleanup.
+- **TRT Myelin FP16 compiler bug on the generator**: `trt_fp16_enable` is deliberately
+  `False` for the generator session (fp16 stays on for hubert/rmvpe) — see
+  `trt_pipeline.py`'s provider options. Don't "optimize" it back to fp16 without re-testing;
+  the flag split is intentional.
+- **ORT silently falls back to CPU when an EP fails to load** — `TRTVoicePipeline.__init__`
+  hard-fails via `sess.get_providers()` checks for exactly this reason. The base ONNX
+  fallback sessions in `worker.py` do NOT have this check yet (open finding). Any new
+  `InferenceSession` in this codebase should assert its expected provider.
+- **Modal image layering**: Modal forbids build steps (`pip_install`/`env`/`run_commands`)
+  after any `add_local_*` — that's why `modal_deploy/modal_defs.py` (single source of truth
+  for `volume`/`image`/`trt_image`) splits build bases from final images and attaches local
+  sources last. It also mounts itself (`add_local_python_source("modal_defs")`) so
+  containers can import it — same class of trap as the 2026-07-03 `streaming.py` incident.
+- **`env=` IS a valid `@app.function(...)` kwarg in Modal 1.5.1** (verified via
+  `inspect.signature`) — don't flag it as an error in review; older Modal docs/memory may
+  suggest otherwise.
+- **`modal run` from repo root, pytest too**: `modal_deploy/test_streaming.py` imports the
+  `modal_deploy` package — run `python -m pytest modal_deploy/...` from the repo root, not
+  from inside `modal_deploy/` (collection fails there).
+
 ## SIP audio isolation (`backend/main.py::_restrict_sip_audio`, added 2026-07-03)
 - **Why this exists**: LiveKit's SIP bridge runs server-side and ignores browser-level
   `setTrackSubscriptionPermissions()` — the SIP participant (the lead) receives a mix of

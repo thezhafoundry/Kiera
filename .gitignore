@@ -19,3 +19,8 @@ tools/ngrok.exe
 
 # RVC WebUI — too large for GitHub
 RVC/
+# Exception: vendored TRT-export shims must stay tracked (Slice 2 of trt-migration).
+# These two files replace torch.rand/randn_like with ONNX-compatible equivalents
+# and guard int-vs-tensor length checks; removing them breaks TRT ONNX export.
+!RVC/infer/lib/infer_pack/models_onnx.py
+!RVC/infer/lib/infer_pack/attentions_onnx.py

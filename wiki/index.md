@@ -21,6 +21,10 @@ wiki. This index is the first stop for any query — find the page here, then dr
   [[voice-identity-mismatch-investigation]]) — cold-start timing may no longer match exactly.
 
 ## Issues (open/resolved problems)
+- [tensorrt-migration](pages/issues/tensorrt-migration.md) — **open, in progress.** Migrate
+  the Modal worker to 3 static-shape TRT engines on the L4 to re-enable RMVPE pitch tracking;
+  implemented by a different model with review here against `implementation_plan.md`'s gates.
+  Includes the approved phased playout-buffer reduction (1.25s → later 0.25s, benchmark-gated).
 - [livekit-sip-trunk-stale](pages/issues/livekit-sip-trunk-stale.md) — **open.** First live
   outbound call after the Modal worker came back up failed to dial (`404 object cannot be
   found`); trunk recreated via `/api/setup`, but the Twilio webhook step 401'd separately and

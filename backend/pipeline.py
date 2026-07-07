@@ -33,16 +33,18 @@ class VoiceConversionWorker:
     # directly off the converter's arrival timing -- it always goes through
     # this buffer first, drained by a separate real-time-paced consumer task
     # (_run_playout_consumer). This absorbs the case where one inference block
-    # takes longer than its real-time budget (confirmed in production: ~460-
-    # 590ms to convert a 320ms block even after the FAISS index caching fix)
-    # by growing the lead's delay instead of producing a silence gap.
+    # takes longer than its real-time budget by growing the lead's delay instead
+    # of producing a silence gap.
     #
-    # Target: initial cushion before playout starts (~3s of 48kHz 16-bit mono).
-    _PLAYOUT_BUFFER_TARGET_BYTES = int(48000 * 2 * 3.0)
+    # Phase 1 of the TRT latency plan (2026-07-05): 1.25s is the floor for
+    # BLOCK_MS=1000 -- converted audio arrives in ~1s bursts, so the cushion must
+    # exceed one block interval plus jitter. 0.25s (Phase 2) additionally requires
+    # shrinking BLOCK_MS and is gated on live TRT p95 <= 0.4x BLOCK_MS.
+    _PLAYOUT_BUFFER_TARGET_BYTES = int(48000 * 2 * 1.25)
     # Cap: beyond this, drop the OLDEST buffered audio rather than let delay
-    # grow unbounded -- same policy as RVCStreamingConverter's reconnect
-    # buffer (backend/converters/rvc_stream.py, _MAX_BUFFER_BYTES).
+    # grow unbounded. 5.0s is an overflow safety cap, not a latency target.
     _PLAYOUT_BUFFER_MAX_BYTES = int(48000 * 2 * 5.0)
+
 
     # If no converted audio has arrived for this long, the data-channel latency
     # metric reports is_fallback=True ("HOLDING") so the existing frontend badge

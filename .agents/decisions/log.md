@@ -178,6 +178,36 @@ to have already fixed.
   family behave in near-real-time. Revisit only if inference-speed engineering (GPU tier,
   ONNX/TensorRT) turns out insufficient.
 
+## 2026-07-05 — TensorRT migration planned (implementation_plan.md); phased playout-buffer reversal approved
+
+Planning-only session: analyzed a user-drafted proposal to migrate the Modal worker's
+inference to TensorRT on the L4, verified it against the codebase, and wrote
+`implementation_plan.md` (repo root). Execution is delegated to a **different model**;
+this agent's role is reviewing the resulting diffs against the plan's gates.
+
+- **TRT via 3 static-shape engines (HuBERT / SynthesizerTrnMs768NSFsid / RMVPE E2E), FAISS
+  stays NumPy.** Why: matches the real `Pipeline.vc` structure; FAISS retrieval can't be a
+  TRT engine; RVC's own `models_onnx.py` proves generator exportability. Primary motivation
+  is **re-enabling RMVPE** (pm was a pure ~300ms-latency tradeoff, see 2026-07-03 entry) at
+  streaming-compatible speed — quality first, latency headroom second.
+- **Static shape corrected during analysis: NOT 22,400 samples.** The vendored pipeline
+  reflect-pads `t_pad = 16000×x_pad` per side, and `BlockAccumulator`'s first blocks have
+  0..6400 context. Plan pins a fixed 16,000/side pad (54,400 into HuBERT) and zero-fills
+  short blocks, making output exactly 3× input. Rejected: exporting at raw 22,400 (would
+  have failed at runtime on every first block and mismatched production padding).
+- **Engines built on the L4 and cached to the `rvc-models` volume, never at image build.**
+  Why: Modal image builds have no GPU; engines are SM89/TRT-version-specific; cold start is
+  already ~75s and an uncached engine build adds minutes. `/health` exposes cache state.
+- **Phased playout-buffer reversal — user-approved 2026-07-05, partially reverses the
+  2026-07-03 "latency is not a priority" decision.** Phase 1: `_PLAYOUT_BUFFER_TARGET_BYTES`
+  3.0s → 1.25s (floor for `BLOCK_MS=1000` — converted audio arrives in ~1s bursts, so a
+  cushion below one block interval starves every cycle). Phase 2 (0.25s + smaller
+  `BLOCK_MS`): separate future plan, gated on live TRT p95 ≤ 400ms sustained. Rejected: the
+  proposal's original direct 0.25s cut (mathematically below block-arrival granularity —
+  gaps guaranteed regardless of GPU speed).
+- **Fail-closed preserved**: TRT init failure falls back to the PyTorch *converted* path
+  only — never raw. All `modal deploy`/push steps in the plan are marked [USER-RUN].
+
 ## 2026-07-03 (later still) — Voice-identity mismatch: five hypotheses ruled out, new diagnostic tooling built
 
 Separate from both the buffer/latency work and the SIP-mixing fix above: converted voice
@@ -219,3 +249,14 @@ narrative in [wiki/pages/issues/voice-identity-mismatch-investigation.md](../../
   tools, and the live calls tested against them) ran on matched T4 hardware. The live worker
   is now on L4 as of an incidental redeploy — future live-call tests will not be GPU-matched
   against the existing diagnostics unless that's revisited. See [[subsystem-notes]].
+
+- **Keep-warm loop: env-gated (option b), default OFF (2026-07-06).** The `_rvc_keepwarm_loop()`
+  in `backend/main.py` now exits immediately unless `RVC_KEEPWARM=1` is set in Render's env.
+  Rationale: 24/7 keep-warm on an L4 costs ~$550–600/mo for a capability that's only needed
+  during active shifts. The env-gate preserves the capability with zero redeploy cost — set
+  `RVC_KEEPWARM=1` at shift start from the Render dashboard, clear it at end-of-shift.
+  Cold-start risk (~75s) is accepted during unwarmed periods; the fail-closed engine check
+  (A1) ensures the container never serves raw audio while loading, so the user hears silence
+  (or a hold message) rather than the agent's real voice during that window.
+  Rejected: option (a) delete entirely (loses the capability permanently without a code deploy),
+  option (c) keep 24/7 (unacceptable ongoing cost).

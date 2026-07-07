@@ -27,11 +27,14 @@ SAMPLE_RATE_OUT = 48000         # RVC / published track rate (3x input)
 # than the old 320ms one). The added per-block delay is absorbed by the
 # playout buffer in backend/pipeline.py, not exposed to the lead as latency
 # they can't tolerate -- it's exposed as buffered delay instead.
-BLOCK_MS = 1000                 # NEW audio processed per inference block
-CONTEXT_MS = 400                # prior input prepended as left context
+# NOTE: BLOCK_MS + CONTEXT_MS must equal trt_pipeline.CANONICAL_IN / SAMPLE_RATE_IN * 1000
+# (currently 1000+400=1400ms = 22400 samples) -- changing either without updating the
+# TRT static shapes requires re-exporting all three ONNX models.
+BLOCK_MS = 1000               # new audio processed per inference block
+CONTEXT_MS = 400              # prior input prepended as left context
 
-BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000        # 5120
-CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000    # 2560
+BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000        # 16000
+CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000    # 6400
 
 SOLA_CROSSFADE_SAMPLES = SAMPLE_RATE_OUT * 80 // 1000       # 3840 (80 ms @ 48 kHz)
 SOLA_SEARCH_SAMPLES = SAMPLE_RATE_OUT * 10 // 1000          # 480  (10 ms @ 48 kHz)

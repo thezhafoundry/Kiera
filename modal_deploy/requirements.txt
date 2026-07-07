@@ -1,5 +1,7 @@
 torch==2.5.1
 torchaudio==2.5.1
+# onnxruntime-gpu and onnx removed (A6): trt_image pins ORT 1.19.0 via modal_defs.py;
+# the base image no longer imports ORT directly.
 opencv-python-headless==4.10.0.84
 numpy==1.23.5
 scipy

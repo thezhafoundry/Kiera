@@ -123,3 +123,35 @@ GitHub -- `.gitignore` never matched the *current* folder name until this sessio
 had silently stopped excluding anything. Fixing the gitignore entry doesn't retroactively
 untrack the already-committed files; noted in `.agents/projects/active-backlog.md` as cleanup
 still needed.
+
+## [2026-07-05] ingest | TensorRT migration plan approved; phased playout-buffer reversal
+
+Planning session, no code changed. Analyzed a user-drafted TensorRT proposal against the
+codebase, corrected it in three places (static shape must account for the vendored
+pipeline's t_pad and the accumulator's variable first-block context; engines must be built
+on-GPU and cached to the volume, not at image build; a 0.25s playout buffer is below the
+1000ms block-arrival granularity), and wrote `implementation_plan.md` (repo root).
+
+- New issue page: [[tensorrt-migration]] -- migration scope, design findings, the phased
+  buffer decision (1.25s Phase 1 approved 2026-07-05, 0.25s Phase 2 benchmark-gated), and
+  resolution criteria. Notably, implementation is delegated to a *different* model; the
+  resident agent reviews diffs against the plan's gates.
+- Updated [[adaptive-playout-buffer]] with a pending-change banner (3s numbers remain the
+  deployed truth until Phase 1 ships).
+- `.agents/` counterparts: decisions log 2026-07-05 entry, active-backlog TensorRT row
+  (replaces the old "deferred ONNX/TensorRT" row).
+
+## [2026-07-06] ingest | TRT migration review rounds 2-3: from dead-on-arrival to credible
+
+Two full code reviews of the other model's uncommitted TRT implementation. Round 2 found
+the TRT path unable to run at all (broken HuBERT export, wrong production image, block
+geometry mismatched against the static engine shapes); round 3 confirmed all of those
+fixed and surfaced two real TensorRT platform discoveries (ONNX random ops don't compile
+under TRT; Myelin FP16 bug on the generator).
+
+- Updated [[tensorrt-migration]] with the full review arc and current status (9 open
+  findings, Task 9 GPU verification + user-run rollout remaining).
+- New load-bearing trap recorded in `.agents/context/subsystem-notes.md` and cross-linked
+  in `.agents/projects/active-backlog.md`: the TRT-export shims live as uncommitted edits
+  to vendored RVC files, and the pre-existing "untrack RVC/" backlog item would erase them
+  -- that item is now explicitly blocked until the shims are committed or relocated.
