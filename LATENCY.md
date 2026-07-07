@@ -26,14 +26,29 @@ troubleshooting steps for Modal GPU connection/cold-start issues.
 > (the old ordered-playout-queue design) is retitled and kept as historical record — that
 > machinery no longer exists in the code.
 
+> **2026-07-03 / 2026-07-07 update:** the "no standing playout buffer" framing in §1 below is
+> now stale — a bounded standing playout buffer was reintroduced on 2026-07-03 as a deliberate
+> latency-for-quality tradeoff (see CLAUDE.md "Audio Pipeline & Streaming" and
+> `.agents/decisions/log.md`), and its target was reduced from ~3s to **1.25s** (cap still ~5s)
+> as TRT migration phase 1 (merged to `main` 2026-07-07). The Modal worker also moved from a
+> T4 to an **L4** GPU (2026-07-03) and now runs an optional **TensorRT** path
+> (`USE_TRT=1`) using RMVPE pitch tracking instead of `pm` — see
+> `.agents/context/subsystem-notes.md`'s TensorRT/ONNX migration section for the C3 benchmark
+> (median 66ms/p95 68ms inference on a live L4). The Render↔Modal region mismatch described in
+> §4.1/Region note below was **resolved 2026-07-03** — Render is now confirmed live in
+> Singapore, colocated with Modal's `ap-southeast` pin. Numbers in §1's table below have not
+> been fully reconciled with these changes; treat the buffer/GPU-tier/region specifics in this
+> banner as authoritative over the older prose that follows.
+
 ---
 
 ## 1. Latency Budget Breakdown (design targets — not yet re-measured, see banner)
 
 In a real-time voice call, total mouth-to-ear latency is composed of multiple steps in the
-media transport and conversion pipeline. The stages below reflect the **new** streaming
-pipeline (`backend/pipeline.py` + `modal_deploy/streaming.py`'s `/ws` engine); there is no more
-VAD chunking or standing playout buffer to budget for.
+media transport and conversion pipeline. The stages below reflect the streaming pipeline
+(`backend/pipeline.py` + `modal_deploy/streaming.py`'s `/ws` engine); there is no more VAD
+chunking, but a standing playout buffer **was** reintroduced 2026-07-03 (see the top-of-document
+banner) — it is the single largest term in the budget below and is not optional.
 
 $$\text{Mouth-to-Ear Latency} = T_{\text{ingress}} + T_{\text{noise\_suppression}} + T_{\text{frame\_batch}} + T_{\text{block\_accumulate}} + T_{\text{inference}} + T_{\text{SOLA\_crossfade}} + T_{\text{jitter\_buffer}} + T_{\text{egress}}$$
 
@@ -43,19 +58,19 @@ $$\text{Mouth-to-Ear Latency} = T_{\text{ingress}} + T_{\text{noise\_suppression
 | **Noise Suppression** | 0.2 - 0.5 ms | `WebRTCNoiseSuppressor` processing of 10ms/320-byte frames. Sub-millisecond on CPU. Unchanged by this rebuild. |
 | **Input Frame Batching** | up to 20 ms | `_frame_pairs()` in `backend/pipeline.py` pairs two consecutive 10ms denoised frames into one 20ms (640-byte) input frame before it's sent into `convert_stream` — the plan's "Input frame to WS" parameter. |
 | **Inference Block Accumulation** | up to 320 ms (design target) | `modal_deploy/streaming.py::BlockAccumulator` only pops a block once 320ms of *new* audio has arrived (`BLOCK_MS`/`BLOCK_SAMPLES_IN`); a 160ms left-context window (`CONTEXT_MS`) is prepended for inference quality but doesn't itself add wait time. Per the rebuild plan's parameter table — see `docs/plans/2026-07-02-streaming-rebuild-plan.md`. |
-| **GPU Inference (warm)** | target < ~250 ms per 320ms block | `RVCEngine.run_conversion` inside the `/ws` handler (`modal_deploy/worker.py`), same underlying inference path as the old `/convert` HTTP endpoint (`pm` pitch extraction, not `rmvpe`). The plan's verification checklist target is `infer_ms` per 320ms block < ~250ms warm — **not yet measured live** against a deployed `/ws` worker. |
-| **GPU Inference (cold)** | 30 - 90+ s (whole call blocked, not just first block) | Same Modal cold-start as before — see the historical ~75s measurement in §4.1 — but the *consequence* changed: the fail-closed warm gate (`worker.wait_until_ready`, see CLAUDE.md "Telephony & SIP") now blocks the call from starting at all until the GPU is ready, instead of letting the first several chunks through as raw voice. |
+| **GPU Inference (warm)** | TRT path: median **66ms** / p95 68ms per 1400ms block (C3 benchmark, live L4, 2026-07-06); legacy ONNX/`pm` path: target < ~250 ms per 320ms block, not live-measured | `RVCEngine.run_conversion` / `TRTVoicePipeline` inside the `/ws` handler (`modal_deploy/worker.py`). The TRT path (`USE_TRT=1`) uses 3 static-shape TensorRT engines (HuBERT/generator/RMVPE) and re-enables `rmvpe` pitch tracking — see `.agents/context/subsystem-notes.md`'s TensorRT/ONNX migration section. |
+| **GPU Inference (cold)** | 30 - 90+ s (whole call blocked, not just first block); TRT adds a one-time ~22s engine build/warmup on a cold volume cache | Same Modal cold-start as before — see the historical ~75s measurement in §4.1 — but the *consequence* changed: the fail-closed warm gate (`worker.wait_until_ready`, see CLAUDE.md "Telephony & SIP") now blocks the call from starting at all until the GPU is ready, instead of letting the first several chunks through as raw voice. |
 | **SOLA Crossfade** | 80 ms held back per block | `modal_deploy/streaming.py::sola_crossfade` (`SOLA_CROSSFADE_SAMPLES`, 3840 samples @ 48kHz) holds back the last 80ms of each converted block as `pending_tail`, overlap-added onto the next block, to avoid audible seams between blocks. Per the plan's parameter table. |
-| **One-shot Jitter Buffer** | 100 ms (once, at stream start) | `VoiceConversionWorker._JITTER_TARGET_BYTES` in `backend/pipeline.py` — holds the first ~100ms of converted 48kHz audio before publishing starts, then streams straight through. Unlike the old adaptive standing playout buffer, this is a single fixed fill, not re-triggered per speech session. |
+| **Standing Playout Buffer** | 1.25 s target / 5 s cap (as of TRT migration phase 1, 2026-07-07; was ~3s/~5s from 2026-07-03 to phase 1) | `VoiceConversionWorker._PLAYOUT_BUFFER_TARGET_BYTES`/`_MAX_BYTES` in `backend/pipeline.py` — a producer/consumer split that absorbs any block slower than real-time, trading delay for voice continuity. See CLAUDE.md "Audio Pipeline & Streaming" and `.agents/context/subsystem-notes.md`. This is now the dominant term in the budget, not the one-shot 100ms jitter fill this table used to describe (that constant no longer exists in the code). |
 | **Egress Network** | 20 - 40 ms | Publishing 960-byte (10ms @ 48kHz) frames to LiveKit, then WebRTC + browser jitter-buffer playout to the lead. Unchanged by this rebuild. |
-| **Steady-state Total** | **~400 - 550 ms (design target)** | Explicit target from the rebuild plan ("Target: ~400-550 ms mouth-to-ear, converted from the first word"). The plan's separate live-verification checklist gives a slightly wider acceptance range, "mouth-to-ear latency ≈ 400-600 ms". Both are **plan text, not measurements** — no live run has produced a number yet. |
+| **Steady-state Total** | **~1.3 - 1.6 s (design estimate, not live-measured)** | Dominated by the 1.25s standing playout buffer, not GPU inference (which TRT has made comparatively negligible at ~66ms). The rebuild plan's original "~400-550ms" target predates the 2026-07-03 playout-buffer reintroduction and no longer describes the deployed design — see the top-of-document banner. No live spectral-tone measurement has been run against the current (buffer + TRT) configuration yet. |
 | **Cold-GPU Total** | **Call blocked (503 outbound / held inbound) until ready, no audio published** | Replaces the old "30-90+s of raw voice, then fail-over recovers" row — there is no raw-voice period anymore; see the Inference (cold) row above and §4.2. |
 
 Region note: the Modal function is pinned to `region="ap-southeast"` (Singapore), intended to
 sit next to Render/Twilio infrastructure and avoid a transpacific round trip on every audio
-block — unchanged by this rebuild. But see §4.1: the currently deployed Render service is
-actually in Oregon, and moving it to Singapore is a separate, still-pending task (not done here)
-— so this pin may still be working against itself until that migration lands.
+block. **Resolved 2026-07-03**: the deployed Render service is confirmed live in Singapore
+(colocated with Modal), so this pin is no longer working against itself — see
+`.agents/context/stack-and-rules.md`.
 
 ---
 
@@ -157,7 +172,7 @@ noise and measures delay digitally in the browser.
    and `GET /api/health` reports it — otherwise the bot silently falls back to
    `DummyVoiceConverter` and you'll measure the wrong pipeline.
 2. Hit `POST /api/warmup` (or wait for the automatic pre-warm ping fired on bot start) so the
-   Modal T4 is warm **before** you measure — see §4. With the fail-closed warm gate, a
+   Modal GPU (L4 as of 2026-07-03) is warm **before** you measure — see §4. With the fail-closed warm gate, a
    still-cold GPU won't give you a bad measurement to sanity-check — it'll just block the call
    (outbound 503, or inbound stuck on hold), so there's nothing to measure until the engine
    reports ready.
@@ -213,18 +228,14 @@ endpoint directly. Two concrete issues showed up:
   but timeouts and reasonably conclude Modal is broken when it's actually just slow to wake up.
   During the same window, RVC calls that *did* land while the GPU was warm completed in
   580-750ms — the engine itself works fine once the container is up.
-- **Region mismatch worth double-checking:** the Modal worker is pinned to
+- **Region mismatch — resolved 2026-07-03:** the Modal worker is pinned to
   `region="ap-southeast"` (Singapore, per the comment in
   [modal_deploy/worker.py](modal_deploy/worker.py)) on the premise that Render/Twilio also run
-  in that region — but the deployed Render service is currently in **Oregon** (`us-west`), not
-  Singapore. If that's still the case, every audio block on the persistent `/ws` stream pays a
-  transpacific round trip on top of inference, eating into the per-320ms-block real-time budget
-  and making it harder to keep the stream's real-time factor under 1 (i.e. converting audio
-  faster than it's spoken) under load — the streaming rebuild does not remove this cost, it just
-  changed what a per-request timeout/fallback used to look like (there is no more per-chunk
-  budget/fallback at all — see §4.2/§4.3). Moving Render to `ap-southeast` is planned as a
-  separate, still-pending task (not done as part of this rebuild); until then, this pin may still
-  be working against itself.
+  in that region. This was open as of this 2026-07-02 investigation (Render was in Oregon at
+  the time), but the Render service was confirmed live in Singapore via the Render API on
+  2026-07-03 (service ID changed from `srv-d92lh7navr4c738i03a0` to `srv-d932m4cvikkc73belt1g`)
+  — see `.agents/context/stack-and-rules.md`. The transpacific-round-trip risk described below
+  no longer applies; kept as historical record of what to check if the region ever drifts again.
 
 ### 4.2 Confirmed production incident: lead heard the agent's raw voice for a whole call
 
@@ -281,7 +292,8 @@ work through these in order:
 3. **Hit `/health` directly** on the deployed endpoint (`RVC_ENDPOINT_URL` with `/convert`
    swapped for `/health`). `{"status": "loading"}` means the container is up but still inside
    `RVCEngine.startup()` (model + HuBERT + FAISS index + warm-up inference) — expect this to
-   take up to ~90s on a cold T4 (see §4.1). `{"status": "ready"}` means it's fully warm.
+   take up to ~90s on a cold GPU (see §4.1; the live worker is an L4 as of 2026-07-03, plus a
+   one-time ~22s TRT engine build/warmup if `USE_TRT=1` and the volume cache is cold). `{"status": "ready"}` means it's fully warm.
 4. **Use `POST /api/warmup`, not a single health ping.** It polls `/health` every 30s for up to
    6 minutes specifically to ride out a cold start; a single `curl` with a short timeout will
    very likely time out on a cold container and is not a reliable "Modal is broken" signal.
@@ -308,8 +320,10 @@ work through these in order:
    Real conversion resumes automatically once the container reports ready and a session is free.
 7. **Confirm GPU visibility inside the container**, not just that the container started: the
    `/health` response includes `cuda_available` and `cuda_device` — if `cuda_available` is
-   `false` on a `gpu="T4"` function, that's a Modal-side scheduling/image issue, not an
-   application bug (check `modal app logs rvc-worker` for CUDA init errors).
+   `false` on the `gpu="L4"` function (was `"T4"` before 2026-07-03), that's a Modal-side
+   scheduling/image issue, not an application bug (check `modal app logs rvc-worker` for CUDA
+   init errors). Committing a `gpu=` change doesn't deploy it — `modal deploy` must actually run
+   before `/health`'s `cuda_device` reflects it; see `.agents/context/subsystem-notes.md`.
 8. **Keep it warm proactively.** The `scaledown_window=120` means the container shuts down 2
    minutes after the last request — for back-to-back calls, ping `/api/warmup` at shift start
    and rely on the automatic pre-warm ping fired in `_do_start_bot` on every bot spawn to

@@ -3,6 +3,40 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
+## [2026-07-07] audit | Full stale-data sweep — 11 files corrected, wiki re-ingested
+
+Systematic audit of the entire codebase for stale docs, config, and notes after the TRT
+migration merge (`9c1093a`) and the earlier 2026-07-03 Render-region migration. Found and
+corrected 11 files:
+
+- **`render.yaml`** — region `oregon`→`singapore` (colocated with Modal since 2026-07-03,
+  never reflected in infra-as-code); added 8 missing env vars (`RVC_API_KEY`, `RVC_PITCH_SHIFT`,
+  `RVC_INDEX_RATE`, `RVC_WS_URL`, `RVC_KEEPWARM`, `CORS_ORIGINS`, `TWILIO_SIP_USERNAME`,
+  `TWILIO_SIP_PASSWORD`).
+- **`CLAUDE.md`** — dead `.env.example` link (file doesn't exist), stale project-layout tree
+  (missed `rvc_stream.py`, all 6 new TRT-era `modal_deploy/` files), ~3s→1.25s buffer target.
+- **`README.md`** — architecture section described the pre-rebuild VAD-chunked/T4/raw-fallback
+  design; rewritten for the current fail-closed streaming/L4/buffer pipeline. Env reference
+  expanded to match what the code actually reads.
+- **`LATENCY.md`** — top-of-document banner added (doc predates the 2026-07-03 buffer
+  reintroduction and the 2026-07-07 TRT merge); the removed `_JITTER_TARGET_BYTES` table row
+  replaced with the current standing buffer; all T4→L4; region-mismatch section flipped from
+  "still pending" to "resolved 2026-07-03"; inference row updated with actual C3 TRT benchmark
+  numbers (median 66ms).
+- **`.agents/context/subsystem-notes.md`** / **`stack-and-rules.md`** — buffer 3s→1.25s,
+  GPU tier T4→L4, file map expanded with TRT-era files.
+- **Wiki pages** — `adaptive-playout-buffer.md` (1.25s is now current, not "pending"),
+  `audio-pipeline-latency-budget.md` (full rewrite: VAD/T4/raw-fallback table replaced with
+  current streaming/TRT/L4/buffer rows), `rvc-cold-start.md` (re-framed as historical — the
+  2000ms-budget/raw-fallback mechanism it describes no longer exists), `readme-latency-budget-
+  contradiction.md` (marked resolved — the mechanism itself is gone, not just the number),
+  `index.md` (TRT status, buffer iteration count, concept-page blurbs).
+
+**Not touched**: `wiki/pages/sources/*` (those are point-in-time ingestion mirrors—see the
+source-page updates below for the re-ingest that followed this audit) and the already-tracked
+backlog items (stale `TWILIO_AUTH_TOKEN`, untracked `RVC/` cleanup, `_DEBUG_SAVE_RAW_AUDIO`)
+which are legitimately open work, not stale docs.
+
 ## [2026-07-07] ingest | TensorRT migration merged to main
 
 Updated [tensorrt-migration](pages/issues/tensorrt-migration.md) status: `trt-migration`

@@ -1,7 +1,7 @@
 ---
 title: TensorRT migration (RMVPE re-enable + phased latency plan)
 type: issue
-status: open
+status: merged-pending-verification
 sources: [decisions-log, subsystem-notes, active-backlog]
 updated: 2026-07-07
 ---

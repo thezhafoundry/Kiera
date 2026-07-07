@@ -5,26 +5,26 @@ wiki. This index is the first stop for any query — find the page here, then dr
 
 ## Concepts (evergreen explanations)
 - [audio-pipeline-latency-budget](pages/concepts/audio-pipeline-latency-budget.md) — full
-  mouth-to-ear latency breakdown, stage by stage. **Partly stale** (2026-07-02 pre-rebuild
-  numbers) — as of 2026-07-03 latency is explicitly not a product priority, see
-  [[part-by-part-audio-investigation]].
+  mouth-to-ear latency breakdown, stage by stage. Updated 2026-07-07 for the streaming
+  rebuild + TRT migration (was stale on VAD/T4/raw-fallback claims before that).
 - [adaptive-playout-buffer](pages/concepts/adaptive-playout-buffer.md) — the current
-  (2026-07-03) standing playout buffer: bounded target/cap, drop-oldest overflow,
-  decoupled producer/consumer. Third distinct design this buffer has had.
+  (2026-07-07, TRT phase 1) standing playout buffer: 1.25s target/5s cap, drop-oldest
+  overflow, decoupled producer/consumer. Fourth distinct design this buffer has had.
 - [buffering-history](pages/concepts/buffering-history.md) — the five-attempt,
   one-revert migration path that led to the current buffer design; check here before
   re-fixing an old bug.
-- [rvc-cold-start](pages/concepts/rvc-cold-start.md) — Modal T4 cold-start behavior
+- [rvc-cold-start](pages/concepts/rvc-cold-start.md) — Modal cold-start behavior
   (measured ~75s, not the assumed 8-30s) and a confirmed production incident where a lead
   heard raw voice for a whole call (historical — raw fallback no longer exists at all
-  post-rebuild). **Note**: the live worker moved from T4 to L4 on 2026-07-03 (see
-  [[voice-identity-mismatch-investigation]]) — cold-start timing may no longer match exactly.
+  post-rebuild). The live worker moved from T4 to **L4** on 2026-07-03.
 
 ## Issues (open/resolved problems)
-- [tensorrt-migration](pages/issues/tensorrt-migration.md) — **open, in progress.** Migrate
-  the Modal worker to 3 static-shape TRT engines on the L4 to re-enable RMVPE pitch tracking;
-  implemented by a different model with review here against `implementation_plan.md`'s gates.
-  Includes the approved phased playout-buffer reduction (1.25s → later 0.25s, benchmark-gated).
+- [tensorrt-migration](pages/issues/tensorrt-migration.md) — **merged to `main` 2026-07-07**
+  (commit `9c1093a`). Migrated the Modal worker to 3 static-shape TRT engines on the L4 to
+  re-enable RMVPE pitch tracking; C3 GPU benchmark passed live (median 66ms/p95 68ms vs.
+  ≤400ms gate). Includes the playout-buffer reduction (~3s → 1.25s, now live). Remaining:
+  C4 (offline A/B WAVs), C5 (listen test), and confirming the live Modal deploy is actually
+  serving TRT (`/api/health` → `"engine": "trt"`).
 - [livekit-sip-trunk-stale](pages/issues/livekit-sip-trunk-stale.md) — **open.** First live
   outbound call after the Modal worker came back up failed to dial (`404 object cannot be
   found`); trunk recreated via `/api/setup`, but the Twilio webhook step 401'd separately and

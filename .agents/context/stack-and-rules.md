@@ -9,7 +9,8 @@
 - **Media/Telephony**: LiveKit Cloud (WebRTC room + SIP), Twilio (Elastic SIP Trunk + PSTN
   phone number). Twilio webhook points at the Render server's `/api/call/inbound`.
 - **Voice conversion**: RVC v2 model served from a serverless **Modal** GPU worker
-  (`modal_deploy/worker.py`, T4, pinned `region="ap-southeast"`), now driven as a persistent
+  (`modal_deploy/worker.py`, **L4** as of 2026-07-03 (was T4), pinned `region="ap-southeast"`,
+  with an optional TensorRT path — see [[subsystem-notes]] TRT section), now driven as a persistent
   streaming session over a `/ws` FastAPI/Modal ASGI endpoint (alongside the pre-existing
   `/health`/`/convert` HTTP endpoints) — MVP is single-tenant (1 concurrent session, a
   module-level busy flag). `RVCStreamingConverter` (`backend/converters/rvc_stream.py`) is the
@@ -66,9 +67,12 @@
 | `backend/converters/dummy.py` | `DummyVoiceConverter` — ring-mod effect, no external API (local test). |
 | `backend/noise/noise_suppressor.py` | `NoiseSuppressor` ABC + WebRTC/RNNoise implementations — pluggability seam #2. |
 | `backend/test_pipeline.py` | Offline pipeline smoke tests, incl. `RVCStreamingConverter` reconnect/backoff/buffer-cap tests. |
-| `modal_deploy/worker.py` | Serverless RVC GPU worker deployed to Modal — serves `/health`, `/convert`, and the persistent `/ws` streaming session endpoint (1-concurrent-session MVP). |
+| `modal_deploy/worker.py` | Serverless RVC GPU worker deployed to Modal — serves `/health`, `/convert`, and the persistent `/ws` streaming session endpoint (1-concurrent-session MVP); routes to the TRT engine path when `USE_TRT=1`. |
+| `modal_deploy/modal_defs.py` | Single source of truth for the Modal `volume`/`image`/`trt_image` definitions (TRT migration). |
+| `modal_deploy/trt_pipeline.py` | `TRTVoicePipeline` — 3-engine (HuBERT/generator/RMVPE) static-shape TensorRT inference wrapper. |
+| `modal_deploy/export_onnx.py` / `modal_deploy/compile_trt.py` | ONNX exporters with parity gates, and TRT engine-cache priming with a fatal ≤400ms benchmark gate. |
 | `modal_deploy/streaming.py` | Pure numpy/stdlib streaming DSP for the `/ws` path: `BlockAccumulator`, `trim_context`, `sola_crossfade`, `block_rms`. No Modal/GPU import — unit-testable standalone. |
-| `modal_deploy/test_streaming.py` | Unit tests for `modal_deploy/streaming.py` (SOLA crossfade, block accumulation) without Modal/GPU. |
+| `modal_deploy/test_streaming.py` / `modal_deploy/test_trt_pipeline.py` | Unit tests for `modal_deploy/streaming.py` and the TRT pipeline, without live Modal/GPU. |
 | `frontend/` | Vanilla HTML/JS/CSS agent dashboard. |
 | `scripts/` | `build_rnnoise.sh`, dataset prep/denoise helpers. |
 | `LATENCY.md` | Latency budget, log-reading guide, live troubleshooting log — read before touching pipeline timing. |

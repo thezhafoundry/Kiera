@@ -2,7 +2,7 @@ services:
   - type: web
     name: keira-backend
     runtime: python
-    region: oregon          # US West — closest to Modal US servers
+    region: singapore       # colocated with the Modal `ap-southeast` GPU worker pin
     plan: free              # free tier (512MB RAM, sleeps after 15min idle)
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
@@ -15,6 +15,18 @@ services:
         sync: false
       - key: RVC_ENDPOINT_URL
         sync: false
+      - key: RVC_API_KEY
+        sync: false
+      - key: RVC_PITCH_SHIFT
+        sync: false         # semitones, e.g. +12 male / 0 female (see agentGender toggle)
+      - key: RVC_INDEX_RATE
+        sync: false         # defaults to 0.9 if unset
+      - key: RVC_WS_URL
+        sync: false         # optional explicit override; derived from RVC_ENDPOINT_URL if unset
+      - key: RVC_KEEPWARM
+        sync: false         # set to "1" at shift start to keep the GPU warm; default off
+      - key: CORS_ORIGINS
+        sync: false         # comma-separated allowed origins; defaults to "*" if unset
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
@@ -25,6 +37,10 @@ services:
         sync: false         # Twilio Elastic SIP Trunk termination URI (e.g. myproject.pstn.twilio.com)
       - key: TWILIO_SIP_TRUNK_ID
         sync: false         # LiveKit outbound trunk ID — populate after running POST /api/setup
+      - key: TWILIO_SIP_USERNAME
+        sync: false         # defaults to "Keira" if unset
+      - key: TWILIO_SIP_PASSWORD
+        sync: false
       - key: SERVER_URL
         sync: false         # public URL of this server (e.g. https://keira-backend.onrender.com)
       - key: MODAL_TOKEN_ID

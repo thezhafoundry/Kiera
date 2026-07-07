@@ -11,9 +11,9 @@ graph TD
     Agent[Agent Browser Mic] -->|WebRTC| LK[LiveKit Room]
     LK -->|16kHz Audio Stream| Worker[Backend Python Bot]
     Worker -->|Denoise| NS[WebRTC Noise Suppressor]
-    NS -->|Accumulated 300ms Chunks| RVC[RVC v2 on Modal T4 GPU]
-    RVC -->|Converted Voice| Worker
-    Worker -->|Publish Converted Track| LK
+    NS -->|Persistent WebSocket, continuous frames| RVC[RVC v2 on Modal L4 GPU]
+    RVC -->|Converted Voice| Buf[Standing Playout Buffer]
+    Buf -->|Publish Converted Track| LK
     LK -->|Twilio SIP Trunk| Twilio[Twilio Voice Gateway]
     Twilio -->|PSTN Phone Call| Lead[Lead Telephone]
 
@@ -24,9 +24,9 @@ graph TD
 ```
 
 - **Browser-to-Phone**: Agents dial leads directly from a clean dark glassmorphism dashboard. Incoming calls dial in from the PSTN, trigger a Twilio webhook, and are routed via SIP into a LiveKit room.
-- **Brand Voice Conversion**: Agent audio is captured at 16kHz, denoised, and sent to a serverless T4 GPU running RVC v2 on Modal. Converted 48kHz audio is returned, framed, and published into the room.
+- **Brand Voice Conversion**: Agent audio is captured at 16kHz, denoised, and streamed continuously over a persistent WebSocket to a serverless L4 GPU running RVC v2 on Modal (optionally accelerated with TensorRT). Converted 48kHz audio is returned, held in a standing playout buffer, and published into the room.
 - **One-Way Conversion**: Voice conversion is applied only to the agent-to-lead stream. The lead-to-agent stream is bridged directly and unmodified so the agent hears the lead's raw voice.
-- **Low-Latency Fail-Safe**: If RVC processing exceeds the budget timeout (5000ms) or fails, the bot falls back to streaming the raw denoised agent voice (resampled to 48kHz) to keep the call smooth.
+- **Fail-Closed, Never Raw**: There is no raw-voice fallback — it was removed structurally. If the GPU connection drops or errors, the bot publishes silence until real converted audio resumes; the lead never hears the agent's unconverted voice. A standing playout buffer (~1.25s target/5s cap) absorbs GPU blocks that run slower than real-time, trading latency for voice continuity, rather than trying to fail over to raw audio. See [CLAUDE.md](CLAUDE.md) and [LATENCY.md](LATENCY.md) for the full mechanism.
 
 ---
 
@@ -59,13 +59,27 @@ LIVEKIT_API_SECRET=your_livekit_api_secret
 # RVC Serverless GPU
 RVC_ENDPOINT_URL=https://your-modal-app--rvc-convert.modal.run
 RVC_API_KEY=your_custom_api_key
-RVC_PITCH_SHIFT=0 # Semitones (e.g. +2 to raise pitch, -2 to lower)
+RVC_PITCH_SHIFT=0 # Semitones (e.g. +12 male / 0 female — see the agentGender toggle)
+RVC_INDEX_RATE=0.9 # FAISS-retrieved timbre mix; defaults to 0.9 if unset
+RVC_WS_URL= # optional explicit /ws URL override; derived from RVC_ENDPOINT_URL if unset
+RVC_KEEPWARM=0 # set to 1 at shift start to keep the GPU warm (no redeploy needed)
+
+# CORS (comma-separated; defaults to "*" if unset)
+CORS_ORIGINS=*
 
 # Twilio Telephony Credentials
 TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxx
 TWILIO_AUTH_TOKEN=your_twilio_auth_token
 TWILIO_PHONE_NUMBER=+15550000000
+TWILIO_SIP_URI=your-project.pstn.twilio.com
 TWILIO_SIP_TRUNK_ID=STxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_SIP_USERNAME=Keira # defaults to "Keira" if unset
+TWILIO_SIP_PASSWORD=your_sip_password
+
+# Server / Modal deploy trigger
+SERVER_URL=https://your-deployed-server.example.com
+MODAL_TOKEN_ID=your_modal_token_id
+MODAL_TOKEN_SECRET=your_modal_token_secret
 ```
 
 ---

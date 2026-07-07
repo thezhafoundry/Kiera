@@ -60,7 +60,8 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   convert a 320ms block even after the FAISS caching fix below (a ~1.5-1.8x real-time
   factor), which reliably starved the old design.
 - Replaced with a producer/consumer split: `_run_conversion_stream` only appends converted
-  audio to `self._playout_buffer` (bounded, `_PLAYOUT_BUFFER_TARGET_BYTES` ~3s /
+  audio to `self._playout_buffer` (bounded, `_PLAYOUT_BUFFER_TARGET_BYTES` 1.25s as of the
+  TRT migration phase 1 (down from an original 3s target — see [[log]]) /
   `_PLAYOUT_BUFFER_MAX_BYTES` ~5s cap, drop-oldest on overflow — same policy as
   `RVCStreamingConverter`'s reconnect buffer, `backend/converters/rvc_stream.py`,
   `_MAX_BUFFER_BYTES`). A separate `_run_playout_consumer` task drains it into

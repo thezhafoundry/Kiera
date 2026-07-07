@@ -56,11 +56,17 @@ backend/
   pipeline.py                 VoiceConversionWorker — the LiveKit bot audio loop.
   converters/
     base.py                   VoiceConverter ABC.
-    rvc.py                    RVCVoiceConverter — HTTP to the Modal RVC endpoint.
+    rvc.py                    RVCVoiceConverter — HTTP to the Modal RVC endpoint (offline-test-only).
+    rvc_stream.py             RVCStreamingConverter — persistent WS client to the Modal /ws
+                              endpoint; what _do_start_bot actually selects in production.
     dummy.py                  DummyVoiceConverter — ring-mod effect, no API needed (local test).
   noise/noise_suppressor.py   NoiseSuppressor ABC + WebRTCNoiseSuppressor / RNNoiseSuppressor.
   test_pipeline.py            Offline pipeline smoke tests.
-modal_deploy/                 Serverless RVC GPU worker (worker.py) deployed to Modal.
+modal_deploy/                 Serverless RVC GPU worker deployed to Modal: worker.py (the
+                              /health, /convert, /ws endpoints), modal_defs.py (single source
+                              for volume/image/trt_image), streaming.py (block/SOLA DSP),
+                              trt_pipeline.py (TensorRT engine wrapper), export_onnx.py /
+                              compile_trt.py (ONNX export + TRT engine compilation).
 frontend/                     Vanilla HTML/JS/CSS agent dashboard (served by FastAPI at /).
 scripts/                      build_rnnoise.sh, dataset prep/denoise helpers.
 ```
@@ -145,7 +151,9 @@ this from the running server if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set.
 - **Standing playout buffer (reintroduced 2026-07-03).** The original rebuild's one-shot ~100ms
   jitter fill only smoothed the *start* of a call and starved on any slow block. It's since been
   replaced by a producer/consumer split: `_run_conversion_stream` appends converted audio to a
-  bounded `self._playout_buffer` (~3s target/~5s cap, drop-oldest on overflow), and a separate
+  bounded `self._playout_buffer` (1.25s target/5s cap as of the TRT migration phase 1, down
+  from an earlier 3s target — see `.agents/context/subsystem-notes.md`; drop-oldest on
+  overflow), and a separate
   `_run_playout_consumer` task drains it into `_publish_frames` at a steady pace — a slow RVC
   block now grows delay instead of producing "part by part" audio. This reflects a deliberate
   2026-07-03 product decision that call latency is not a priority, voice continuity is — see
@@ -180,9 +188,11 @@ this from the running server if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set.
   RVC `/health` to warm the GPU (call it at shift start to hide cold-start latency).
 
 ### Environment
-Config is read from `.env` (see [.env.example](.env.example)): `LIVEKIT_*`, `RVC_ENDPOINT_URL`,
-`RVC_API_KEY`, `RVC_PITCH_SHIFT`, `TWILIO_*`, `SERVER_URL`. Never commit `.env` or model files
-(`.pth`/`.index`/`.wav`) — they are gitignored.
+Config is read from `.env` (no `.env.example` is checked in — see
+[README.md §3](README.md#3-environment-variables-reference) for the reference list):
+`LIVEKIT_*`, `RVC_ENDPOINT_URL`, `RVC_API_KEY`, `RVC_PITCH_SHIFT`, `RVC_INDEX_RATE`,
+`RVC_WS_URL`, `RVC_KEEPWARM`, `CORS_ORIGINS`, `TWILIO_*`, `SERVER_URL`. Never commit `.env` or
+model files (`.pth`/`.index`/`.wav`) — they are gitignored.
 
 ### Code Style
 - **Python**: PEP 8, type hints where useful. Never block the event loop — offload CPU/network

@@ -1,10 +1,17 @@
 ---
 title: README states a stale 5000ms fail-safe budget
 type: issue
-status: open
+status: resolved
 sources: [readme-md, latency-md]
-updated: 2026-07-02
+updated: 2026-07-07
 ---
+
+**Resolved 2026-07-07**: the fail-safe/budget concept itself is gone from the code, not just
+the number. The 2026-07-02 streaming rebuild deleted the raw-voice-fallback path structurally
+(see CLAUDE.md "Fail-CLOSED, never raw") — there is no timeout budget left to state correctly.
+README.md's architecture section was rewritten to describe the current fail-closed
+(silence-on-failure + standing playout buffer) design instead of picking a number for a
+mechanism that no longer exists. Original write-up preserved below as historical record.
 
 Found during the first wiki lint pass (bootstrap ingest, 2026-07-02): [[readme-md]]
 states the RVC fail-safe timeout budget as **"5000ms"**; [[latency-md]] and the
