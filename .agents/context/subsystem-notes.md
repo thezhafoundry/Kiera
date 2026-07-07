@@ -159,7 +159,23 @@ Engine build + warmup (cold cache): **22.1s** (one-time cost, then cached on vol
 | max | 68 | — |
 
 All three sessions confirmed on TensorrtExecutionProvider (hubert FP16, generator FP32, rmvpe FP16).
-**21× real-time** — gate PASSED. C4 (A/B WAVs) and C5 (listen test) pending.
+**21× real-time** — gate PASSED. Phase 1 complete.
+
+### Phase 2 D benchmark results (2026-07-07, NVIDIA L4, ap-southeast)
+Block geometry: 720ms audio in (BLOCK_MS=320 + CONTEXT_MS=400 = CANONICAL_IN=11520 samples), 48kHz out.
+Engine build + warmup (cold cache, after stale purge): **327.7s** (one-time cost).
+
+| Metric | Phase 1 (1000ms block) | Phase 2 (320ms block) | Δ |
+|---|---|---|---|
+| min | 65ms | 53ms | −18% |
+| **median** | **66ms** | **54ms** | **−18%** ✅ |
+| p95 | 68ms | 55ms | −19% |
+| max | 68ms | 55ms | |
+| Real-time ratio | 21× | 13× | still >3× gate |
+
+All 3 sessions on TensorrtExecutionProvider. Gate PASSED (54ms ≤ 400ms).
+Merged to main (`b9df41f`). `modal deploy` required to go live on worker.
+
 
 ### Shims committed to trt-migration branch
 - `attentions_onnx.py`: `torch.clamp(int, min=int)` → `max(int, int)` — `.size()` dims are Python

@@ -142,7 +142,7 @@ def build_engines():
     times_sorted = sorted(times)
     print(f"[TRT] warm convert_block ms: min={min(times):.0f} "
           f"median={times_sorted[5]:.0f} p95={times_sorted[9]:.0f} max={max(times):.0f} "
-          f"(block=1400ms audio, target median<=400ms)")
+          f"(block={tp.CANONICAL_IN // 16}ms audio @ 16kHz, target median<=400ms)")
     assert len(out) == 3 * tp.CANONICAL_IN, f"output length contract violated: {len(out)}"
 
     volume.commit()
