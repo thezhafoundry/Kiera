@@ -20,21 +20,18 @@ import numpy as np
 SAMPLE_RATE_IN = 16000          # agent mic / inference input rate
 SAMPLE_RATE_OUT = 48000         # RVC / published track rate (3x input)
 
-# Latency is not a product priority for this app (2026-07-03 decision) --
-# voice QUALITY is. Bigger blocks give HuBERT/pitch tracking more context per
-# inference call and cut the SOLA crossfade seam rate (crossfade is a fixed
-# 80ms per block, so a 1000ms block has ~3x fewer seams per second of audio
-# than the old 320ms one). The added per-block delay is absorbed by the
-# playout buffer in backend/pipeline.py, not exposed to the lead as latency
-# they can't tolerate -- it's exposed as buffered delay instead.
+# TRT Phase 2 (2026-07-07): block shrunk 1000ms→320ms to reduce mouth-to-ear latency
+# now that TRT median is 66ms (21× real-time) and the playout buffer gate has passed.
+# SOLA crossfade stays at 80ms (25% overhead per block at 320ms — up from 8% at 1000ms;
+# watch for time-compression artefacts in C5 listen test).
 # NOTE: BLOCK_MS + CONTEXT_MS must equal trt_pipeline.CANONICAL_IN / SAMPLE_RATE_IN * 1000
-# (currently 1000+400=1400ms = 22400 samples) -- changing either without updating the
+# (now 320+400=720ms = 11520 samples) -- changing either without updating the
 # TRT static shapes requires re-exporting all three ONNX models.
-BLOCK_MS = 1000               # new audio processed per inference block
-CONTEXT_MS = 400              # prior input prepended as left context
+BLOCK_MS = 320               # new audio processed per inference block (was 1000)
+CONTEXT_MS = 400              # prior input prepended as left context (unchanged)
 
-BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000        # 16000
-CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000    # 6400
+BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000        # 5120  (was 16000)
+CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000    # 6400  (unchanged)
 
 SOLA_CROSSFADE_SAMPLES = SAMPLE_RATE_OUT * 80 // 1000       # 3840 (80 ms @ 48 kHz)
 SOLA_SEARCH_SAMPLES = SAMPLE_RATE_OUT * 10 // 1000          # 480  (10 ms @ 48 kHz)

@@ -21,21 +21,23 @@ except ImportError:   # inside container
 app = modal.App("rvc-onnx-export")
 
 # ---- Canonical static shapes (single source of truth; trt_pipeline.py mirrors these) ----
+# TRT Phase 2 (2026-07-07): BLOCK_MS 1000→320, CANONICAL_IN 22400→11520.
+# TRT_T_PAD stays at 16000 (x_pad=1 = 1s reflect pad, RVC convention, independent of block size).
 SR_IN = 16000
-CANONICAL_IN = 22400          # 1400 ms: BLOCK_MS=1000 + CONTEXT_MS=400
-TRT_T_PAD = 16000             # fixed reflect pad each side (x_pad=1 equivalent)
-PADDED_IN = CANONICAL_IN + 2 * TRT_T_PAD   # 54400
-HUBERT_FRAMES = 169           # 169 (HuBERT convolutional boundary reduces 54400 // 320 = 170 to 169)
-GEN_FRAMES = HUBERT_FRAMES * 2             # 338 (post 2x interpolation)
+CANONICAL_IN = 11520          # 720 ms: BLOCK_MS=320 + CONTEXT_MS=400  (was 22400)
+TRT_T_PAD = 16000             # fixed reflect pad each side (x_pad=1 equivalent, unchanged)
+PADDED_IN = CANONICAL_IN + 2 * TRT_T_PAD   # 43520  (was 54400)
+HUBERT_FRAMES = 135           # 135 (HuBERT convolutional boundary reduces 43520 // 320 = 136 to 135)
+GEN_FRAMES = HUBERT_FRAMES * 2             # 270 (post 2x interpolation)  (was 338)
 SR_OUT = 48000
-OUT_PADDED_48K = GEN_FRAMES * 480          # 162240
-T_PAD_TGT = TRT_T_PAD * 3                  # 48000
-OUT_48K = OUT_PADDED_48K - 2 * T_PAD_TGT   # 66240 (Perfectly fine, the padding handles alignment)
+OUT_PADDED_48K = GEN_FRAMES * 480          # 129600  (was 162240)
+T_PAD_TGT = TRT_T_PAD * 3                  # 48000   (unchanged)
+OUT_48K = OUT_PADDED_48K - 2 * T_PAD_TGT   # 33600   (was 66240)
 
-# RMVPE mel geometry for PADDED_IN samples: hop 160, center=True -> 341 frames,
-# then RMVPE.mel2hidden zero-pads frame count to a multiple of 32 -> 352.
-MEL_FRAMES = PADDED_IN // 160 + 1          # 341
-MEL_FRAMES_PADDED = ((MEL_FRAMES + 31) // 32) * 32   # 352
+# RMVPE mel geometry for PADDED_IN samples: hop 160, center=True -> 273 frames,
+# then RMVPE.mel2hidden zero-pads frame count to a multiple of 32 -> 288.
+MEL_FRAMES = PADDED_IN // 160 + 1          # 273   (was 341)
+MEL_FRAMES_PADDED = ((MEL_FRAMES + 31) // 32) * 32   # 288   (was 352)
 
 ONNX_DIR = "/root/rvc-models/onnx"
 OPSET = 17

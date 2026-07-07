@@ -1,4 +1,4 @@
-﻿"""Local unit tests for trt_pipeline's pure-NumPy helpers. No GPU, no Modal.
+"""Local unit tests for trt_pipeline's pure-NumPy helpers. No GPU, no Modal.
 Run: python -m pytest modal_deploy/test_trt_pipeline.py -v
 """
 import numpy as np
@@ -21,10 +21,16 @@ def test_pad_to_canonical_full_block():
 
 
 def test_pad_to_canonical_short_first_block():
-    pcm = np.ones(16000, dtype=np.int16)
+    # Simulate the first-of-session block: only BLOCK_SAMPLES_IN samples arrive
+    # (no context yet). Use the constant so the test stays valid at any block size.
+    try:
+        from modal_deploy import streaming as st
+    except ImportError:
+        import streaming as st
+    pcm = np.ones(st.BLOCK_SAMPLES_IN, dtype=np.int16)
     audio, zpad = tp.pad_to_canonical(pcm)
     assert audio.shape == (tp.PADDED_IN,)
-    assert zpad == tp.CANONICAL_IN - 16000        # 6400
+    assert zpad == tp.CANONICAL_IN - st.BLOCK_SAMPLES_IN   # 6400 (context gap)
     head = audio[tp.TRT_T_PAD: tp.TRT_T_PAD + zpad]
     assert np.allclose(head, 0.0)
 
