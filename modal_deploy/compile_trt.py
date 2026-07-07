@@ -108,6 +108,21 @@ def build_engines():
     cache_dir = "/root/rvc-models/trt_cache"
     os.makedirs(cache_dir, exist_ok=True)
 
+    # Purge stale engine files before building. TRT caches are keyed by ONNX
+    # filename (not content hash), so a shape change (e.g. CANONICAL_IN change)
+    # leaves old engines that match the filename but not the input dimensions,
+    # causing a "Static dimension mismatch" RuntimeException on first inference.
+    stale = glob.glob(os.path.join(cache_dir, "*.engine"))
+    stale += glob.glob(os.path.join(cache_dir, "*.profile"))
+    stale += glob.glob(os.path.join(cache_dir, "*.timing"))
+    if stale:
+        print(f"[TRT] Purging {len(stale)} stale engine/profile/timing files from {cache_dir}")
+        for f in stale:
+            os.remove(f)
+            print(f"[TRT]   removed {os.path.basename(f)}")
+    else:
+        print(f"[TRT] Cache dir is clean (no stale files).")
+
     print(f"[TRT] Building TRT engine caches at {cache_dir}...")
     t0 = time.perf_counter()
     pipe = tp.TRTVoicePipeline("/root/rvc-models/onnx", cache_dir, index, big_npy, mel)
