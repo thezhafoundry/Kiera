@@ -6,14 +6,26 @@ sources: [decisions-log, subsystem-notes, active-backlog]
 updated: 2026-07-07
 ---
 
-**Status as of 2026-07-07: merged to `main`** (merge commit `9c1093a`). All round-3
-hardening findings landed as real commits, including the previously-uncommitted vendored
-ONNX-export shims (`4bdbe5f`, `cd7749c`). The C3 GPU benchmark passed on a live L4
-(median 66ms / p95 68ms vs. the ≤400ms gate, 2026-07-06 ap-southeast run). Remaining
-before full close-out: C4 (offline A/B WAVs) and C5 (listen test for the deterministic-
-noise shim's breathiness tradeoff), plus confirming the live Modal deploy is actually
-serving the TRT path (`/api/health` → `"engine": "trt"`) rather than assuming it from
-committed code alone.
+**Status as of 2026-07-07: merged to `main` (`9c1093a`) and already past Phase 1 into
+Phase 2 the same day.** All round-3 hardening findings landed as real commits, including
+the previously-uncommitted vendored ONNX-export shims (`4bdbe5f`, `cd7749c`). The C3 GPU
+benchmark passed on a live L4 (median 66ms / p95 68ms vs. the ≤400ms gate, 2026-07-06
+ap-southeast run).
+
+**Same-day Phase 2** (`38fbef5`/`b9df41f`/`7164b85`): block size cut 1000ms→320ms, playout
+buffer 1.25s→0.25s, new benchmark 54ms median/55ms p95. The 2026-07-05 decision explicitly
+gated Phase 2 on "~a week" of live Phase-1 soak time — there's no evidence that happened
+before Phase 2 shipped, worth a conscious decision either way (see decisions-log). Also
+same day, `d463c41` found and fixed a real regression: the original shim zeroed `SineGen`'s
+unvoiced-frame noise, causing audible hissing/garbled consonants; fixed by generating real
+noise outside the ONNX graph and passing it in as a model input instead (see
+subsystem-notes) — this needs its own fresh listen-test pass since it changes generator
+output.
+
+Remaining before full close-out: C4 (offline A/B WAVs, still unchecked in
+`TRT_ROLLOUT_STEPS.md`), a fresh C5 listen test against the noise-fix specifically, and
+confirming the live Modal deploy is actually serving the TRT path (`/api/health` →
+`"engine": "trt"`) rather than assuming it from committed code alone.
 
 ## Review arc (2026-07-05 → 2026-07-06)
 

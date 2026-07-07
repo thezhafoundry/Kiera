@@ -270,3 +270,30 @@ shims (`4bdbe5f`, `cd7749c`), and the passed C3 GPU benchmark (median 66ms/p95 6
 listen test for the deterministic-noise shim's breathiness tradeoff) and confirming the
 live Modal deploy actually serves TRT (`/api/health` → `"engine": "trt"`) rather than
 inferring it from committed code — see [[active-backlog]], [[subsystem-notes]].
+
+## 2026-07-07 (later) — Phase 2 (320ms block / 0.25s buffer) shipped same-day, ahead of its own gate
+
+`38fbef5` shrank `BLOCK_MS` 1000→320 and the playout buffer 1.25s→0.25s, with
+`b9df41f` fixing a stale-TRT-engine-cache bug found in the process (cache keyed by
+filename, not shape hash — a `BLOCK_MS` change left old engines that failed with a
+"Static dimension mismatch" until the cache files were purged before rebuild). `7164b85`
+recorded the new benchmark: 54ms median / 55ms p95 (down from Phase 1's 66/68ms), gate
+still passed (≤400ms) with real-time ratio down from 21× to 13×.
+
+**Flagging a process deviation, not blocking it retroactively**: the 2026-07-05 decision
+log entry gated Phase 2 on "live TRT p95 ≤ 400ms sustained over ~a week" of Phase 1 running
+in production. Phase 2 shipped ~1 day after the Phase 1 merge, and there's no evidence in
+this repo of a live (as opposed to offline-benchmark) soak period happening in between —
+worth confirming with the user whether that gate was consciously waived or just skipped.
+
+Same day, `d463c41` found and fixed a real audio-quality regression from the original
+TRT shim: zeroing `SineGen`'s unvoiced-frame noise (see [[subsystem-notes]]) made unvoiced
+segments fully silent, causing audible hissing/garbled consonants. Fixed by generating real
+`N(0,1)` noise outside the ONNX graph (numpy RNG in `trt_pipeline.py`) and passing it in as
+a model input — this is now the reference pattern for any future TRT-incompatible random
+op, and worth a fresh C5-style listen-test pass since it changes the generator's audio
+output.
+
+Remaining open, same as before: C4 (offline A/B WAVs) and a fresh C5 listen test against
+this fix specifically, plus confirming the live Modal deploy actually serves TRT — see
+[[active-backlog]].

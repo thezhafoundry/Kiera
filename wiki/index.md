@@ -19,12 +19,14 @@ wiki. This index is the first stop for any query — find the page here, then dr
   post-rebuild). The live worker moved from T4 to **L4** on 2026-07-03.
 
 ## Issues (open/resolved problems)
-- [tensorrt-migration](pages/issues/tensorrt-migration.md) — **merged to `main` 2026-07-07**
-  (commit `9c1093a`). Migrated the Modal worker to 3 static-shape TRT engines on the L4 to
-  re-enable RMVPE pitch tracking; C3 GPU benchmark passed live (median 66ms/p95 68ms vs.
-  ≤400ms gate). Includes the playout-buffer reduction (~3s → 1.25s, now live). Remaining:
-  C4 (offline A/B WAVs), C5 (listen test), and confirming the live Modal deploy is actually
-  serving TRT (`/api/health` → `"engine": "trt"`).
+- [tensorrt-migration](pages/issues/tensorrt-migration.md) — **merged to `main` 2026-07-07,
+  already past Phase 1 into Phase 2 same day.** Migrated the Modal worker to 3 static-shape
+  TRT engines on the L4 to re-enable RMVPE pitch tracking; Phase 1 C3 benchmark 66ms/68ms,
+  Phase 2 (block 320ms, buffer 0.25s) benchmark 54ms/55ms median/p95 — but Phase 2 shipped
+  without the week-long live soak its own gate called for. Same day, found+fixed a real
+  audio bug (zeroed unvoiced-frame noise causing hissing/garbled consonants). Remaining:
+  C4 (offline A/B WAVs), a fresh C5 listen test against the noise fix, and confirming the
+  live Modal deploy is actually serving TRT (`/api/health` → `"engine": "trt"`).
 - [livekit-sip-trunk-stale](pages/issues/livekit-sip-trunk-stale.md) — **open.** First live
   outbound call after the Modal worker came back up failed to dial (`404 object cannot be
   found`); trunk recreated via `/api/setup`, but the Twilio webhook step 401'd separately and

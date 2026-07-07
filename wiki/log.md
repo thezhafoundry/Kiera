@@ -3,6 +3,27 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
+## [2026-07-07] ingest | TRT Phase 2 shipped same-day + unvoiced-noise audio bug found and fixed
+
+After the Phase 1 merge/audit earlier today, the branch moved fast: `38fbef5`/`b9df41f`/
+`7164b85` shipped Phase 2 (block 1000ms→320ms, playout buffer 1.25s→0.25s, benchmark
+54ms median/55ms p95 — down from Phase 1's 66/68ms). Flagged in
+[tensorrt-migration](pages/issues/tensorrt-migration.md) and the backlog: the 2026-07-05
+decision gated Phase 2 on "~a week" of live Phase-1 soak time, and there's no evidence that
+happened before Phase 2 shipped — a process deviation worth a conscious call, not something
+to silently wave through.
+
+Same day, `d463c41` found and fixed a real regression from the original TRT shim: zeroing
+`SineGen`'s unvoiced-frame noise (to dodge TRT Myelin's ONNX-RandomNormal restriction) made
+unvoiced segments fully silent, causing audible hissing/garbled consonants — caught by ear,
+not by the automated gates. Fixed by generating real `N(0,1)` noise outside the ONNX graph
+and passing it in as a model input (same externalize-as-input pattern the generator's `rnd`
+reparam already used), rather than zeroing it. Updated
+`.agents/context/subsystem-notes.md`, `.agents/decisions/log.md`,
+`.agents/projects/active-backlog.md`, and this page + `index.md` accordingly. Still open:
+C4 (offline A/B WAVs), a fresh C5 listen test against this specific fix, and confirming the
+live Modal deploy actually serves TRT.
+
 ## [2026-07-07] audit | Full stale-data sweep — 11 files corrected, wiki re-ingested
 
 Systematic audit of the entire codebase for stale docs, config, and notes after the TRT

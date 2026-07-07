@@ -180,22 +180,34 @@ Merged to main (`b9df41f`). `modal deploy` required to go live on worker.
 ### Shims committed to trt-migration branch
 - `attentions_onnx.py`: `torch.clamp(int, min=int)` → `max(int, int)` — `.size()` dims are Python
   ints in PyTorch 2.5 eager mode, `torch.clamp` requires a Tensor first arg.
-- `models_onnx.py` (3 sites): `torch.randn_like`/`torch.rand` → `torch.zeros_like`/`torch.zeros`
-  in `PosteriorEncoder.forward`, `SineGen._f02sine`, `SineGen.forward`. These emitted ONNX
-  `RandomNormal`/`RandomUniform` nodes that TRT Myelin cannot compile
-  (`randomFill.cpp::replaceFillNodesForMyelin` assertion). Effect: deterministic mean-path inference;
-  breath/consonant texture loses stochasticity (Finding 4 — evaluate in C5 listen test).
+- `models_onnx.py` (3 sites, `4bdbe5f`): `torch.randn_like`/`torch.rand` →
+  `torch.zeros_like`/`torch.zeros` in `PosteriorEncoder.forward`, `SineGen._f02sine`,
+  `SineGen.forward`. These emitted ONNX `RandomNormal`/`RandomUniform` nodes that TRT Myelin
+  cannot compile (`randomFill.cpp::replaceFillNodesForMyelin` assertion).
+- **Listen-test finding, found and fixed same day (`d463c41`, 2026-07-07): zeroing
+  `SineGen.forward`'s unvoiced-frame noise caused audible hissing/garbled consonants**
+  (unvoiced frames went fully silent instead of noisy). Fixed by externalizing that noise:
+  `sine_noise` is now a real `numpy` `N(0,1)` tensor (shape `[1, OUT_PADDED_48K, 1]`)
+  generated in `trt_pipeline.py` per block and passed in as an ONNX **input** rather than
+  generated inside the graph — same trick already used for the generator's `rnd` reparam
+  input, sidesteps TRT Myelin's RandomNormal restriction without losing the stochasticity.
+  `SineGen._f02sine`'s initial-phase offset (`rand_ini`) is still zeroed/deterministic
+  (lower perceptual impact than the unvoiced-noise bug; not yet revisited).
 
 ### Load-bearing gotchas
 Load-bearing gotchas found during the three review rounds:
 - **TensorRT cannot compile ONNX random ops** (`RandomNormal`/`RandomUniform` from
   `torch.rand`/`randn_like`). The generator's NSF `SineGen` uses both internally, so the
-  tree carries edits to **vendored** `RVC/infer/lib/infer_pack/models_onnx.py`
-  (deterministic linspace phases + sin-hash pseudo-noise) and `attentions_onnx.py`
-  (int-vs-tensor guard). These shims are what make `generator.onnx` TRT-compilable — they
-  are now **committed** (`4bdbe5f`, `cd7749c`) with `.gitignore` negation entries keeping
-  them tracked despite `RVC/` being ignored, so the `RVC/` `git rm -r --cached` cleanup
-  ([[active-backlog]]) is unblocked.
+  tree carries edits to **vendored** `RVC/infer/lib/infer_pack/models_onnx.py` and
+  `attentions_onnx.py` (int-vs-tensor guard). These shims are what make `generator.onnx`
+  TRT-compilable — they are **committed** (`4bdbe5f`, `cd7749c`, `d463c41`) with `.gitignore`
+  negation entries keeping them tracked despite `RVC/` being ignored, so the `RVC/`
+  `git rm -r --cached` cleanup ([[active-backlog]]) is unblocked. **Zeroing an internal
+  random op and externalizing it as an ONNX input are not equivalent fixes** — the first
+  attempt zeroed SineGen's unvoiced-frame noise outright (silent unvoiced frames → audible
+  hissing/garbled consonants, caught by ear the same day); the working fix generates real
+  `N(0,1)` noise outside the graph and feeds it in as a model input instead. Any future
+  TRT-incompatible random op should default to the externalize-as-input pattern, not zero.
 - **TRT Myelin FP16 compiler bug on the generator**: `trt_fp16_enable` is deliberately
   `False` for the generator session (fp16 stays on for hubert/rmvpe) — see
   `trt_pipeline.py`'s provider options. Don't "optimize" it back to fp16 without re-testing;
