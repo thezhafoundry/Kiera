@@ -427,7 +427,20 @@ async function publishAgentMicrophone(room, roomName) {
         ]);
         console.log(`[LiveKit] Selective subscription set: Only ${botIdentity} can subscribe to agent raw track`);
 
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Capture RAW mic audio: the browser's default noiseSuppression and
+        // autoGainControl aggressively strip the high-frequency detail (sibilance,
+        // consonants) and flatten the dynamics that the RVC model needs to produce a
+        // clear, on-identity brand voice — measured 2026-07-08 as a major cause of the
+        // "muffled" output. echoCancellation stays ON so the lead's voice coming out of
+        // the agent's speakers isn't picked up and echoed back; if the agent wears
+        // headphones it can be disabled too for maximum fidelity.
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                noiseSuppression: false,
+                autoGainControl: false,
+                echoCancellation: true,
+            },
+        });
         const audioStreamTrack = stream.getAudioTracks()[0];
         localAudioTrack = await room.localParticipant.publishTrack(audioStreamTrack, {
             name: "microphone",

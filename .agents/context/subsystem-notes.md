@@ -309,6 +309,28 @@ lookup when it's unset). See
 (Twilio-webhook-config step of the same `/api/setup` run 401'd separately — see [[active-backlog]]
 — and the actual retried call hasn't been confirmed successful yet).
 
+## Twilio media edge pinning (2026-07-08)
+- **The plain `{trunk}.pstn.twilio.com` termination domain does NOT geo-route** — it resolves
+  to Twilio US1/Virginia (`54.172.60.x`). With LiveKit/Render in Singapore this put a
+  transpacific hop in every call's RTP path. Confirmed consequence via the 2026-07-08 10:16 UTC
+  call analysis: 5 dropouts of 0.18–0.40s of *loud* speech (~1.4s total in 68s) present in
+  Twilio's own recording with flat out→Twilio delay — i.e. packet loss upstream of Twilio on
+  the LiveKit→Twilio leg, not playout underrun (that would step the delay up) and not the
+  lead's mobile network.
+- Fixed 2026-07-08: LiveKit outbound trunk `ST_BMamqedncjzb` address updated **in place**
+  (`update_outbound_trunk_fields`, ID unchanged) to
+  `thezhafoundrykeira.pstn.singapore.twilio.com` (`54.169.127.x`, AWS ap-southeast-1); local
+  `.env` and Render env `TWILIO_SIP_URI` updated to match; Twilio origination URL updated to
+  `sip:3iv76uh14ps.sip.livekit.cloud;edge=singapore` (inbound direction).
+- **Drift trap**: `/api/setup` (main.py) recreates the origination URL **without** the
+  `;edge=` parameter — the outbound side survives a setup re-run (it reads `TWILIO_SIP_URI`),
+  the inbound pin does not, until main.py is patched to append the edge param.
+- Not yet field-verified: needs one post-fix demo call re-analyzed (compare dropout count
+  against the 5-dropout baseline).
+- Render service also got `PYTHONUNBUFFERED=1` (2026-07-08) — python prints were previously
+  block-buffered, flushing a whole call's log lines at once under a single timestamp, which
+  made log-timing forensics impossible.
+
 ## Offline diagnostic tooling (`modal_deploy/worker.py`, added 2026-07-03)
 Built while investigating "converted voice doesn't match the trained voice on live calls" —
 these are lasting tools, not throwaway debug code:

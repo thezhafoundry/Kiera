@@ -61,6 +61,20 @@ RVC_PITCH_SHIFT = int(os.getenv("RVC_PITCH_SHIFT", "0"))
 # confirmed as the cause, but it's cheap/reversible to test). Env var, not another
 # code deploy, so it can be re-tuned from Render without touching code again.
 RVC_INDEX_RATE = float(os.getenv("RVC_INDEX_RATE", "0.9"))
+# Semitone shift applied for a "male" agent so their voice lands in the trained
+# model's pitch range. The old fixed +12 doubles a ~137Hz male fundamental to
+# ~274Hz — ~5 semitones ABOVE the mi-test model's ~208Hz center (measured
+# 2026-07-08: +12 output F0 271Hz vs 208Hz good reference), which pushes RVC
+# outside its trained range and produces a wrong-identity, muffled voice. Per-agent
+# F0 differs, so this is env-tunable (default keeps the legacy +12); set to 7-8 for
+# a ~137Hz agent. A "female" agent stays at 0.
+RVC_MALE_PITCH_SHIFT = int(os.getenv("RVC_MALE_PITCH_SHIFT", "12"))
+# WebRTC noise-suppression aggressiveness [0..4]. Level 3 was gutting high-frequency
+# voice detail (sibilance/consonants HuBERT needs) BEFORE the model saw it —
+# measured 2026-07-08: live input centroid 413Hz vs 720Hz clean, -9dB at 6-8kHz —
+# the dominant cause of the "muffled" converted output. Env-tunable so it can be
+# lowered without a code change; default keeps the legacy Level 3.
+NS_LEVEL = int(os.getenv("NS_LEVEL", "3"))
 
 # Twilio Configuration
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -351,7 +365,7 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
     # the client, so a single call could even change identity mid-call. The UI
     # gender toggle is the ground truth the agent already knows about themselves,
     # so drive pitch_shift from it directly instead of trusting a live guess.
-    pitch_shift = 12 if agent_gender.lower() == "male" else 0
+    pitch_shift = RVC_MALE_PITCH_SHIFT if agent_gender.lower() == "male" else 0
     print(f"[Server] Agent gender: {agent_gender} → pitch_shift={pitch_shift}")
 
     if RVC_ENDPOINT_URL:
@@ -367,8 +381,10 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
         print("[Server] No RVC endpoint config found. Spawning Dummy Pitch Modulation Engine.")
         converter = DummyVoiceConverter()
 
-    # Initialize noise suppression (WebRTC)
-    suppressor = WebRTCNoiseSuppressor(ns_level=3)
+    # Initialize noise suppression (WebRTC). Level via NS_LEVEL env — lowering it
+    # preserves the high-frequency voice detail the RVC model needs for a clear,
+    # on-identity conversion (see NS_LEVEL definition above).
+    suppressor = WebRTCNoiseSuppressor(ns_level=NS_LEVEL)
 
     worker = VoiceConversionWorker(
         room_url=LIVEKIT_URL,

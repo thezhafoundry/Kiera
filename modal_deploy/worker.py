@@ -745,7 +745,14 @@ def _load_wav_as_pcm16_mono(audio_bytes: bytes):
     timeout=10800,
     volumes={"/root/rvc-models": volume},
 )
-def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, use_trt: int = 0) -> bytes:
+def convert_file_chunked(
+    audio_bytes: bytes,
+    pitch: int = -1,
+    use_trt: int = 0,
+    index_rate: float = 0.75,
+    rms_mix_rate: float = 0.75,
+    protect: float = 0.33,
+) -> bytes:
     """
     Diagnostic: runs the SAME block-accumulate + SOLA-crossfade pipeline the live
     /ws handler uses, driven by a static WAV file. Isolates whether the live call
@@ -786,7 +793,13 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, use_trt: int = 0) 
             out = np.zeros(len(block) * 3 + st.SOLA_CROSSFADE_SAMPLES, dtype=np.int16)
         else:
             t0 = time.perf_counter()
-            out_bytes = test_engine.convert_block(infer_input, pitch=pitch)
+            out_bytes = test_engine.convert_block(
+                infer_input,
+                pitch=pitch,
+                index_rate=index_rate,
+                rms_mix_rate=rms_mix_rate,
+                protect=protect,
+            )
             infer_ms = (time.perf_counter() - t0) * 1000
             print(f"[Timing] convert_block: {infer_ms:.1f}ms ({test_engine.engine_kind})")
             out = np.frombuffer(out_bytes, dtype=np.int16)
@@ -806,12 +819,19 @@ def convert_file_chunked(audio_bytes: bytes, pitch: int = -1, use_trt: int = 0) 
 
 
 @app.local_entrypoint()
-def main_chunked(pitch: int = -1, use_trt: int = 0):
+def main_chunked(
+    pitch: int = -1,
+    use_trt: int = 0,
+    input_file: str = r"D:\Kiera\male_test.wav",
+    output_file: str = "",
+    index_rate: float = 0.75,
+    rms_mix_rate: float = 0.75,
+    protect: float = 0.33,
+):
     import struct
 
-    input_file = r"D:\Kiera\test1.wav"
-
-    print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch} | use_trt={use_trt}")
+    print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch} | use_trt={use_trt} "
+          f"| index_rate={index_rate} rms_mix_rate={rms_mix_rate} protect={protect}")
     print("[Chunked Test] Simulates the live /ws block-accumulate + SOLA-crossfade")
     print("[Chunked Test] pipeline on a static file -- compare the output against")
     print("[Chunked Test] test11.wav (convert_file's single-pass output) on the")
@@ -820,7 +840,14 @@ def main_chunked(pitch: int = -1, use_trt: int = 0):
     with open(input_file, "rb") as f:
         audio_bytes = f.read()
 
-    output_pcm = convert_file_chunked.remote(audio_bytes, pitch=pitch, use_trt=use_trt)
+    output_pcm = convert_file_chunked.remote(
+        audio_bytes,
+        pitch=pitch,
+        use_trt=use_trt,
+        index_rate=index_rate,
+        rms_mix_rate=rms_mix_rate,
+        protect=protect,
+    )
 
     sample_rate = 48000
     num_channels = 1
@@ -845,7 +872,7 @@ def main_chunked(pitch: int = -1, use_trt: int = 0):
     header[40:44] = struct.pack('<I', data_size)
 
     import os
-    output_path = r"D:\Kiera\test11_chunked.wav"
+    output_path = output_file or r"D:\Kiera\test11_chunked.wav"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     base, ext = os.path.splitext(output_path)
     counter = 1
