@@ -894,10 +894,8 @@ def main_chunked(
 
 
 @app.local_entrypoint()
-def main(pitch: int = -1):
+def main(pitch: int = -1, input_file: str = r"D:\Kiera\test1.wav", output_file: str = ""):
     import struct
-
-    input_file =r"D:\Kiera\test1.wav"
 
     print(f"[Test] Input: {input_file} | pitch_shift={pitch} (Note: -1 means auto-detect)")
 
@@ -929,7 +927,7 @@ def main(pitch: int = -1):
     header[40:44] = struct.pack('<I', data_size)
 
     import os
-    output_path = r"D:\Kiera\test11.wav"
+    output_path = output_file or r"D:\Kiera\test11.wav"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     base, ext = os.path.splitext(output_path)
     counter = 1
