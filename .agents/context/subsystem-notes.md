@@ -74,6 +74,16 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   exactly what `_run_audio_pipeline` already does before handing frames to the noise
   suppressor. Tripped up a first draft of the playout-buffer tests in
   `backend/test_pipeline.py` (a byte-count assertion silently checked half the real total).
+- **Presence EQ sits between the converter and the playout buffer (added 2026-07-07).**
+  `_run_conversion_stream` passes every converted chunk through
+  `backend/audio_eq.py::PresenceEQ` (+4dB, 1.2–3.4kHz, `PRESENCE_EQ_GAIN_DB` env, 0
+  disables) before `self._playout_buffer.extend(...)` — so if you're comparing the
+  published spectrum against raw Modal `/ws` output and see a ~4dB midrange bump, that's
+  this, not the converter. It's a numpy-only linear-phase FIR whose (taps−1)-sample input
+  tail makes chunked processing byte-identical to single-pass; when writing tests that
+  drive `_run_conversion_stream` with a fake converter, remember the generator must stay
+  alive (e.g. trailing `await asyncio.sleep(...)`) or the `finally:` block cancels the
+  playout consumer before anything is published.
 
 ## Modal RVC GPU worker (`modal_deploy/worker.py`)
 - Cold start is much slower than the code comments assume: measured live at ~75s with

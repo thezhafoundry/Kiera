@@ -63,6 +63,7 @@ RVC_PITCH_SHIFT=0 # Semitones (e.g. +12 male / 0 female — see the agentGender 
 RVC_INDEX_RATE=0.9 # FAISS-retrieved timbre mix; defaults to 0.9 if unset
 RVC_WS_URL= # optional explicit /ws URL override; derived from RVC_ENDPOINT_URL if unset
 RVC_KEEPWARM=0 # set to 1 at shift start to keep the GPU warm (no redeploy needed)
+PRESENCE_EQ_GAIN_DB=4 # dB boost on 1.2-3.4kHz before publish (PSTN clarity); 0 disables
 
 # CORS (comma-separated; defaults to "*" if unset)
 CORS_ORIGINS=*

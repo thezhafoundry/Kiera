@@ -695,6 +695,113 @@ async def test_playout_buffer_drops_oldest_over_cap():
     print("Standing playout buffer cap/drop-oldest test: SUCCESS")
 
 
+async def test_presence_eq():
+    print("\n--- Testing Presence EQ ---")
+    from backend.audio_eq import PresenceEQ
+
+    sr = 48000
+    dur = 1.0
+    t = np.arange(int(sr * dur)) / sr
+
+    def band_gain_db(freq: float) -> float:
+        """Feed a pure tone through a fresh EQ and measure steady-state gain."""
+        eq = PresenceEQ(gain_db=4.0, sample_rate=sr)
+        tone = (np.sin(2 * np.pi * freq * t) * 8000).astype(np.int16)
+        out = np.frombuffer(eq.process(tone.tobytes()), dtype=np.int16)
+        assert len(out) == len(tone), f"length changed: {len(tone)} -> {len(out)}"
+        # skip the filter's warm-up tail at the start
+        skip = 2000
+        in_rms = np.sqrt(np.mean(tone[skip:].astype(np.float64) ** 2))
+        out_rms = np.sqrt(np.mean(out[skip:].astype(np.float64) ** 2))
+        return 20 * np.log10(out_rms / in_rms)
+
+    g_low = band_gain_db(300.0)
+    g_mid = band_gain_db(2200.0)
+    print(f"gain @300Hz: {g_low:+.2f} dB, gain @2.2kHz: {g_mid:+.2f} dB")
+    assert abs(g_low) < 1.0, f"300Hz band should pass ~unchanged, got {g_low:+.2f} dB"
+    assert abs(g_mid - 4.0) < 1.0, f"2.2kHz band should gain ~+4 dB, got {g_mid:+.2f} dB"
+
+    # Streaming continuity: processing in arbitrary chunk sizes must produce
+    # byte-identical output to a single pass — no clicks at chunk boundaries.
+    rng = np.random.default_rng(7)
+    signal = (rng.standard_normal(sr) * 4000).clip(-32768, 32767).astype(np.int16)
+    single = PresenceEQ(gain_db=4.0, sample_rate=sr).process(signal.tobytes())
+    eq = PresenceEQ(gain_db=4.0, sample_rate=sr)
+    chunks, pos = [], 0
+    while pos < len(signal):
+        n = int(rng.integers(1, 4000))
+        chunks.append(eq.process(signal[pos:pos + n].tobytes()))
+        pos += n
+    chunked = b"".join(chunks)
+    assert chunked == single, "chunked output differs from single-pass — boundary discontinuity"
+
+    # Loud input must not wrap around when boosted — it must clip safely.
+    loud = np.full(sr // 10, 30000, dtype=np.int16)
+    out = np.frombuffer(PresenceEQ(gain_db=4.0, sample_rate=sr).process(loud.tobytes()), dtype=np.int16)
+    assert out.max() <= 32767 and out.min() >= -32768
+    print("Presence EQ Test: SUCCESS")
+
+
+async def test_worker_applies_presence_eq():
+    print("\n--- Testing worker applies Presence EQ to converted output ---")
+    import os
+    from backend.audio_eq import PresenceEQ
+
+    t = np.arange(9600) / 48000.0  # 200ms @ 48kHz
+    tone_bytes = (np.sin(2 * np.pi * 2200 * t) * 8000).astype(np.int16).tobytes()
+
+    class _OneChunkConverter:
+        async def convert_stream(self, in_audio):
+            yield tone_bytes
+            # Keep the duplex stream open (like a real call) so
+            # _run_conversion_stream doesn't tear down the playout consumer
+            # before it has drained the buffer; the test cancels us.
+            await asyncio.sleep(30)
+
+    async def run_worker_once() -> bytes:
+        worker = VoiceConversionWorker(
+            room_url="ws://unused",
+            token="unused",
+            converter=_OneChunkConverter(),
+            suppressor=WebRTCNoiseSuppressor(ns_level=3),
+        )
+        published = []
+
+        async def fake_publish_frames(payload):
+            published.append(bytes(payload))
+
+        worker._publish_frames = fake_publish_frames
+        worker._PLAYOUT_BUFFER_TARGET_BYTES = 1000  # publish promptly in test
+        task = asyncio.create_task(worker._run_conversion_stream())
+        try:
+            deadline = time.monotonic() + 3.0
+            while sum(len(p) for p in published) < len(tone_bytes) and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        return b"".join(published)
+
+    # Default: EQ on, output must match PresenceEQ with the default gain.
+    os.environ.pop("PRESENCE_EQ_GAIN_DB", None)
+    got = await run_worker_once()
+    expected = PresenceEQ(gain_db=4.0, sample_rate=48000).process(tone_bytes)
+    assert got == expected, "worker output should be the presence-EQ'd converted audio"
+    assert got != tone_bytes, "EQ'd output should differ from the raw converted audio"
+    print("Default: converted audio is presence-EQ'd before publish: OK")
+
+    # PRESENCE_EQ_GAIN_DB=0 disables the EQ: bytes pass through untouched.
+    os.environ["PRESENCE_EQ_GAIN_DB"] = "0"
+    try:
+        got = await run_worker_once()
+        assert got == tone_bytes, "gain 0 must bypass the EQ entirely"
+    finally:
+        os.environ.pop("PRESENCE_EQ_GAIN_DB", None)
+    print("PRESENCE_EQ_GAIN_DB=0 bypasses the EQ: OK")
+    print("Worker Presence EQ Wiring Test: SUCCESS")
+
+
 async def main():
     print("Running automated pipeline verification tests...")
     await test_noise_suppressor()
@@ -707,6 +814,8 @@ async def main():
     await test_worker_readiness_probe_dedup()
     await test_playout_buffer_smooths_bursty_converter_output()
     await test_playout_buffer_drops_oldest_over_cap()
+    await test_presence_eq()
+    await test_worker_applies_presence_eq()
     print("\nAll automated verification tests completed successfully!")
 
 if __name__ == "__main__":

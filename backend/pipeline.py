@@ -2,11 +2,13 @@ import asyncio
 import collections
 import contextlib
 import json
+import os
 import time
 import traceback
 from typing import AsyncIterator, Optional
 from livekit import rtc
 
+from .audio_eq import PresenceEQ
 from .converters.base import VoiceConverter
 from .noise.noise_suppressor import NoiseSuppressor
 
@@ -74,6 +76,14 @@ class VoiceConversionWorker:
         self.room = rtc.Room()
         self.audio_source: Optional[rtc.AudioSource] = None
         self.published_track: Optional[rtc.LocalAudioTrack] = None
+
+        # Presence EQ on the converted output: the PSTN leg caps the call at
+        # ~3.4kHz, so intelligibility hinges on the 1.2-3.4kHz band — boost it
+        # slightly before publish. PRESENCE_EQ_GAIN_DB=0 disables (see audio_eq.py).
+        eq_gain_db = float(os.getenv("PRESENCE_EQ_GAIN_DB", "4"))
+        self._presence_eq: Optional[PresenceEQ] = (
+            PresenceEQ(gain_db=eq_gain_db) if eq_gain_db != 0 else None
+        )
 
         self.running = False
         self._pipeline_task: Optional[asyncio.Task] = None
@@ -460,6 +470,9 @@ class VoiceConversionWorker:
 
                     if not converted_chunk:
                         continue
+
+                    if self._presence_eq is not None:
+                        converted_chunk = self._presence_eq.process(converted_chunk)
 
                     async with self._playout_buffer_lock:
                         self._playout_buffer.extend(converted_chunk)

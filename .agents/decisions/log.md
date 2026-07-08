@@ -297,3 +297,25 @@ output.
 Remaining open, same as before: C4 (offline A/B WAVs) and a fresh C5 listen test against
 this fix specifically, plus confirming the live Modal deploy actually serves TRT — see
 [[active-backlog]].
+
+## 2026-07-07 (evening) — Presence EQ on converted output for PSTN clarity
+
+A live-call recording (WhatsApp/Android capture in `voices/`) prompted a clarity
+investigation. Signal analysis cleared the pipeline itself: TRT streaming output
+(`test11_chunked_4.wav`) is spectrally identical to the pre-TRT baseline out to 6kHz,
+and the publish path adds no coloration. The real ceilings are (a) the G.711 PSTN leg
+(hard ~3.4kHz cap — physics, not fixable) and (b) that specific recording chain
+(~8kbps/ch AAC Android call recorder, which destroyed everything above ~800Hz and is
+NOT representative of what the lead hears).
+
+Decision: boost the one band we control that PSTN actually carries — new
+`PresenceEQ` in `backend/audio_eq.py` (+4dB, 1.2–3.4kHz, linear-phase FIR,
+frequency-sampling design, numpy-only since scipy isn't a dep) applied in
+`_run_conversion_stream` before the playout buffer. Streaming state (taps−1 input
+tail) makes chunked output byte-identical to single-pass — no boundary clicks.
+Env `PRESENCE_EQ_GAIN_DB` (default 4, 0 disables). Group delay ~1.3ms, negligible.
+
+Deliberately NOT done without asking: Twilio server-side call recording (the decisive
+instrument for measuring what the lead actually hears within the 3.4kHz band) — it's
+an infra/billing mutation; user chose the EQ first. If clarity complaints persist
+after the EQ, that recording test is the next diagnostic step.
