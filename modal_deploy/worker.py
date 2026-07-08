@@ -415,6 +415,32 @@ _session_active = False
 _session_lock = asyncio.Lock()   # guards the _session_active check-and-set
 _gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-tenant
 
+# ---- Per-call audio debug capture ----
+# Saves each /ws session's input (16 kHz post-denoise PCM, as received) and output
+# (48 kHz post-SOLA PCM, exactly what was sent back — the backend applies PresenceEQ
+# *after* this point, so expect a ~4dB 1.2-3.4kHz difference vs what gets published)
+# to the volume's debug/ dir for offline clarity analysis against the Twilio call
+# recording. Bounded per side; disable with DEBUG_SAVE_AUDIO=0 and redeploy.
+_DEBUG_SAVE_AUDIO = os.environ.get("DEBUG_SAVE_AUDIO", "1") == "1"
+_DEBUG_MAX_SECONDS = 120
+
+
+def _save_debug_wavs(in_pcm16k: bytes, out_pcm48k: bytes) -> None:
+    import wave
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    os.makedirs("/root/rvc-models/debug", exist_ok=True)
+    for tag, rate, data in (("in16k", 16000, in_pcm16k), ("out48k", 48000, out_pcm48k)):
+        if not data:
+            continue
+        path = f"/root/rvc-models/debug/call_{ts}_{tag}.wav"
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(data)
+        print(f"[Debug] saved {path} ({len(data)} bytes)")
+    volume.commit()
+
 
 @app.function(
     image=trt_image,   # includes ORT + TRT stack; required for USE_TRT to work at runtime
@@ -521,6 +547,10 @@ def fastapi_app():
                 return
             _session_active = True
 
+        # Bounded per-session capture, written out in the finally below.
+        dbg_in = bytearray() if _DEBUG_SAVE_AUDIO else None
+        dbg_out = bytearray() if _DEBUG_SAVE_AUDIO else None
+
         try:
             # ---- Handshake: first message is the config JSON ----
             first = await ws.receive()
@@ -564,6 +594,8 @@ def fastapi_app():
                     continue
                 if len(payload) % 2:
                     payload = payload[:len(payload) - 1]  # keep int16 alignment
+                if dbg_in is not None and len(dbg_in) < 16000 * 2 * _DEBUG_MAX_SECONDS:
+                    dbg_in.extend(payload)
                 acc.push(np.frombuffer(payload, dtype=np.int16))
 
                 # Drain every complete 1000 ms block currently buffered.
@@ -621,7 +653,10 @@ def fastapi_app():
 
                     emit, pending_tail = st.sola_crossfade(pending_tail, out)
                     if len(emit):
-                        await ws.send_bytes(emit.tobytes())
+                        emit_bytes = emit.tobytes()
+                        await ws.send_bytes(emit_bytes)
+                        if dbg_out is not None and len(dbg_out) < 48000 * 2 * _DEBUG_MAX_SECONDS:
+                            dbg_out.extend(emit_bytes)
                     await ws.send_json({
                         "type": "stats",
                         "infer_ms": round(infer_ms, 2),
@@ -639,6 +674,13 @@ def fastapi_app():
         finally:
             async with _session_lock:
                 _session_active = False
+            if dbg_in is not None:
+                try:
+                    await asyncio.to_thread(
+                        _save_debug_wavs, bytes(dbg_in), bytes(dbg_out)
+                    )
+                except Exception:
+                    traceback.print_exc()
 
     return web_app
 

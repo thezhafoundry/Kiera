@@ -325,12 +325,17 @@ these are lasting tools, not throwaway debug code:
   gotcha above). If you test a file that opens with a stretch of silence, prefer an explicit
   `--pitch` over `-1` — `_auto_detect_pitch` has no silence check on its 1-second analysis
   window and will produce an effectively random result on near-zero-amplitude input.
-- **`_DEBUG_SAVE_RAW_AUDIO`** (module-level flag, currently `True` in the deployed worker):
-  saves the first 30s of real pre-conversion PCM per live call to
-  `/root/rvc-models/debug/raw_call_audio_<timestamp>.wav` on the persistent volume — download
-  with `modal volume get rvc-models debug/<filename> <local-path>`. **Temporary** — flip back
-  to `False` and redeploy once the current voice-identity investigation concludes; not meant
-  to run indefinitely (per-call overhead, volume storage). See [[active-backlog]].
+- **`_DEBUG_SAVE_AUDIO` per-call in/out WAV capture (added 2026-07-08; replaces
+  `_DEBUG_SAVE_RAW_AUDIO`, which the TRT migration silently dropped)**: each `/ws` session
+  saves up to 120s of its input (16 kHz post-denoise, `call_<ts>_in16k.wav`) **and** its
+  converted output (48 kHz post-SOLA, **pre-PresenceEQ** — the backend EQs after this point)
+  to `/root/rvc-models/debug/` when the session closes — download with
+  `modal volume get rvc-models debug/<filename> <local-path>`. Default ON; disable with
+  `DEBUG_SAVE_AUDIO=0` + redeploy. Same "temporary while investigating" caveat as its
+  predecessor (per-call overhead, volume storage). Pairs with the Twilio trunk recording
+  (`record-from-answer-dual`, enabled 2026-07-08 on trunk `TK8958...da94`) for 3-point
+  clarity isolation on outbound demo calls: raw input → converted output → what the lead
+  actually heard (post-PSTN). See [[active-backlog]].
 
 ## GPU tier: a committed code change isn't a deployed one (2026-07-03)
 `fastapi_app`'s `gpu=` was changed from `"T4"` to `"L4"` in a commit that landed on `main`,
