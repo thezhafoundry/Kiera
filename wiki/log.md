@@ -3,6 +3,40 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
+## [2026-07-08] ingest | Voice identity + clarity root-caused and fixed; SIP-leg packet loss fixed; call-analysis instrumentation
+
+The long-open [voice-identity-mismatch-investigation](pages/issues/voice-identity-mismatch-investigation.md)
+is **resolved**. Built a 3-point call-capture rig — Twilio dual-channel trunk recording
+(`record-from-answer-dual`), per-call Modal in/out debug WAVs (`_DEBUG_SAVE_AUDIO` in
+`worker.py`, replacing the TRT-dropped `_DEBUG_SAVE_RAW_AUDIO`), and now-legible Render logs
+(`PYTHONUNBUFFERED=1`) — and measured the actual audio at each stage. Two independent causes,
+both upstream of the model, both env-gated fixes (`f748a89`):
+
+- **Pitch overshoot**: hardcoded `+12` for "male" doubled the user's ~137Hz voice to ~274Hz,
+  ~5 semitones above the model's ~208Hz center (measured output F0 271Hz vs 208Hz good
+  reference) → wrong identity. Now `RVC_MALE_PITCH_SHIFT` env (live 7).
+- **Double noise-suppression**: browser `getUserMedia` defaults + server WebRTC NS Level 3
+  stripped HF detail (input centroid 413Hz vs 720Hz clean, −9dB at 6-8kHz) → muffle. Now raw
+  browser capture + `NS_LEVEL` env (live 1).
+
+Notably the 2026-07-03 investigation had marked pitch "ruled out" (it confirmed `pitch=12` was
+*applied*, mistaking that for *correct*) and input-quality "ruled out" (checked levels, not
+spectrum) — both false negatives because every offline test used a female-range clip that
+auto-detected to 0 shift and never exercised the +12 male path. Lesson recorded in
+[[subsystem-notes]]: reproduce a live-only bug with the *actual captured live input at the
+actual live pitch*, not a clean reference clip.
+
+Separately filed and resolved [sip-leg-packet-loss-edge-pinning](pages/issues/sip-leg-packet-loss-edge-pinning.md):
+the same capture rig showed 5 dropouts of loud speech in Twilio's own recording with flat
+GPU→Twilio delay ⇒ RTP loss on the LiveKit→Twilio leg. Root cause: `{trunk}.pstn.twilio.com`
+resolves to Twilio US, a transpacific hop from Singapore. Re-pointed the trunk to the
+Singapore edge (+ `;edge=singapore` origination URL); post-fix call dropped 5→1.
+
+Updated `.agents/decisions/log.md`, `.agents/context/subsystem-notes.md`,
+`.agents/projects/active-backlog.md`, both issue pages, and `index.md`. Open: one live
+verification call for the identity/clarity fix, the `/api/setup` edge-param drift trap, and
+turning the debug tap off once verified.
+
 ## [2026-07-07] ingest | TRT Phase 2 shipped same-day + unvoiced-noise audio bug found and fixed
 
 After the Phase 1 merge/audit earlier today, the branch moved fast: `38fbef5`/`b9df41f`/

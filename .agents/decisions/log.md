@@ -319,3 +319,53 @@ Deliberately NOT done without asking: Twilio server-side call recording (the dec
 instrument for measuring what the lead actually hears within the 3.4kHz band) — it's
 an infra/billing mutation; user chose the EQ first. If clarity complaints persist
 after the EQ, that recording test is the next diagnostic step.
+
+## 2026-07-08 — Voice identity + clarity root-caused and fixed; call-analysis instrumentation
+
+Ran the recording test flagged as "next diagnostic step" in the 2026-07-07 EQ entry.
+Built a **3-point call capture** to measure what the lead actually hears vs each pipeline
+stage: (1) Twilio trunk dual-channel recording (`record-from-answer-dual` on trunk
+`TK8958…da94`), (2) per-call Modal in/out debug WAVs (`_DEBUG_SAVE_AUDIO` in `worker.py`,
+saving 16kHz post-denoise input + 48kHz post-SOLA output to the volume `debug/` dir —
+replaces the TRT-migration-dropped `_DEBUG_SAVE_RAW_AUDIO`), (3) Render logs
+(now legible after adding `PYTHONUNBUFFERED=1` — prints were block-buffered under one
+timestamp). See [[subsystem-notes]] for the analysis method.
+
+**Finding 1 — SIP-leg packet loss (fixed).** 2026-07-08 baseline call: pipeline itself
+clean (no clipping/underruns), but 5 dropouts of 0.18–0.40s of *loud* speech (~1.4s/68s)
+in Twilio's own recording with flat GPU→Twilio delay ⇒ RTP loss on the LiveKit→Twilio leg,
+not playout underrun, not the lead's mobile net. Root cause: the plain
+`{trunk}.pstn.twilio.com` termination domain does NOT geo-route — resolves to Twilio
+US/Virginia, a transpacific hop from Singapore LiveKit/Render. Fixed by re-pointing the
+LiveKit outbound trunk `ST_BMamqedncjzb` (in place, ID unchanged) to
+`…pstn.singapore.twilio.com`, matching `.env`/Render `TWILIO_SIP_URI`, and adding
+`;edge=singapore` to the Twilio origination URL (inbound). Post-fix call: 1 dropout.
+
+**Finding 2 — voice never matched the trained voice + muffled (fixed).** Confirmed present
+since the start on BOTH TRT and pre-TRT engines (reproduced offline from git `326098e`), so
+NOT the TRT migration. Two independent causes:
+- **Identity = pitch overshoot.** Hardcoded `pitch_shift = 12 if male else 0` doubled the
+  user's ~137Hz fundamental to ~274Hz — ~5 semitones ABOVE the mi-test model's ~208Hz
+  center (measured output F0: +12 → 271Hz vs 208Hz on the good offline reference). RVC
+  driven outside its trained range → wrong identity. Correct shift for a ~137Hz agent is
+  **+7** (→~205Hz). The 2026-07-07 offline test only sounded right because its clean input
+  auto-detected female→0 shift.
+- **Muffle = double noise-suppression.** Agent voice was NS'd twice pre-model: browser
+  `getUserMedia({audio:true})` defaults (noiseSuppression + autoGainControl) THEN server
+  `WebRTCNoiseSuppressor(ns_level=3)`, stripping the HF detail HuBERT needs (live input
+  centroid 413Hz vs 720Hz clean, −9dB at 6-8kHz; propagates to −3dB presence in the output).
+
+Fix (commit `f748a89`, both env-gated with legacy defaults so revertible from Render with
+no code change): `RVC_MALE_PITCH_SHIFT` env drives the male shift (default 12, Render set
+**7**); `NS_LEVEL` env drives server suppression (default 3, Render set **1**); frontend
+`app.js` captures raw mic (noiseSuppression/autoGainControl OFF, echoCancellation kept ON
+for speaker-echo safety). Also enabled Twilio recording (billing/consent — user-approved).
+
+**Deliberately gated on user approval** (per [[feedback_production_actions]]): every live
+mutation here (Twilio recording, trunk edge re-point, Render env changes, `git push`
+auto-deploy, Modal `worker.py` redeploy for the debug tap) was confirmed with the user first.
+
+Still open: one post-fix verification call (expect input centroid → ~720Hz, output F0 →
+~205Hz); if it's clear + on-pitch but still not an exact match, the remaining gap is model/
+index training quality or the 16kHz HuBERT ingress ceiling, not these knobs. PSTN ~3.4kHz
+still caps what the lead hears regardless. See [[active-backlog]].

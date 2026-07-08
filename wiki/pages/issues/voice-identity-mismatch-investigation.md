@@ -1,9 +1,9 @@
 ---
-title: Converted voice doesn't match the trained voice (live calls only) — ongoing
+title: Converted voice doesn't match the trained voice (live calls only) — RESOLVED 2026-07-08
 type: issue
-status: open
+status: resolved
 sources: [decisions-log, subsystem-notes, active-backlog]
-updated: 2026-07-03
+updated: 2026-07-08
 ---
 
 Distinct from [[part-by-part-audio-investigation]] (choppiness/latency) and
@@ -11,6 +11,54 @@ Distinct from [[part-by-part-audio-investigation]] (choppiness/latency) and
 **timbre/identity**: on live calls, the converted voice doesn't sound like the trained
 "Keira" voice, even with those two other issues fixed. First reported as "sounds like a
 generic/different voice" — clean audio, no glitches, just not identity-matched.
+
+## RESOLUTION (2026-07-08) — two independent causes, both upstream of the model
+
+Root-caused with a 3-point call capture (Twilio dual-channel recording + per-call Modal
+in/out debug WAVs + Render logs — see [[subsystem-notes]] "Call-analysis 3-point capture")
+plus offline pitch/param sweeps and an F0/spectrum measurement of the actual outputs. Fixed
+in commit `f748a89`, both env-gated with legacy defaults so revertible from Render.
+
+1. **Pitch overshoot (identity).** The hardcoded `pitch_shift = 12 if male else 0` doubled
+   the user's ~137Hz fundamental to ~274Hz — **~5 semitones ABOVE** the mi-test model's
+   ~208Hz center (measured output F0: +12 → **271Hz** live / 274Hz pre-TRT vs **208Hz** on
+   the good reference). Feeding RVC audio outside its trained pitch range produces a
+   wrong-identity voice, not merely a pitch error. Correct shift for a ~137Hz agent is **+7**
+   (→~205Hz). Now `RVC_MALE_PITCH_SHIFT` env (default 12, live 7).
+2. **Double noise-suppression (muffle/"blabbering").** The agent voice was noise-suppressed
+   twice before the model: browser `getUserMedia({audio:true})` defaults (noiseSuppression +
+   autoGainControl) THEN server `WebRTCNoiseSuppressor(ns_level=3)`. Measured: live input
+   spectral centroid **413Hz vs 720Hz** clean, **−9dB at 6-8kHz** — gutting the HF detail
+   HuBERT needs. Now: frontend `app.js` captures raw (NS/AGC off, echoCancellation kept);
+   server level via `NS_LEVEL` env (default 3, live 1).
+
+### Why the 2026-07-03 investigation below ruled these out (and how it was misled)
+
+The earlier five-hypothesis sweep was rigorous but two rule-outs were **false negatives**,
+for the same underlying reason — **every offline test used `test1.wav`, which is
+female-pitched and auto-detects to a 0-semitone shift**, so it never once exercised the
++12 male path where the overshoot lives:
+- *Hypothesis 1 (pitch)* was "ruled out" because logs confirmed `pitch_shift=12` was being
+  *applied* — but 12 being applied correctly is exactly the bug; the value itself was wrong
+  for this agent. "Confirmed applied" was mistaken for "confirmed correct."
+- *Hypothesis 5 (raw input quality)* was "effectively ruled out" from levels/noise-floor
+  looking normal — but the damage was **spectral** (HF rolloff from browser processing),
+  which a level/noise-floor check doesn't reveal, and the offline chunked test fed the model
+  a *clean* file, never the browser-processed live capture. It was actually half the problem.
+
+Lesson (now in [[subsystem-notes]]): to reproduce a live-only identity bug offline you must
+drive the diagnostic with the **actual captured live input** at the **actual live pitch**,
+not a clean reference clip at its own auto-detected pitch. The per-call Modal debug tap now
+saves exactly that live input for this purpose.
+
+One live verification call is still pending (expect input centroid → ~720Hz, output F0 →
+~205Hz); if it's clear and on-pitch but still not an *exact* match, the remaining gap is
+model/index training quality or the 16kHz HuBERT ingress ceiling — not these knobs. See
+[[active-backlog]].
+
+---
+
+## Historical investigation (2026-07-03, status at the time: open)
 
 ## The key clue: offline sounds right, live doesn't
 

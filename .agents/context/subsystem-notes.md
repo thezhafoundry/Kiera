@@ -390,3 +390,49 @@ diverge for as long as nobody runs `modal deploy`.
   (VAD-based chunking was deleted, not just made optional) — the old "without it, chunking
   falls back to fixed max-length" note no longer applies to anything. It's effectively an
   unused dependency now regardless of platform.
+
+## Voice identity & clarity: pitch range + input-chain fidelity (root-caused 2026-07-08)
+Why live calls never sounded like the trained voice AND were muffled — two *independent*
+knobs, both upstream of the model, both now env-gated (commit `f748a89`). This is the
+authoritative "why"; [[log]] 2026-07-08 has the decision framing.
+- **RVC identity depends on landing the input in the model's trained pitch range.** The
+  mi-test model centers ~208Hz (measured from a known-good output). Feeding audio outside
+  that range produces a *wrong-identity* voice, not just a pitch error (same failure class
+  as the reverted GPU auto-detect, above). The hardcoded `pitch_shift = 12 if male else 0`
+  in `_do_start_bot` doubled the user's ~137Hz fundamental to ~274Hz (~5 semitones too
+  high). Correct shift is **agent-F0-specific** (~137Hz → +7); now `RVC_MALE_PITCH_SHIFT`
+  env (default 12). A future robust fix would target the model's pitch regardless of input
+  F0 (what `pitch=-1` auto-detect *tried* but did unreliably), not a per-agent constant.
+- **Never noise-suppress the agent voice twice.** The input reached the model NS'd twice:
+  browser `getUserMedia({audio:true})` enables noiseSuppression + autoGainControl by
+  default, THEN `WebRTCNoiseSuppressor(ns_level=3)` ran server-side. Both strip the HF
+  detail (sibilance/consonants) HuBERT reads — measured live-input spectral centroid 413Hz
+  vs 720Hz on clean `test1.wav`, −9dB at 6-8kHz, and it propagates to a duller output. Fix:
+  frontend `app.js` now requests raw capture (`noiseSuppression:false`,
+  `autoGainControl:false`, `echoCancellation:true`); server level is `NS_LEVEL` env
+  (default 3, live 1). **Browser caches `app.js`** — the raw-capture change only takes
+  effect after a hard refresh (tell: mic-permission re-prompt).
+- **Diagnostic method (reusable).** Autocorrelation F0 of an output WAV (voiced frames,
+  lag r/60..r/400) checks pitch targeting; per-file speech-frame power spectrum (centroid,
+  85% rolloff, band ratios rel 0.3-1kHz) localizes muffle to input vs model. Offline replay
+  via `modal run worker.py::main_chunked --input-file … --pitch N` (now also takes
+  `--index-rate/--rms-mix-rate/--protect/--output-file`) reproduces the exact live
+  block/SOLA path on a static WAV — isolates engine from network/telephony. The pre-TRT
+  engine can be replayed from git `326098e` (scratch copy, force `import streaming`) to rule
+  the migration in/out.
+
+## Call-analysis 3-point capture (built 2026-07-08)
+To assess any demo call the user supplies only the approximate call time; pull three
+artifacts and diff stage-by-stage:
+1. **Twilio recording** = ground truth of what the lead heard. Trunk `TK8958…da94` has
+   `record-from-answer-dual`. `Calls.json?StartTime>=…` → `Recordings.json?CallSid=…` →
+   `.wav?RequestedChannels=2` (ch0 converted voice, ch1 lead — verify by envelope corr).
+2. **Modal debug WAVs** = `modal volume ls rvc-models debug/` → `call_<ts>_in16k.wav`
+   (post-denoise input) + `call_<ts>_out48k.wav` (post-SOLA, **pre-PresenceEQ** output).
+   `_DEBUG_SAVE_AUDIO` flag in `worker.py`, default ON — **temporary**, disable via
+   `DEBUG_SAVE_AUDIO=0` + redeploy once the identity/clarity work is field-verified.
+3. **Render logs** via Render MCP (`srv-d932m4cvikkc73belt1g`, workspace
+   `tea-d91lambtqb8s7398mfd0`); legible now that `PYTHONUNBUFFERED=1` is set.
+Envelope method: 20ms RMS envelopes; windowed xcorr out48k↔twilio-conv gives delay(t)
+(flat lag ⇒ downstream loss is packet loss; step-ups ⇒ playout underruns); replaying the
+320ms/RMS<150 silence gate over in16k reproduces out48k's zero mask (~97% agreement).

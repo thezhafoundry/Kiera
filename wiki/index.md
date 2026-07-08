@@ -39,10 +39,17 @@ wiki. This index is the first stop for any query — find the page here, then dr
   (`_restrict_sip_audio`) had a wrong protobuf field name and failed silently on 100% of
   calls; fixed and now confirmed succeeding (`✅`) on every call sampled since.
 - [voice-identity-mismatch-investigation](pages/issues/voice-identity-mismatch-investigation.md)
-  — **open.** Converted voice doesn't match the trained voice on live calls (offline tests
-  sound correct). Five hypotheses ruled out with real evidence (pitch, `index_rate`,
-  chunking+SOLA, noise suppression, raw input quality); new reusable diagnostic tooling
-  (`convert_file_chunked`/`main_chunked`) built along the way.
+  — **RESOLVED 2026-07-08** (one live verification call pending). Two independent causes, both
+  upstream of the model: `+12` male pitch shift overshot the model's ~208Hz range (→274Hz;
+  now `RVC_MALE_PITCH_SHIFT=7`), and double noise-suppression (browser + server L3) stripped
+  HF detail (→ raw browser capture + `NS_LEVEL=1`). The 2026-07-03 "ruled out pitch/input"
+  conclusions were false negatives — every offline test used a female clip that never hit the
+  +12 male path. Fixed `f748a89`.
+- [sip-leg-packet-loss-edge-pinning](pages/issues/sip-leg-packet-loss-edge-pinning.md) —
+  **RESOLVED 2026-07-08** (field-verify pending). Lead heard clipped words: RTP loss on the
+  LiveKit→Twilio leg because `{trunk}.pstn.twilio.com` resolves to Twilio US, a transpacific
+  hop from Singapore. Re-pointed the trunk to the Singapore edge; dropouts 5→1 on the next
+  call. Open drift trap: `/api/setup` drops the inbound `;edge=singapore` pin.
 - [part-by-part-audio-investigation](pages/issues/part-by-part-audio-investigation.md) —
   **resolved 2026-07-03** (buffer fix not yet live-call-verified). Four distinct root
   causes found via production logs: Modal container fan-out, unreliable pitch

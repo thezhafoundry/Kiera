@@ -61,6 +61,15 @@ RVC_PITCH_SHIFT = int(os.getenv("RVC_PITCH_SHIFT", "0"))
 # confirmed as the cause, but it's cheap/reversible to test). Env var, not another
 # code deploy, so it can be re-tuned from Render without touching code again.
 RVC_INDEX_RATE = float(os.getenv("RVC_INDEX_RATE", "0.9"))
+# Loudness-contour blend: 1.0 = model's own (near-constant) loudness, 0.0 = follow the
+# agent's delivery. The 0.75 server default flattens speech dynamics (measured 2026-07-08:
+# input modulation depth 0.99 → output 0.62), which reads as mushy/"blabbering"; 0.25
+# recovered it to 0.80 with identity/pitch unchanged. Env-tunable; default keeps the
+# server's legacy 0.75.
+RVC_RMS_MIX_RATE = float(os.getenv("RVC_RMS_MIX_RATE", "0.75"))
+# Voiceless-consonant protection (lower = stronger protection, 0.5 disables). 0.2 keeps
+# t/s/k crisper through conversion; server legacy default is 0.33.
+RVC_PROTECT = float(os.getenv("RVC_PROTECT", "0.33"))
 # Semitone shift applied for a "male" agent so their voice lands in the trained
 # model's pitch range. The old fixed +12 doubles a ~137Hz male fundamental to
 # ~274Hz — ~5 semitones ABOVE the mi-test model's ~208Hz center (measured
@@ -375,6 +384,8 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
             api_key=RVC_API_KEY,
             pitch_shift=pitch_shift,
             index_rate=RVC_INDEX_RATE,
+            rms_mix_rate=RVC_RMS_MIX_RATE,
+            protect=RVC_PROTECT,
             connect_timeout=150.0,  # allow full Modal cold-start window (~60-90s)
         )
     else:
