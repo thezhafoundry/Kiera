@@ -598,7 +598,7 @@ def fastapi_app():
                     dbg_in.extend(payload)
                 acc.push(np.frombuffer(payload, dtype=np.int16))
 
-                # Drain every complete 1000 ms block currently buffered.
+                # Drain every complete hop (st.BLOCK_MS of new audio) currently buffered.
                 while True:
                     popped = acc.pop_block()
                     if popped is None:

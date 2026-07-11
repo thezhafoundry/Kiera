@@ -38,12 +38,12 @@ class VoiceConversionWorker:
     # (_run_playout_consumer). This absorbs the case where one inference block
     # takes longer than its real-time budget by growing the lead's delay instead
     # of producing a silence gap.
-    # Phase 2 of the TRT latency plan (2026-07-07): 0.25s target now that
-    # BLOCK_MS=320 and TRT median is 66ms (21x real-time, p95=68ms). Converted
-    # audio arrives in ~320ms bursts; the 0.25s cushion absorbs jitter without
-    # adding a full extra block interval of mouth-to-ear delay.
-    # (Phase 1 was 1.25s, required at BLOCK_MS=1000 to absorb one full block interval.)
-    _PLAYOUT_BUFFER_TARGET_BYTES = int(48000 * 2 * 0.25)
+    # Hop-streaming (2026-07-11): 0.10s target now that BLOCK_MS=160 and live
+    # TRT compute is ~51ms/hop (32% duty). Converted audio arrives in ~160ms
+    # hops; the cushion only needs to absorb hop-to-hop jitter, not a whole
+    # block interval. (History: 3s → 1.25s → 0.25s → 0.10s; see
+    # .agents/decisions/log.md and the hop-streaming plan.)
+    _PLAYOUT_BUFFER_TARGET_BYTES = int(48000 * 2 * 0.10)
 
     # Cap: beyond this, drop the OLDEST buffered audio rather than let delay
     # grow unbounded. 5.0s is an overflow safety cap, not a latency target.
