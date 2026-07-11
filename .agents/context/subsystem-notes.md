@@ -85,6 +85,20 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   alive (e.g. trailing `await asyncio.sleep(...)`) or the `finally:` block cancels the
   playout consumer before anything is published.
 
+### Hop streaming (2026-07-11)
+The 2026-07-03 "latency isn't a priority" decision was reversed on 2026-07-11: latency is
+now the active focus. BLOCK_MS 320→160 ("hop") with CONTEXT_MS 400→560 — the TRT input
+window stays 720ms/11520 samples, so **the TRT engines did not change and no ONNX
+re-export was needed** (this is the whole trick; `test_trt_pipeline.py::
+test_hop_window_matches_trt_static_shape` guards the invariant). SOLA crossfade halved to
+40ms (same 25% overlap ratio per hop), playout cushion 0.25s→0.10s. Seam rate doubled to
+6.25/s — gated by an offline `main_chunked` listen A/B before deploy. Per-emitted-sample
+left context actually GREW (560ms vs 400ms), so per-hop conversion quality should be equal
+or better; the risk is purely seam density. GPU duty 16%→32% (51ms per 160ms hop),
+single-tenant L4 unaffected. Live per-stage numbers (2026-07-11, from `[Worker]
+[LatencySummary]`): hubert 2.6ms / index 13.7ms / rmvpe 9.0ms / generator 24.0ms /
+postproc 1.5ms ≈ 51ms total, lock_wait ~0.
+
 ## Modal RVC GPU worker (`modal_deploy/worker.py`)
 - Cold start is much slower than the code comments assume: measured live at ~75s with
   no `/health` response at all before `{"status":"ready"}` (see LATENCY.md §4.1), not the
