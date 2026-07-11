@@ -13,49 +13,10 @@ let agentIdentity = `agent-${Math.floor(1000 + Math.random() * 9000)}`;
 let localAudioTrack = null;
 let wsConn = null;
 
-// Mock Leads Array for MVP
-const LEADS = [
-    { id: 1, name: "Alice Smith", phone: "+916281686616", company: "Acme Corp" },
-    { id: 2, name: "Bob Johnson", phone: "+919626811099", company: "Globex" },
-    { id: 3, name: "Charlie Brown", phone: "+919629419551", company: "Initech" },
-    { id: 4, name: "Diana Prince", phone: "+15557778888", company: "Wayne Ent" }
-];
-
 document.addEventListener('DOMContentLoaded', () => {
-    renderLeads();
     setupEventListeners();
     initWebSocket();
 });
-
-// Render the Leads Directory List
-function renderLeads() {
-    const listContainer = document.getElementById('lead-list-container');
-    listContainer.innerHTML = '';
-
-    LEADS.forEach(lead => {
-        const item = document.createElement('div');
-        item.className = 'lead-item';
-        item.innerHTML = `
-            <div class="lead-info">
-                <div class="lead-name-text">${lead.name}</div>
-                <div class="lead-company-text">${lead.company} &bull; ${lead.phone}</div>
-            </div>
-            <button class="call-action-btn" data-phone="${lead.phone}" data-name="${lead.name}">
-                📞 Call
-            </button>
-        `;
-        listContainer.appendChild(item);
-    });
-
-    // Setup click listener for each call button
-    document.querySelectorAll('.call-action-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            const phone = btn.getAttribute('data-phone');
-            const name = btn.getAttribute('data-name');
-            startOutboundCall(phone, name);
-        });
-    });
-}
 
 function setupEventListeners() {
     // Deploy GPU Button
@@ -63,6 +24,12 @@ function setupEventListeners() {
 
     // Warmup / Start Shift Button
     document.getElementById('btn-warmup').addEventListener('click', startShift);
+
+    // Manual dialer
+    document.getElementById('btn-dial').addEventListener('click', dialManualNumber);
+    document.getElementById('dial-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') dialManualNumber();
+    });
 
     // Call acceptance / rejection bu  ttons
     document.getElementById('btn-incoming-accept').addEventListener('click', acceptIncomingCall);
@@ -294,6 +261,29 @@ async function startOutboundCall(phone, name) {
         alert("Outbound call failed:\n\n" + e.message);
         resetCallUI();
     }
+}
+
+// Normalize manual dial input to E.164 (+91 default country code).
+// Returns null when the input can't be made into a plausible number.
+function normalizeDialNumber(raw) {
+    const cleaned = (raw || '').replace(/[\s\-\.\(\)]/g, '');
+    if (/^\+\d{8,15}$/.test(cleaned)) return cleaned;
+    if (/^\d{10}$/.test(cleaned)) return '+91' + cleaned;
+    if (/^91\d{10}$/.test(cleaned)) return '+' + cleaned;
+    return null;
+}
+
+function dialManualNumber() {
+    const input = document.getElementById('dial-input');
+    const errorEl = document.getElementById('dial-error');
+    const number = normalizeDialNumber(input.value);
+    if (!number) {
+        errorEl.innerText = 'Enter a 10-digit number or full +country format';
+        errorEl.style.display = 'block';
+        return;
+    }
+    errorEl.style.display = 'none';
+    startOutboundCall(number, number);
 }
 
 // Connect to LiveKit room

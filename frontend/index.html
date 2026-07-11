@@ -75,13 +75,15 @@
         </section>
 
         <section class="grid-layout">
-            <!-- Left Side: Lead List Card -->
+            <!-- Left Side: Manual Dialer Card -->
             <div class="glass-card lead-card">
-                <h2>Leads Directory</h2>
-                <p class="description">Select a lead to initiate an outbound call with active voice conversion.</p>
-                <div class="lead-list" id="lead-list-container">
-                    <!-- Dynamic Leads will be loaded here -->
+                <h2>Dialer</h2>
+                <p class="description">Type a number and call with active voice conversion. 10-digit numbers dial as +91; use +country format for anything else.</p>
+                <div class="dialer-row">
+                    <input type="tel" id="dial-input" placeholder="+91XXXXXXXXXX or 10-digit number" autocomplete="off" />
+                    <button id="btn-dial" class="call-action-btn">📞 Call</button>
                 </div>
+                <div id="dial-error" class="dial-error" style="display: none;"></div>
             </div>
 
             <!-- Right Side: Active Call Console -->
