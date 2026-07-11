@@ -118,10 +118,65 @@ def test_sola_crossfade_seamless_at_boundary():
     print("SOLA crossfade seam continuity test: SUCCESS")
 
 
+def test_hop_geometry_constants():
+    print("\n--- Testing hop-streaming geometry constants ---")
+    from modal_deploy import streaming as st
+    from modal_deploy import trt_pipeline as tp
+
+    # Hop-streaming (2026-07-11): 160ms hop + 560ms context. The inference
+    # window total MUST stay equal to the TRT static input shape -- this is
+    # the invariant that makes the hop change deploy-safe without an ONNX
+    # re-export.
+    assert st.BLOCK_MS == 160, f"hop must be 160ms, got {st.BLOCK_MS}"
+    assert st.CONTEXT_MS == 560, f"context must be 560ms, got {st.CONTEXT_MS}"
+    assert st.BLOCK_SAMPLES_IN == 2560
+    assert st.CONTEXT_SAMPLES_IN == 8960
+    assert st.BLOCK_SAMPLES_IN + st.CONTEXT_SAMPLES_IN == tp.CANONICAL_IN, (
+        f"window {st.BLOCK_SAMPLES_IN + st.CONTEXT_SAMPLES_IN} != TRT static shape "
+        f"{tp.CANONICAL_IN} -- changing this requires re-exporting all three ONNX models"
+    )
+    # SOLA crossfade halved with the hop so the overlap ratio per emitted hop
+    # stays 25% (was 80ms/320ms, now 40ms/160ms).
+    assert st.SOLA_CROSSFADE_SAMPLES == st.SAMPLE_RATE_OUT * 40 // 1000 == 1920
+    print("Hop geometry constants test: SUCCESS")
+
+
+def test_accumulator_hop_cadence():
+    print("\n--- Testing BlockAccumulator hop cadence (160ms pops, 560ms context cap) ---")
+    from modal_deploy import streaming as st
+
+    acc = st.BlockAccumulator()  # defaults = production geometry
+
+    # Feed exactly one hop of new audio -> exactly one poppable block, no context yet.
+    acc.push(np.arange(st.BLOCK_SAMPLES_IN, dtype=np.int16))
+    infer_input, context_len, block = acc.pop_block()
+    assert len(block) == st.BLOCK_SAMPLES_IN == 2560
+    assert context_len == 0
+    assert len(infer_input) == st.BLOCK_SAMPLES_IN
+    assert acc.pop_block() is None, "no second block until another hop of NEW audio arrives"
+
+    # Second hop: previous hop becomes context.
+    acc.push(np.arange(st.BLOCK_SAMPLES_IN, dtype=np.int16))
+    infer_input, context_len, block = acc.pop_block()
+    assert context_len == st.BLOCK_SAMPLES_IN
+    assert len(infer_input) == 2 * st.BLOCK_SAMPLES_IN
+
+    # After enough hops, context saturates at CONTEXT_SAMPLES_IN and the
+    # inference window reaches the full 720ms TRT shape (11520 samples).
+    for _ in range(6):
+        acc.push(np.arange(st.BLOCK_SAMPLES_IN, dtype=np.int16))
+        infer_input, context_len, block = acc.pop_block()
+    assert context_len == st.CONTEXT_SAMPLES_IN == 8960
+    assert len(infer_input) == st.BLOCK_SAMPLES_IN + st.CONTEXT_SAMPLES_IN == 11520
+    print("BlockAccumulator hop cadence test: SUCCESS")
+
+
 def main():
     print("Running modal_deploy/streaming.py DSP verification tests...")
     test_sola_crossfade_first_block_holds_tail_only()
     test_sola_crossfade_seamless_at_boundary()
+    test_hop_geometry_constants()
+    test_accumulator_hop_cadence()
     print("\nAll modal_deploy streaming tests completed successfully!")
 
 

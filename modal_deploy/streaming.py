@@ -20,20 +20,26 @@ import numpy as np
 SAMPLE_RATE_IN = 16000          # agent mic / inference input rate
 SAMPLE_RATE_OUT = 48000         # RVC / published track rate (3x input)
 
-# TRT Phase 2 (2026-07-07): block shrunk 1000ms→320ms to reduce mouth-to-ear latency
-# now that TRT median is 66ms (21× real-time) and the playout buffer gate has passed.
-# SOLA crossfade stays at 80ms (25% overhead per block at 320ms — up from 8% at 1000ms;
-# watch for time-compression artefacts in C5 listen test).
+# Hop-streaming (2026-07-11): BLOCK shrunk 320ms→160ms (a "hop") with CONTEXT grown
+# 400ms→560ms so the total inference window stays 720ms — the TRT static shapes
+# (trt_pipeline.CANONICAL_IN = 11520) are UNCHANGED and need no ONNX re-export.
+# Each inference slides the same 720ms window forward by one 160ms hop and emits
+# only the newest hop's worth of audio: half the accumulation wait of the old
+# 320ms block, with MORE left context per emitted sample (560ms vs 400ms).
+# SOLA crossfade halved 80ms→40ms to keep the same 25% overlap ratio per hop;
+# seam rate doubles to 6.25/s — listen-gated offline via main_chunked before any
+# deploy (see docs/superpowers/plans/2026-07-11-hop-streaming-latency.md).
+# GPU duty: ~51ms TRT compute per 160ms hop = 32% (was 16%) on the single-tenant L4.
 # NOTE: BLOCK_MS + CONTEXT_MS must equal trt_pipeline.CANONICAL_IN / SAMPLE_RATE_IN * 1000
-# (now 320+400=720ms = 11520 samples) -- changing either without updating the
+# (160+560=720ms = 11520 samples) -- changing either without updating the
 # TRT static shapes requires re-exporting all three ONNX models.
-BLOCK_MS = 320               # new audio processed per inference block (was 1000)
-CONTEXT_MS = 400              # prior input prepended as left context (unchanged)
+BLOCK_MS = 160               # new audio per inference hop (was 320; 1000 pre-TRT-phase-2)
+CONTEXT_MS = 560              # prior input prepended as left context (was 400)
 
-BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000        # 5120  (was 16000)
-CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000    # 6400  (unchanged)
+BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000        # 2560  (was 5120)
+CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000    # 8960  (was 6400)
 
-SOLA_CROSSFADE_SAMPLES = SAMPLE_RATE_OUT * 80 // 1000       # 3840 (80 ms @ 48 kHz)
+SOLA_CROSSFADE_SAMPLES = SAMPLE_RATE_OUT * 40 // 1000       # 1920 (40 ms @ 48 kHz, was 80 ms)
 SOLA_SEARCH_SAMPLES = SAMPLE_RATE_OUT * 10 // 1000          # 480  (10 ms @ 48 kHz)
 
 SILENCE_RMS_THRESHOLD = 150     # block RMS (int16) below this -> silence bypass
