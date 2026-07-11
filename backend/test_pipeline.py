@@ -615,6 +615,95 @@ async def test_on_converter_stats_accumulates_full_breakdown():
     print("_on_converter_stats accumulation test: SUCCESS")
 
 
+async def test_log_call_latency_summary_prints_header_rows_and_aggregates():
+    print("\n--- Testing _log_call_latency_summary output ---")
+    import io
+    import contextlib
+
+    def make_worker():
+        return VoiceConversionWorker(
+            room_url="ws://unused",
+            token="unused",
+            converter=DummyVoiceConverter(),
+            suppressor=WebRTCNoiseSuppressor(ns_level=3),
+        )
+
+    # No stats recorded at all: must not raise, must say so clearly.
+    worker = make_worker()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        worker._log_call_latency_summary()
+    assert "No converter stats recorded" in buf.getvalue()
+    print("Empty-call case prints a clear no-data line: OK")
+
+    # Populate synthetic per-block rows spanning the full stage breakdown.
+    # Fresh worker: the summary is once-per-call (idempotence check below), so
+    # reusing the one that already logged the empty-call line would print nothing.
+    worker = make_worker()
+    worker._call_block_stats = [
+        {"infer_ms": 60.0, "block_ms": 320, "lock_wait_ms": 1.0, "hubert_ms": 10.0,
+         "index_ms": 1.0, "rmvpe_ms": 20.0, "generator_ms": 27.0, "postproc_ms": 2.0,
+         "total_ms": 60.0, "playout_buffer_bytes": 5000},
+        {"infer_ms": 80.0, "block_ms": 320, "lock_wait_ms": 5.0, "hubert_ms": 12.0,
+         "index_ms": 1.5, "rmvpe_ms": 25.0, "generator_ms": 39.0, "postproc_ms": 2.5,
+         "total_ms": 80.0, "playout_buffer_bytes": 6000},
+        {"infer_ms": 0.0, "block_ms": 320},  # a silence-bypassed block: no stage keys
+    ]
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        worker._log_call_latency_summary()
+    out = buf.getvalue()
+
+    assert "3 block(s) this call" in out, "expected a header naming the block count"
+    assert "block 0:" in out and "block 1:" in out and "block 2:" in out, (
+        "expected one printed line per block"
+    )
+    assert "hubert_ms=10.0" in out, "expected raw per-block field values to be printed verbatim"
+    # infer_ms aggregate across all 3 blocks (60, 80, 0): avg=46.67, median=60, max=80
+    assert "infer_ms: avg=46.67 median=60.00 p95=80.00 max=80.00 n=3" in out, (
+        f"unexpected infer_ms aggregate line, got:\n{out}"
+    )
+    # hubert_ms aggregate only over the 2 blocks that have it (silence-bypassed block excluded)
+    assert "hubert_ms: avg=11.00 median=11.00 p95=12.00 max=12.00 n=2" in out, (
+        f"unexpected hubert_ms aggregate line (should exclude the silence-bypassed block), got:\n{out}"
+    )
+    print("Populated-call case prints per-block rows and correct aggregates: OK")
+
+    # stop() runs TWICE on the /api/call/end path (the endpoint calls it directly,
+    # then run_worker_task's finally calls it again once worker.running goes false
+    # -- backend/main.py:424-427 + 857-860). The summary must print once per call,
+    # not once per stop() invocation.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        worker._log_call_latency_summary()
+    assert buf.getvalue() == "", (
+        "expected a second _log_call_latency_summary call to print nothing "
+        f"(once-per-call idempotence guard), got:\n{buf.getvalue()}"
+    )
+    print("Second call on the same worker prints nothing (once per call): OK")
+    print("_log_call_latency_summary test: SUCCESS")
+
+
+async def test_stop_logs_summary_before_teardown():
+    print("\n--- Testing stop() invokes the latency summary ---")
+
+    worker = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=DummyVoiceConverter(),
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+    )
+    called = []
+    worker._log_call_latency_summary = lambda: called.append(True)
+
+    await worker.stop()
+
+    assert called == [True], "expected stop() to call _log_call_latency_summary exactly once"
+    print("stop() invokes _log_call_latency_summary: OK")
+    print("stop() latency summary wiring test: SUCCESS")
+
+
 async def test_playout_buffer_smooths_bursty_converter_output():
     print("\n--- Testing standing playout buffer (absorbs bursty/delayed converter output) ---")
 
@@ -860,6 +949,8 @@ async def main():
     await test_rvc_streaming_converter_buffer_cap_drop_oldest()
     await test_worker_readiness_probe_dedup()
     await test_on_converter_stats_accumulates_full_breakdown()
+    await test_log_call_latency_summary_prints_header_rows_and_aggregates()
+    await test_stop_logs_summary_before_teardown()
     await test_playout_buffer_smooths_bursty_converter_output()
     await test_playout_buffer_drops_oldest_over_cap()
     await test_presence_eq()

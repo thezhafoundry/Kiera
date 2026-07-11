@@ -3,6 +3,7 @@ import collections
 import contextlib
 import json
 import os
+import statistics
 import time
 import traceback
 from typing import AsyncIterator, Optional
@@ -109,6 +110,11 @@ class VoiceConversionWorker:
         # full (plus aggregates) by _log_call_latency_summary() once the call ends
         # (see stop()) -- this is diagnostic-only, never read during a live call.
         self._call_block_stats: list = []
+
+        # stop() can legitimately run twice per call (/api/call/end calls it, then
+        # run_worker_task's finally calls it again once running goes false) -- this
+        # flag makes the end-of-call summary print at most once per worker.
+        self._latency_summary_logged: bool = False
 
         # Timestamps of frames sent into the converter (20ms/640-byte each), used
         # only as a local latency estimate when the converter has no richer stats
@@ -226,6 +232,7 @@ class VoiceConversionWorker:
 
     async def stop(self):
         """Disconnects the worker and stops all background tasks."""
+        self._log_call_latency_summary()
         self.running = False
         self.stop_pipeline()
 
@@ -389,6 +396,50 @@ class VoiceConversionWorker:
             **stats,
             "playout_buffer_bytes": len(playout_buffer) if playout_buffer is not None else None,
         })
+
+    def _log_call_latency_summary(self):
+        """Prints every block's converter-reported latency breakdown, plus
+        aggregate avg/median/p95/max per numeric field, to stdout -- Render's
+        autoDeploy service runs with PYTHONUNBUFFERED=1 (see
+        .agents/context/subsystem-notes.md), so this reliably lands in Render
+        logs. Called from stop(), which can run twice per call (see
+        _latency_summary_logged) -- prints at most once per worker.
+        No-op-with-a-note if the converter never reported any stats (e.g.
+        DummyVoiceConverter, or a call that ended before any block was
+        converted)."""
+        if self._latency_summary_logged:
+            return
+        self._latency_summary_logged = True
+
+        stats = self._call_block_stats
+        if not stats:
+            print("[Worker][LatencySummary] No converter stats recorded for this call.")
+            return
+
+        print(f"[Worker][LatencySummary] ==== {len(stats)} block(s) this call ====")
+        for i, row in enumerate(stats):
+            fields = ", ".join(f"{k}={v}" for k, v in row.items())
+            print(f"[Worker][LatencySummary] block {i}: {fields}")
+
+        numeric_fields = [
+            "infer_ms", "block_ms", "lock_wait_ms", "hubert_ms", "index_ms",
+            "rmvpe_ms", "generator_ms", "postproc_ms", "total_ms",
+            "playout_buffer_bytes",
+        ]
+        for field in numeric_fields:
+            values = [row[field] for row in stats if isinstance(row.get(field), (int, float))]
+            if not values:
+                continue
+            values_sorted = sorted(values)
+            p95_index = min(len(values_sorted) - 1, int(round(0.95 * (len(values_sorted) - 1))))
+            print(
+                f"[Worker][LatencySummary] {field}: "
+                f"avg={statistics.mean(values):.2f} "
+                f"median={statistics.median(values):.2f} "
+                f"p95={values_sorted[p95_index]:.2f} "
+                f"max={max(values):.2f} "
+                f"n={len(values)}"
+            )
 
     def _estimate_fallback_latency_ms(self, converted_chunk: bytes) -> Optional[float]:
         """Local latency estimate used only when the converter has no on_stats hook
