@@ -7,6 +7,7 @@ unit-testable locally. It is mounted into the container via
 auto-bundle sibling modules; confirmed incident 2026-07-03 with streaming.py).
 """
 import numpy as np
+import time
 
 # ---- Canonical static shapes (MUST mirror export_onnx.py) ----
 # TRT Phase 2 (2026-07-07): BLOCK_MS 1000→320, CANONICAL_IN 22400→11520.
@@ -162,6 +163,7 @@ class TRTVoicePipeline:
                 )
             print(f"[TRT] {sess_name} session providers: {active}")
         self._rng = np.random.default_rng(0)   # rnd noise; seeded = reproducible tests
+        self.last_block_timing: dict = {}
 
     def warmup(self):
         """One full dummy pass -- builds/loads TRT engine caches."""
@@ -199,13 +201,20 @@ class TRTVoicePipeline:
     def convert_block(self, pcm_int16, pitch_shift: int = 0, index_rate: float = 0.75,
                       rms_mix_rate: float = 0.75, protect: float = 0.33,
                       filter_radius: int = 3) -> np.ndarray:
-        """Convert one streaming block. Returns int16 @ 48 kHz, length exactly 3*len(pcm_int16)."""
+        """Convert one streaming block. Returns int16 @ 48 kHz, length exactly 3*len(pcm_int16).
+
+        Records a per-stage timing breakdown (ms) in self.last_block_timing after
+        every call: hubert_ms, index_ms, rmvpe_ms, generator_ms, postproc_ms, total_ms.
+        """
         n_in = len(pcm_int16)
         audio, zpad = pad_to_canonical(pcm_int16)
+
+        t_start = time.perf_counter()
 
         # ---- Engine 1: HuBERT / ContentVec ----
         feats = self.s_hubert.run(None, {"audio": audio[None, :]})[0]   # [1, 170, 768]
         feats_raw_pre = feats.copy()
+        t_hubert = time.perf_counter()
 
         # ---- FAISS index mixing (CPU, cannot be TRT) ----
         if self.index is not None and self.big_npy is not None and index_rate > 0:
@@ -221,9 +230,11 @@ class TRTVoicePipeline:
 
         feats = np.repeat(feats, 2, axis=1)          # [1, 340, 768]
         feats_raw = np.repeat(feats_raw_pre, 2, axis=1)
+        t_index = time.perf_counter()
 
         # ---- Engine 3: RMVPE F0 ----
         pitch, pitchf = self._f0(audio, pitch_shift, filter_radius)
+        t_rmvpe = time.perf_counter()
 
         # ---- protect (consonant guard) ----
         feats = apply_protect(feats, feats_raw, pitchf, protect)
@@ -242,6 +253,7 @@ class TRTVoicePipeline:
             "rnd": self._rng.standard_normal((1, 192, GEN_FRAMES)).astype(np.float32),
             "sine_noise": sine_noise,
         })[0].reshape(-1)                                   # [OUT_PADDED_48K] float32
+        t_generator = time.perf_counter()
 
         # ---- trim fixed pad, then the zero-fill's share, then rms mix ----
         out = out[T_PAD_TGT: T_PAD_TGT + OUT_48K]
@@ -256,4 +268,14 @@ class TRTVoicePipeline:
             out = change_rms(src, out, rms_mix_rate)
         out = np.clip(out * 32767.0, -32768, 32767).astype(np.int16)
         assert len(out) == 3 * n_in, f"contract violation: {len(out)} != 3*{n_in}"
+
+        t_end = time.perf_counter()
+        self.last_block_timing = {
+            "hubert_ms": round((t_hubert - t_start) * 1000.0, 2),
+            "index_ms": round((t_index - t_hubert) * 1000.0, 2),
+            "rmvpe_ms": round((t_rmvpe - t_index) * 1000.0, 2),
+            "generator_ms": round((t_generator - t_rmvpe) * 1000.0, 2),
+            "postproc_ms": round((t_end - t_generator) * 1000.0, 2),
+            "total_ms": round((t_end - t_start) * 1000.0, 2),
+        }
         return out
