@@ -606,6 +606,8 @@ def fastapi_app():
                     infer_input, context_len, block = popped
 
                     infer_ms = 0.0
+                    lock_wait_ms = 0.0
+                    block_timing: dict = {}
                     if st.block_rms(block) < st.SILENCE_RMS_THRESHOLD:
                         # Silence bypass: skip the GPU, emit equal-duration 48 kHz
                         # silence (3x samples), never raw audio. The extra crossfade of
@@ -622,8 +624,9 @@ def fastapi_app():
                                 engine._auto_detect_pitch, probe_wav
                             )
                         try:
-                            t0 = time.perf_counter()
+                            t_wait_start = time.perf_counter()
                             async with _gpu_lock:  # single-tenant GPU
+                                t_compute_start = time.perf_counter()
                                 out_bytes = await asyncio.to_thread(
                                     engine.convert_block,
                                     infer_input,
@@ -632,7 +635,16 @@ def fastapi_app():
                                     rms_mix_rate,
                                     protect,
                                 )
-                            infer_ms = (time.perf_counter() - t0) * 1000.0
+                            t_compute_end = time.perf_counter()
+                            infer_ms = (t_compute_end - t_wait_start) * 1000.0
+                            lock_wait_ms = (t_compute_start - t_wait_start) * 1000.0
+                            # Per-stage breakdown lives on the TRT pipeline object
+                            # (engine.trt_pipe), not on RVCEngine itself — engine's
+                            # convert_block only delegates there. trt_pipe is None on
+                            # the ONNX-CUDA fallback path: no breakdown, empty dict.
+                            block_timing = dict(
+                                getattr(getattr(engine, "trt_pipe", None), "last_block_timing", None) or {}
+                            )
                         except Exception as e:
                             # Inference failed: report, emit NOTHING (never raw),
                             # keep the session alive, hold the pending tail as-is.
@@ -657,11 +669,14 @@ def fastapi_app():
                         await ws.send_bytes(emit_bytes)
                         if dbg_out is not None and len(dbg_out) < 48000 * 2 * _DEBUG_MAX_SECONDS:
                             dbg_out.extend(emit_bytes)
-                    await ws.send_json({
+                    stats_payload = {
                         "type": "stats",
                         "infer_ms": round(infer_ms, 2),
                         "block_ms": st.BLOCK_MS,
-                    })
+                        "lock_wait_ms": round(lock_wait_ms, 2),
+                    }
+                    stats_payload.update(block_timing)
+                    await ws.send_json(stats_payload)
 
         except WebSocketDisconnect:
             pass
