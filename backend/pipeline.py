@@ -104,6 +104,12 @@ class VoiceConversionWorker:
         self._last_chunk_at: float = 0.0        # monotonic time of the last output chunk
         self._last_metric_publish_at: float = 0.0
 
+        # Every stats dict the converter has reported this call, in arrival order,
+        # each annotated with playout-buffer occupancy at receipt time. Printed in
+        # full (plus aggregates) by _log_call_latency_summary() once the call ends
+        # (see stop()) -- this is diagnostic-only, never read during a live call.
+        self._call_block_stats: list = []
+
         # Timestamps of frames sent into the converter (20ms/640-byte each), used
         # only as a local latency estimate when the converter has no richer stats
         # hook (see on_stats wiring below and _estimate_fallback_latency_ms).
@@ -374,6 +380,15 @@ class VoiceConversionWorker:
         block_ms = stats.get("block_ms") or 0.0
         self._latest_latency_ms = float(infer_ms) + float(block_ms)
         self._publish_latency_metric()
+
+        # _playout_buffer only exists once _run_conversion_stream has started
+        # (see its class docstring) -- degrade to None rather than raising if a
+        # stats message somehow arrives before that.
+        playout_buffer = getattr(self, "_playout_buffer", None)
+        self._call_block_stats.append({
+            **stats,
+            "playout_buffer_bytes": len(playout_buffer) if playout_buffer is not None else None,
+        })
 
     def _estimate_fallback_latency_ms(self, converted_chunk: bytes) -> Optional[float]:
         """Local latency estimate used only when the converter has no on_stats hook

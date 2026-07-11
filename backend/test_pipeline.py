@@ -568,6 +568,53 @@ async def test_worker_readiness_probe_dedup():
     print("VoiceConversionWorker readiness-probe dedup test: SUCCESS")
 
 
+async def test_on_converter_stats_accumulates_full_breakdown():
+    print("\n--- Testing VoiceConversionWorker._on_converter_stats accumulation ---")
+
+    class _StatsCapableConverter:
+        """Only needs an on_stats attribute to exist for VoiceConversionWorker's
+        hasattr() check to wire it up -- mirrors RVCStreamingConverter's shape
+        without needing a real WS connection."""
+        on_stats = None
+
+    worker = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=_StatsCapableConverter(),
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+    )
+    assert worker._call_block_stats == [], "should start empty"
+
+    # Before _run_conversion_stream ever runs, _playout_buffer doesn't exist yet --
+    # playout_buffer_bytes must degrade to None rather than raising.
+    worker._on_converter_stats({"infer_ms": 12.3, "block_ms": 320})
+    assert worker._call_block_stats[-1]["playout_buffer_bytes"] is None, (
+        "expected playout_buffer_bytes=None before the playout buffer is created"
+    )
+
+    # Once a playout buffer exists, its current length must be captured alongside
+    # whatever fields the server sent (here, the full TRT stage breakdown).
+    worker._playout_buffer = bytearray(b"\x00" * 4096)
+    worker._on_converter_stats({
+        "infer_ms": 58.1, "block_ms": 320, "lock_wait_ms": 3.5,
+        "hubert_ms": 10.0, "index_ms": 1.0, "rmvpe_ms": 20.0,
+        "generator_ms": 25.0, "postproc_ms": 2.1, "total_ms": 58.1,
+    })
+
+    assert len(worker._call_block_stats) == 2, f"expected 2 recorded blocks, got {len(worker._call_block_stats)}"
+    second = worker._call_block_stats[1]
+    assert second["playout_buffer_bytes"] == 4096, f"expected 4096, got {second['playout_buffer_bytes']}"
+    assert second["hubert_ms"] == 10.0 and second["generator_ms"] == 25.0, (
+        "expected the full server-reported stage breakdown to be preserved verbatim"
+    )
+    # infer_ms/block_ms latency-badge behavior must be untouched.
+    assert worker._latest_latency_ms == 58.1 + 320, (
+        f"existing pipeline_latency_ms computation regressed: {worker._latest_latency_ms}"
+    )
+    print(f"Accumulated {len(worker._call_block_stats)} block stats rows with playout_buffer_bytes: OK")
+    print("_on_converter_stats accumulation test: SUCCESS")
+
+
 async def test_playout_buffer_smooths_bursty_converter_output():
     print("\n--- Testing standing playout buffer (absorbs bursty/delayed converter output) ---")
 
@@ -812,6 +859,7 @@ async def main():
     await test_rvc_streaming_converter_reconnect()
     await test_rvc_streaming_converter_buffer_cap_drop_oldest()
     await test_worker_readiness_probe_dedup()
+    await test_on_converter_stats_accumulates_full_breakdown()
     await test_playout_buffer_smooths_bursty_converter_output()
     await test_playout_buffer_drops_oldest_over_cap()
     await test_presence_eq()
