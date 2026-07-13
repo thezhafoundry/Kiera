@@ -151,14 +151,12 @@ this from the running server if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set.
 - **Standing playout buffer (reintroduced 2026-07-03).** The original rebuild's one-shot ~100ms
   jitter fill only smoothed the *start* of a call and starved on any slow block. It's since been
   replaced by a producer/consumer split: `_run_conversion_stream` appends converted audio to a
-  bounded `self._playout_buffer` (0.10s target/5s cap as of hop-streaming 2026-07-11 —
-  history 3s → 1.25s → 0.25s → 0.10s, see `.agents/context/subsystem-notes.md`; drop-oldest on
+  bounded `self._playout_buffer` (1.25s target/5s cap as of the TRT migration phase 1, down
+  from an earlier 3s target — see `.agents/context/subsystem-notes.md`; drop-oldest on
   overflow), and a separate
   `_run_playout_consumer` task drains it into `_publish_frames` at a steady pace — a slow RVC
-  block now grows delay instead of producing "part by part" audio. The buffer's *size* history
-  tracks a product-priority reversal: the 2026-07-03 decision deprioritized latency in favor of
-  continuity (3s→1.25s era); on 2026-07-11 latency became the active focus again (0.10s, paired
-  with the 160ms hop-streaming geometry in `modal_deploy/streaming.py`) — see
+  block now grows delay instead of producing "part by part" audio. This reflects a deliberate
+  2026-07-03 product decision that call latency is not a priority, voice continuity is — see
   `.agents/context/subsystem-notes.md` for the full mechanism and `.agents/decisions/log.md` for
   the tradeoff reasoning.
 - **Fail-CLOSED, never raw.** There is no raw-audio-fallback path — it was removed structurally,

@@ -14,7 +14,7 @@ import time
 # TRT_T_PAD stays at 16000 (x_pad=1 = 1s reflect pad, RVC convention, independent of block size).
 SR_IN = 16000
 SR_OUT = 48000
-CANONICAL_IN = 11520          # 720 ms window: BLOCK_MS=160 + CONTEXT_MS=560 (hop-streaming 2026-07-11; sum unchanged since TRT phase 2)
+CANONICAL_IN = 11520          # 720 ms: BLOCK_MS=320 + CONTEXT_MS=400  (was 22400)
 TRT_T_PAD = 16000             # fixed reflect pad each side (x_pad=1 equivalent, unchanged)
 PADDED_IN = CANONICAL_IN + 2 * TRT_T_PAD      # 43520  (was 54400)
 HUBERT_FRAMES = 135              # 135 (HuBERT convolutional boundary reduces 43520 // 320 = 136 to 135)

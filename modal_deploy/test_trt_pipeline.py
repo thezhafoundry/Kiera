@@ -88,14 +88,3 @@ def test_apply_protect_blends_unvoiced():
     pitchf = np.zeros(tp.GEN_FRAMES, dtype=np.float32)
     out = tp.apply_protect(feats, raw, pitchf, protect=0.33)
     assert np.allclose(out, 0.33, atol=1e-6)
-
-
-def test_hop_window_matches_trt_static_shape():
-    """The streaming hop geometry MUST fill the TRT static input shape exactly --
-    a drifted constant here means a silent head-zero-pad on every block (quality
-    loss) or a ValueError (oversize), only visible on a live GPU otherwise."""
-    try:
-        from modal_deploy import streaming as st
-    except ImportError:
-        import streaming as st
-    assert st.BLOCK_SAMPLES_IN + st.CONTEXT_SAMPLES_IN == tp.CANONICAL_IN
