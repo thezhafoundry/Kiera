@@ -14,6 +14,11 @@ try:
 except ImportError:  # pragma: no cover
     import streaming as st
 
+try:
+    from modal_deploy import pitch_lock as pl
+except ImportError:   # inside container: modal_deploy package not present
+    import pitch_lock as pl
+
 import faiss
 from functools import lru_cache
 
@@ -563,10 +568,12 @@ def fastapi_app():
             if first.get("type") == "websocket.disconnect":
                 return
             cfg = json.loads(first.get("text") or "{}")
-            cfg_pitch = int(cfg.get("pitch_shift", -1))
+            cfg_pitch = float(cfg.get("pitch_shift", -1))
             index_rate = float(cfg.get("index_rate", 0.75))
             rms_mix_rate = float(cfg.get("rms_mix_rate", 0.75))
             protect = float(cfg.get("protect", 0.33))
+            adaptive_cfg = bool(cfg.get("adaptive_pitch", False))
+            target_f0 = float(cfg.get("target_f0", pl.DEFAULT_TARGET_F0_HZ))
 
             # Warm-gate: only reply "ready" when the engine is actually loaded AND
             # (guaranteed above) no other session is active.
@@ -582,6 +589,15 @@ def fastapi_app():
             # pitch_shift == -1 -> auto-detect once from the first non-silent block,
             # then fixed for the whole session.
             session_pitch = None if cfg_pitch == -1 else cfg_pitch
+
+            # Adaptive per-call pitch lock (spec 2026-07-13): needs a concrete
+            # prior — pitch_shift == -1 keeps the legacy auto-detect path and
+            # disables adaptation.
+            lock = pl.PitchLock(
+                prior_shift=cfg_pitch if cfg_pitch != -1 else 0.0,
+                target_f0=target_f0,
+                enabled=adaptive_cfg and cfg_pitch != -1,
+            )
 
             while True:
                 message = await ws.receive()
@@ -629,6 +645,8 @@ def fastapi_app():
                             session_pitch = await asyncio.to_thread(
                                 engine._auto_detect_pitch, probe_wav
                             )
+                        pitch_for_block = lock.shift if lock.enabled else session_pitch
+                        f0_sink = [] if (lock.enabled and not lock.locked) else None
                         try:
                             t_wait_start = time.perf_counter()
                             async with _gpu_lock:  # single-tenant GPU
@@ -636,10 +654,11 @@ def fastapi_app():
                                 out_bytes = await asyncio.to_thread(
                                     engine.convert_block,
                                     infer_input,
-                                    session_pitch,
+                                    pitch_for_block,
                                     index_rate,
                                     rms_mix_rate,
                                     protect,
+                                    f0_sink=f0_sink,
                                 )
                             t_compute_end = time.perf_counter()
                             infer_ms = (t_compute_end - t_wait_start) * 1000.0
@@ -657,6 +676,18 @@ def fastapi_app():
                             traceback.print_exc()
                             await ws.send_json({"type": "error", "message": str(e)})
                             continue
+
+                        if f0_sink:
+                            if lock.add_block(
+                                np.concatenate(f0_sink),
+                                block_seconds=len(block) / st.SAMPLE_RATE_IN,
+                            ):
+                                print(
+                                    f"[AdaptivePitch] locked shift={lock.shift:+.2f} st "
+                                    f"(median F0={lock.locked_median_f0:.1f}Hz → target "
+                                    f"{target_f0:.0f}Hz, {lock.voiced_seconds:.1f}s voiced, "
+                                    f"prior {lock.prior_shift:+.1f})"
+                                )
 
                         out = np.frombuffer(out_bytes, dtype=np.int16)
                         # Trim the converted context but RETAIN a crossfade's worth of
@@ -681,6 +712,8 @@ def fastapi_app():
                         "block_ms": st.BLOCK_MS,
                         "lock_wait_ms": round(lock_wait_ms, 2),
                     }
+                    if lock.locked:
+                        stats_payload["locked_pitch"] = round(lock.shift, 2)
                     stats_payload.update(block_timing)
                     await ws.send_json(stats_payload)
 
