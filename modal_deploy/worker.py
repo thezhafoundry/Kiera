@@ -801,11 +801,13 @@ def _load_wav_as_pcm16_mono(audio_bytes: bytes):
 )
 def convert_file_chunked(
     audio_bytes: bytes,
-    pitch: int = -1,
+    pitch: float = -1,
     use_trt: int = 0,
     index_rate: float = 0.75,
     rms_mix_rate: float = 0.75,
     protect: float = 0.33,
+    adaptive: int = 0,
+    target_f0: float = 208.0,
 ) -> bytes:
     """
     Diagnostic: runs the SAME block-accumulate + SOLA-crossfade pipeline the live
@@ -826,10 +828,18 @@ def convert_file_chunked(
 
     samples = _load_wav_as_pcm16_mono(audio_bytes)
 
+    if adaptive and pitch == -1:
+        raise ValueError(
+            "--adaptive needs an explicit --pitch prior (e.g. --pitch 7); "
+            "-1 keeps the legacy whole-file auto-detect and disables adaptation"
+        )
+
     if pitch == -1:
         probe_wav = st.pcm16_to_wav_bytes(samples)
         pitch = test_engine._auto_detect_pitch(probe_wav)
         print(f"[Chunked Test] Whole-file auto-detected pitch_shift={pitch}")
+
+    lock = pl.PitchLock(prior_shift=pitch, target_f0=target_f0, enabled=bool(adaptive))
 
     acc = st.BlockAccumulator()
     acc.push(samples)
@@ -846,16 +856,29 @@ def convert_file_chunked(
         if st.block_rms(block) < st.SILENCE_RMS_THRESHOLD:
             out = np.zeros(len(block) * 3 + st.SOLA_CROSSFADE_SAMPLES, dtype=np.int16)
         else:
+            pitch_for_block = lock.shift if lock.enabled else pitch
+            f0_sink = [] if (lock.enabled and not lock.locked) else None
             t0 = time.perf_counter()
             out_bytes = test_engine.convert_block(
                 infer_input,
-                pitch=pitch,
+                pitch=pitch_for_block,
                 index_rate=index_rate,
                 rms_mix_rate=rms_mix_rate,
                 protect=protect,
+                f0_sink=f0_sink,
             )
             infer_ms = (time.perf_counter() - t0) * 1000
             print(f"[Timing] convert_block: {infer_ms:.1f}ms ({test_engine.engine_kind})")
+            if f0_sink:
+                if lock.add_block(
+                    np.concatenate(f0_sink),
+                    block_seconds=len(block) / st.SAMPLE_RATE_IN,
+                ):
+                    print(
+                        f"[AdaptivePitch] locked shift={lock.shift:+.2f} st "
+                        f"(median F0={lock.locked_median_f0:.1f}Hz → target {target_f0:.0f}Hz, "
+                        f"{lock.voiced_seconds:.1f}s voiced, prior {lock.prior_shift:+.1f})"
+                    )
             out = np.frombuffer(out_bytes, dtype=np.int16)
             out = st.trim_context(
                 out, context_len, len(infer_input), overlap_keep=st.SOLA_CROSSFADE_SAMPLES
@@ -874,18 +897,21 @@ def convert_file_chunked(
 
 @app.local_entrypoint()
 def main_chunked(
-    pitch: int = -1,
+    pitch: float = -1,
     use_trt: int = 0,
     input_file: str = r"D:\Kiera\male_test.wav",
     output_file: str = "",
     index_rate: float = 0.75,
     rms_mix_rate: float = 0.75,
     protect: float = 0.33,
+    adaptive: int = 0,
+    target_f0: float = 208.0,
 ):
     import struct
 
     print(f"[Chunked Test] Input: {input_file} | pitch_shift={pitch} | use_trt={use_trt} "
-          f"| index_rate={index_rate} rms_mix_rate={rms_mix_rate} protect={protect}")
+          f"| index_rate={index_rate} rms_mix_rate={rms_mix_rate} protect={protect}"
+          f" | adaptive={adaptive} target_f0={target_f0}")
     print("[Chunked Test] Simulates the live /ws block-accumulate + SOLA-crossfade")
     print("[Chunked Test] pipeline on a static file -- compare the output against")
     print("[Chunked Test] test11.wav (convert_file's single-pass output) on the")
@@ -901,6 +927,8 @@ def main_chunked(
         index_rate=index_rate,
         rms_mix_rate=rms_mix_rate,
         protect=protect,
+        adaptive=adaptive,
+        target_f0=target_f0,
     )
 
     sample_rate = 48000
