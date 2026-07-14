@@ -191,7 +191,7 @@ this from the running server if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set.
 Config is read from `.env` (no `.env.example` is checked in — see
 [README.md §3](README.md#3-environment-variables-reference) for the reference list):
 `LIVEKIT_*`, `RVC_ENDPOINT_URL`, `RVC_API_KEY`, `RVC_PITCH_SHIFT`, `RVC_INDEX_RATE`,
-`RVC_WS_URL`, `RVC_KEEPWARM`, `CORS_ORIGINS`, `TWILIO_*`, `SERVER_URL`. Never commit `.env` or
+`RVC_WS_URL`, `RVC_KEEPWARM`, `RVC_ADAPTIVE_PITCH`, `RVC_TARGET_F0`, `CORS_ORIGINS`, `TWILIO_*`, `SERVER_URL`. Never commit `.env` or
 model files (`.pth`/`.index`/`.wav`) — they are gitignored.
 
 ### Code Style

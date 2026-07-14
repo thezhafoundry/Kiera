@@ -151,6 +151,24 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   from the UI's `agentGender` toggle again (`12 if male else 0`) instead of `-1` (GPU
   auto-detect). The GPU-side `_auto_detect_pitch` code itself is untouched/still selectable
   via `pitch=-1` — just no longer what the live call path uses.
+- **Adaptive per-call pitch lock (added 2026-07-13, spec
+  `docs/superpowers/specs/2026-07-13-adaptive-pitch-shift-design.md`).** The fixed
+  `RVC_MALE_PITCH_SHIFT` went stale when the agent's live F0 moved (152-158Hz on
+  2026-07-13 vs the 137-138Hz that +7 was calibrated on → output 1.5-2 st above the
+  model center = wrong identity). `ws_stream` now owns a `PitchLock`
+  (`modal_deploy/pitch_lock.py`): engines expose their PRE-shift F0 track via the
+  `f0_sink` kwarg on `convert_block`, the session accumulates voiced frames
+  (60-400Hz window) and, at ≥2s voiced, locks `12·log2(target_f0/median)` (float,
+  clamped ±12) for the rest of the session. The locked value rides the existing
+  `stats` messages as `locked_pitch`; `RVCStreamingConverter` adopts it and flips
+  its own `adaptive_pitch` off, so a WS **reconnect resumes the locked identity**
+  — the exact failure that got `_auto_detect_pitch` reverted on 2026-07-03 cannot
+  recur (that legacy path still exists behind `pitch_shift == -1`, unused live).
+  Kill switch: `RVC_ADAPTIVE_PITCH=0` on Render (backend env; default on). Offline
+  replay: `modal run modal_deploy/worker.py::main_chunked --pitch 7 --adaptive 1`.
+  Trap: `pitch_lock.py` must stay numpy+stdlib-only (it imports into the container
+  via `add_local_python_source("pitch_lock")` in `modal_defs.py` — same mount rule
+  as streaming.py).
 
 ## TensorRT/ONNX migration (merged to main 2026-07-07, merge commit `9c1093a`)
 Full spec: `implementation_plan.md` / `TRT_ROLLOUT_STEPS.md` (repo root). `trt-migration`
