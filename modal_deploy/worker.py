@@ -251,11 +251,12 @@ class RVCEngine:
     def run_conversion(
         self,
         audio_bytes: bytes,
-        pitch: int = -1,
+        pitch: float = -1,
         index_rate: float = 0.75,
         filter_radius: int = 3,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
+        f0_sink: list = None,
     ) -> bytes:
         import numpy as np
         import librosa
@@ -320,7 +321,9 @@ class RVCEngine:
             pitchf = np.pad(pitchf, (0, p_len - len(pitchf)), mode="edge")
         elif len(pitchf) > p_len:
             pitchf = pitchf[:p_len]
-            
+
+        if f0_sink is not None:
+            f0_sink.append(pitchf.astype(np.float32, copy=True))
         pitchf = pitchf * (2 ** (pitch / 12))
         
         f0_min = 50
@@ -377,17 +380,20 @@ class RVCEngine:
     def convert_block(
         self,
         pcm_int16,                      # np.int16 array, 16 kHz, <= CANONICAL_IN samples
-        pitch: int = 0,
+        pitch: float = 0,
         index_rate: float = 0.75,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
+        f0_sink: list = None,
     ) -> bytes:
         """Single streaming-block conversion. TRT path when loaded, else the
         existing PyTorch run_conversion via WAV bytes. Returns 48 kHz int16 bytes,
-        ~3x the input duration either way."""
+        ~3x the input duration either way. When `f0_sink` is a list, the block's
+        pre-shift F0 track (Hz, unvoiced == 0) is appended to it."""
         if self.trt_pipe is not None:
             out = self.trt_pipe.convert_block(
                 pcm_int16, pitch, index_rate, rms_mix_rate, protect,
+                f0_sink=f0_sink,
             )
             return out.tobytes()
         # PyTorch fallback: wrap in WAV and call run_conversion
@@ -397,7 +403,7 @@ class RVCEngine:
             import streaming as _st
         return self.run_conversion(
             _st.pcm16_to_wav_bytes(pcm_int16), pitch, index_rate, 3,
-            rms_mix_rate, protect,
+            rms_mix_rate, protect, f0_sink=f0_sink,
         )
 
 

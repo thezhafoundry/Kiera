@@ -173,8 +173,9 @@ class TRTVoicePipeline:
                            pitch_shift=0, index_rate=0.75,
                            rms_mix_rate=0.75, protect=0.33)
 
-    def _f0(self, audio_f32: np.ndarray, pitch_shift: int, filter_radius: int):
-        """audio [PADDED_IN] float32 -> (pitch int64 [GEN_FRAMES], pitchf f32 [GEN_FRAMES])."""
+    def _f0(self, audio_f32: np.ndarray, pitch_shift: float, filter_radius: int):
+        """audio [PADDED_IN] float32 -> (pitch int64 [GEN_FRAMES], pitchf f32 [GEN_FRAMES],
+        f0_raw f32 [GEN_FRAMES] -- the PRE-shift F0 track in Hz, unvoiced == 0)."""
         import torch
         with torch.no_grad():
             x = torch.from_numpy(audio_f32).float().to(self.device)[None, :]
@@ -191,16 +192,19 @@ class TRTVoicePipeline:
             ks = filter_radius if filter_radius % 2 == 1 else 3
             f0_f = medfilt(f0, kernel_size=ks)
             f0 = np.where(voiced & (f0_f > 0), f0_f, f0)
-        f0 = f0 * (2.0 ** (pitch_shift / 12.0))
-        # resample MEL_FRAMES(273) f0 points onto the GEN_FRAMES(270) grid
+        # resample MEL_FRAMES(273) f0 points onto the GEN_FRAMES(270) grid BEFORE
+        # applying the shift: linear interp commutes with the scalar 2**(shift/12)
+        # factor, and capturing f0_raw here hands PitchLock the pre-shift track.
         f0 = np.interp(np.linspace(0, 1, GEN_FRAMES), np.linspace(0, 1, len(f0)), f0)
+        f0_raw = f0.astype(np.float32)
+        f0 = f0 * (2.0 ** (pitch_shift / 12.0))
         pitchf = f0.astype(np.float32)
         pitch = f0_to_coarse(f0)
-        return pitch, pitchf
+        return pitch, pitchf, f0_raw
 
-    def convert_block(self, pcm_int16, pitch_shift: int = 0, index_rate: float = 0.75,
+    def convert_block(self, pcm_int16, pitch_shift: float = 0, index_rate: float = 0.75,
                       rms_mix_rate: float = 0.75, protect: float = 0.33,
-                      filter_radius: int = 3) -> np.ndarray:
+                      filter_radius: int = 3, f0_sink: list = None) -> np.ndarray:
         """Convert one streaming block. Returns int16 @ 48 kHz, length exactly 3*len(pcm_int16).
 
         Records a per-stage timing breakdown (ms) in self.last_block_timing after
@@ -233,7 +237,9 @@ class TRTVoicePipeline:
         t_index = time.perf_counter()
 
         # ---- Engine 3: RMVPE F0 ----
-        pitch, pitchf = self._f0(audio, pitch_shift, filter_radius)
+        pitch, pitchf, f0_raw = self._f0(audio, pitch_shift, filter_radius)
+        if f0_sink is not None:
+            f0_sink.append(f0_raw)
         t_rmvpe = time.perf_counter()
 
         # ---- protect (consonant guard) ----
