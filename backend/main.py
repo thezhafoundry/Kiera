@@ -78,6 +78,19 @@ RVC_PROTECT = float(os.getenv("RVC_PROTECT", "0.33"))
 # F0 differs, so this is env-tunable (default keeps the legacy +12); set to 7-8 for
 # a ~137Hz agent. A "female" agent stays at 0.
 RVC_MALE_PITCH_SHIFT = int(os.getenv("RVC_MALE_PITCH_SHIFT", "12"))
+# Adaptive per-call pitch lock (spec: docs/superpowers/specs/2026-07-13-adaptive-pitch-shift-design.md).
+# The fixed RVC_MALE_PITCH_SHIFT above goes stale whenever the agent's natural
+# delivery shifts (2026-07-13: live agent F0 152-158Hz vs the 137-138Hz that +7
+# was calibrated on -> output landed 1.5-2 st above the model center = the
+# documented wrong-identity voice). When enabled, the GPU worker measures the
+# live voiced F0 (median over >=2s of voiced RMVPE frames) and locks
+# shift = 12*log2(RVC_TARGET_F0 / median) once per call; the gender-toggle
+# shift becomes only the pre-lock prior. Set to 0 to disable (exact legacy
+# fixed-shift behavior).
+RVC_ADAPTIVE_PITCH = os.getenv("RVC_ADAPTIVE_PITCH", "1") == "1"
+# The trained model's F0 center in Hz that the adaptive lock targets
+# (mi-test: ~208, measured 2026-07-08 from a known-good output).
+RVC_TARGET_F0 = float(os.getenv("RVC_TARGET_F0", "208"))
 # WebRTC noise-suppression aggressiveness [0..4]. Level 3 was gutting high-frequency
 # voice detail (sibilance/consonants HuBERT needs) BEFORE the model saw it —
 # measured 2026-07-08: live input centroid 413Hz vs 720Hz clean, -9dB at 6-8kHz —
@@ -375,7 +388,8 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
     # gender toggle is the ground truth the agent already knows about themselves,
     # so drive pitch_shift from it directly instead of trusting a live guess.
     pitch_shift = RVC_MALE_PITCH_SHIFT if agent_gender.lower() == "male" else 0
-    print(f"[Server] Agent gender: {agent_gender} → pitch_shift={pitch_shift}")
+    print(f"[Server] Agent gender: {agent_gender} → pitch prior={pitch_shift} "
+          f"(adaptive={'on' if RVC_ADAPTIVE_PITCH else 'off'}, target_f0={RVC_TARGET_F0:.0f}Hz)")
 
     if RVC_ENDPOINT_URL:
         print(f"[Server] Spawning RVC Streaming Voice Changer (Endpoint: {RVC_ENDPOINT_URL})")
@@ -386,6 +400,8 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
             index_rate=RVC_INDEX_RATE,
             rms_mix_rate=RVC_RMS_MIX_RATE,
             protect=RVC_PROTECT,
+            adaptive_pitch=RVC_ADAPTIVE_PITCH,
+            target_f0=RVC_TARGET_F0,
             connect_timeout=150.0,  # allow full Modal cold-start window (~60-90s)
         )
     else:
