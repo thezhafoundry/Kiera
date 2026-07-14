@@ -545,6 +545,85 @@ async def test_rvc_streaming_adaptive_config_and_locked_pitch_resume():
     print("RVCStreamingConverter adaptive config + locked_pitch resume: SUCCESS")
 
 
+async def test_rvc_streaming_adaptive_locked_pitch_reconnect_e2e():
+    print(
+        "\n--- Testing RVCStreamingConverter e2e: locked_pitch resume survives a real "
+        "WS reconnect (not just the _handle_incoming seam) ---"
+    )
+
+    received_configs = []
+    connection_count = 0
+
+    async def handler(websocket):
+        nonlocal connection_count
+        connection_count += 1
+        conn_id = connection_count
+        try:
+            config_msg = await websocket.recv()  # the JSON config handshake message
+            received_configs.append(json.loads(config_msg))
+            await websocket.send(json.dumps({"type": "ready"}))
+            if conn_id == 1:
+                # Report the per-call lock via stats, then drop the connection --
+                # proves the client's reconnect RESUMES this identity instead of
+                # re-adapting (the whole point of reporting locked_pitch at all).
+                await websocket.send(json.dumps(
+                    {"type": "stats", "infer_ms": 1.0, "locked_pitch": 5.39}
+                ))
+                await asyncio.sleep(0.1)  # give the client time to process it
+                await websocket.close()
+                return
+            # Second (reconnect) connection: nothing else under test here, just
+            # keep the socket open until the test tears the converter down.
+            async for message in websocket:
+                pass
+        except ConnectionClosed:
+            pass
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        converter = RVCStreamingConverter(
+            ws_url=f"ws://127.0.0.1:{port}/ws",
+            pitch_shift=7,
+            adaptive_pitch=True,
+            target_f0=208.0,
+        )
+        in_gen, in_queue = _make_fed_input()
+        output_chunks = []
+
+        async def collect():
+            async for chunk in converter.convert_stream(in_gen):
+                output_chunks.append(chunk)
+
+        collect_task = asyncio.create_task(collect())
+        try:
+            # Wait for the second (reconnect) config handshake -- that's the
+            # proof a real WS reconnect happened, not just an in-memory field set.
+            deadline = time.monotonic() + 5.0
+            while len(received_configs) < 2 and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+            assert len(received_configs) >= 2, (
+                f"expected a second (reconnect) config handshake, got {len(received_configs)}"
+            )
+
+            second_config = received_configs[1]
+            assert second_config["pitch_shift"] == 5.39, (
+                f"reconnect config did not resume the locked pitch: {second_config}"
+            )
+            assert second_config["adaptive_pitch"] is False, (
+                f"reconnect config re-enabled adaptive pitch instead of resuming the lock: {second_config}"
+            )
+            print(
+                "Reconnect config resumes locked identity "
+                "(pitch_shift=5.39, adaptive_pitch=False): OK"
+            )
+        finally:
+            await converter.close()
+            await asyncio.wait_for(collect_task, timeout=5.0)
+            await in_gen.aclose()
+
+    print("RVCStreamingConverter e2e locked_pitch reconnect-resume test: SUCCESS")
+
+
 async def test_worker_readiness_probe_dedup():
     print("\n--- Testing VoiceConversionWorker readiness-probe dedup (outbound race fix) ---")
 
@@ -985,6 +1064,7 @@ async def main():
     await test_rvc_streaming_converter_reconnect()
     await test_rvc_streaming_converter_buffer_cap_drop_oldest()
     await test_rvc_streaming_adaptive_config_and_locked_pitch_resume()
+    await test_rvc_streaming_adaptive_locked_pitch_reconnect_e2e()
     await test_worker_readiness_probe_dedup()
     await test_on_converter_stats_accumulates_full_breakdown()
     await test_log_call_latency_summary_prints_header_rows_and_aggregates()

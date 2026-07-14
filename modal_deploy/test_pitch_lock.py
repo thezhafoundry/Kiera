@@ -5,9 +5,11 @@ environment (no modal package, no GPU). Plain assert/print style, no pytest.
 
 Run: python -m modal_deploy.test_pitch_lock
 """
+import math
+
 import numpy as np
 
-from modal_deploy.pitch_lock import PitchLock, MAX_ABS_SHIFT_SEMITONES
+from modal_deploy.pitch_lock import PitchLock, MAX_ABS_SHIFT_SEMITONES, DEFAULT_TARGET_F0_HZ
 
 
 def _voiced_block(f0_hz: float, n_frames: int = 100) -> np.ndarray:
@@ -68,6 +70,17 @@ def test_disabled_is_inert():
     print("disabled inert: SUCCESS")
 
 
+def test_invalid_target_f0_falls_back_to_default():
+    print("\n--- PitchLock: non-positive target_f0 falls back to the DEFAULT_TARGET_F0_HZ ---")
+    lock = PitchLock(prior_shift=7.0, target_f0=0.0)
+    assert lock.target_f0 == DEFAULT_TARGET_F0_HZ
+    locked = lock.add_block(_voiced_block(152.4), block_seconds=2.0)
+    assert locked and lock.locked and math.isfinite(lock.shift)
+    # Same math as test_locks_on_median_and_freezes, since target_f0 fell back to 208.
+    assert abs(lock.shift - 5.39) < 0.05, f"expected ~+5.39, got {lock.shift}"
+    print("invalid target_f0 fallback: SUCCESS")
+
+
 def main():
     print("Running modal_deploy/pitch_lock.py verification tests...")
     test_prior_until_locked()
@@ -75,6 +88,7 @@ def main():
     test_unvoiced_and_implausible_excluded()
     test_clamp()
     test_disabled_is_inert()
+    test_invalid_target_f0_falls_back_to_default()
     print("\nAll pitch-lock tests completed successfully!")
 
 

@@ -321,14 +321,21 @@ class RVCEngine:
         from infer.lib.infer_pack.modules.F0Predictor.PMF0Predictor import PMF0Predictor
         f0_predictor = PMF0Predictor(hop_length=160, sampling_rate=16000)
         
-        pitchf = f0_predictor.compute_f0(audio, p_len)
+        pitchf, uv = f0_predictor.compute_f0_uv(audio, p_len)
         if len(pitchf) < p_len:
-            pitchf = np.pad(pitchf, (0, p_len - len(pitchf)), mode="edge")
+            pad_len = p_len - len(pitchf)
+            pitchf = np.pad(pitchf, (0, pad_len), mode="edge")
+            uv = np.pad(uv, (0, pad_len), mode="edge")
         elif len(pitchf) > p_len:
             pitchf = pitchf[:p_len]
+            uv = uv[:p_len]
 
         if f0_sink is not None:
-            f0_sink.append(pitchf.astype(np.float32, copy=True))
+            # compute_f0_uv's f0 is interpolated (unvoiced frames filled) for
+            # conversion quality; mask it back to 0 on unvoiced frames using the
+            # predictor's own voiced/unvoiced flags before handing it to PitchLock,
+            # which relies on "unvoiced == 0" to gate its 2s voiced-credit window.
+            f0_sink.append(np.where(uv > 0, pitchf, 0.0).astype(np.float32))
         pitchf = pitchf * (2 ** (pitch / 12))
         
         f0_min = 50

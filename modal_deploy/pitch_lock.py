@@ -38,7 +38,14 @@ class PitchLock:
         min_voiced_seconds: float = DEFAULT_MIN_VOICED_SECONDS,
     ):
         self.prior_shift = float(prior_shift)
-        self.target_f0 = float(target_f0)
+        target_f0 = float(target_f0)
+        if target_f0 <= 0 or not math.isfinite(target_f0):
+            print(
+                f"[PitchLock] invalid target_f0={target_f0!r} (must be positive "
+                f"and finite) -- falling back to DEFAULT_TARGET_F0_HZ={DEFAULT_TARGET_F0_HZ}"
+            )
+            target_f0 = DEFAULT_TARGET_F0_HZ
+        self.target_f0 = target_f0
         self.enabled = bool(enabled)
         self.min_voiced_seconds = float(min_voiced_seconds)
         self.voiced_seconds = 0.0

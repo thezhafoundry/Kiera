@@ -322,12 +322,20 @@ class RVCStreamingConverter(VoiceConverter):
                 # Adopt the server's per-call locked shift so any WS reconnect
                 # RESUMES this identity (concrete pitch + adaptive_pitch=False in
                 # the next _config_payload) instead of re-detecting mid-call.
-                self.pitch_shift = float(locked)
-                self.adaptive_pitch = False
-                logger.info(
-                    "[RVCStreamingConverter] adaptive pitch locked at %+.2f st — "
-                    "reconnects will resume this value", self.pitch_shift,
-                )
+                try:
+                    locked_val = float(locked)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[RVCStreamingConverter] ignoring malformed locked_pitch: %r", locked,
+                    )
+                    locked_val = None
+                if locked_val is not None:
+                    self.pitch_shift = locked_val
+                    self.adaptive_pitch = False
+                    logger.info(
+                        "[RVCStreamingConverter] adaptive pitch locked at %+.2f st — "
+                        "reconnects will resume this value", self.pitch_shift,
+                    )
             if self.on_stats is not None:
                 try:
                     self.on_stats({k: v for k, v in data.items() if k != "type"})
