@@ -1,10 +1,32 @@
 ---
-title: Converted voice doesn't match the trained voice (live calls only) — RESOLVED 2026-07-08
+title: Converted voice doesn't match the trained voice (live calls only) — pitch axis resolved; clarity axis REOPENED 2026-07-14
 type: issue
-status: resolved
+status: open
 sources: [decisions-log, subsystem-notes, active-backlog]
-updated: 2026-07-08
+updated: 2026-07-14
 ---
+
+## Update 2026-07-14 — clarity axis reopened, pitch axis superseded
+
+The two causes below were independent, and they've diverged since:
+
+- **Pitch overshoot** is superseded by [[adaptive-pitch-lock-rollout]] — the fixed
+  `RVC_MALE_PITCH_SHIFT=7` constant this page's fix introduced itself went stale on
+  2026-07-13 (the agent's live F0 drifted from ~137Hz to 152-158Hz), reproducing the
+  wrong-identity symptom via the same mechanism. Replaced with a per-call adaptive lock,
+  field-confirmed working 2026-07-14.
+- **Double noise-suppression / muffled input** looks **regressed**, not resolved. Three
+  consecutive field calls since (07-13 x2, 07-14) measured input spectral centroid back
+  down to 250-360Hz — worse than this page's own original 413Hz pre-fix measurement, and
+  nowhere near the ~720Hz the fix restored (confirmed once, 07-11, at 628Hz). Both sides
+  of the fix were re-checked and are still correct in the source (server logs
+  `Noise Suppressor (Level 1)`; `frontend/app.js` still requests
+  `noiseSuppression:false, autoGainControl:false`) — pointing at the gotcha this page
+  already flagged below (browser caches `app.js`) recurring, not a code regression.
+  Not yet confirmed by a genuine hard-refresh test call. A structural risk was also found:
+  the frontend is served via a plain `StaticFiles` mount with no cache-control headers at
+  all, so nothing prevents this exact regression from recurring indefinitely for any
+  agent's stale tab.
 
 Distinct from [[part-by-part-audio-investigation]] (choppiness/latency) and
 [[sip-audio-mixing-isolation-bug]] (raw+converted mixing, now resolved) — this is about

@@ -22,6 +22,27 @@ whether it's a regression of something already tried and reverted here before re
 a fix from scratch.
 
 ## Decisions
+- **Adaptive per-call pitch lock replaces the fixed `RVC_MALE_PITCH_SHIFT` constant
+  (2026-07-13/14, spec `docs/superpowers/specs/2026-07-13-adaptive-pitch-shift-design.md`,
+  merged `88b3736`).** Why: the fixed shift (`+7`, calibrated 2026-07-08 against a ~137Hz
+  agent F0) went stale the moment the agent's live delivery drifted — 07-13 calls measured
+  152-158Hz, landing the converted output 1.5-2 semitones above the model's ~208Hz trained
+  center, i.e. a wrong-identity voice again. New design: the Modal worker (`/ws` session)
+  accumulates the engine's own pre-shift F0 (RMVPE on TRT, PM `compute_f0_uv` masked to
+  voiced-only on the ONNX fallback), locks `12·log2(target_f0/median)` once ≥2s of voiced
+  speech has been seen, then freezes for the rest of the call; the locked value rides the
+  existing `stats` payload so a WS reconnect **resumes** the locked identity instead of
+  re-detecting (this is what makes it safe against the exact failure that got the old GPU
+  auto-detect reverted 2026-07-03 — see [[subsystem-notes]]). Rejected: continuous mid-call
+  F0 tracking (would let the lead audibly hear the voice keep drifting) and per-agent-only
+  scope (all agents get the lock; the gender toggle is now just the pre-lock prior).
+  `RVC_ADAPTIVE_PITCH=0` (Render env) reverts to the exact legacy fixed-shift behavior with
+  no Modal redeploy needed. **Field-confirmed working 2026-07-14** on two live calls (locked
+  +3.33st from a measured 171.6Hz, and +5.67st from 149.9Hz — both landing ≈208Hz, both
+  math-exact against the formula). **Open follow-up**: the lock produces one audible pitch
+  *jump* partway into the call (prior → locked value) that was never listen-tested before
+  shipping, and `RVC_TARGET_F0=208` itself is a single 2026-07-08 reference measurement, not
+  re-derived from the model's actual training data — see [[active-backlog]].
 - **One-way voice conversion only (agent→lead).** Why: the agent needs to hear the lead's
   real voice for natural conversation; only the outbound "brand voice" needs to be
   consistent. Rejected: bidirectional conversion (adds latency and distorts the agent's

@@ -3,6 +3,33 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
+## [2026-07-14] ingest | Adaptive pitch lock shipped + field-verified; two new open issues from live-call diagnosis
+
+Built and merged the adaptive per-call pitch lock ([[adaptive-pitch-lock-rollout]],
+spec/plan/SDD execution, `88b3736`), replacing the fixed `RVC_MALE_PITCH_SHIFT` constant
+that itself had gone stale (agent F0 drifted 137→152-158Hz between 07-08 and 07-13,
+reproducing the original wrong-identity bug this project already fixed once). Deployed and
+field-confirmed on two live calls same day (`[AdaptivePitch] locked shift=+3.33/+5.67 st`,
+both math-exact). Diagnosing the user's live-call feedback across three rounds the same
+session surfaced two more things:
+
+1. **[[voice-identity-mismatch-investigation]] reopened on its clarity axis** — three
+   recent field calls show input spectral centroid regressed to 250-360Hz, worse than the
+   413Hz this page's own 2026-07-08 fix originally measured as the *problem*. Server and
+   frontend source are both still correct, pointing at the browser-app.js-caching gotcha
+   this page already flagged, recurring rather than a code regression. Also found: the
+   frontend has no cache-control headers at all, so nothing structurally prevents this.
+2. **New issue: [[playout-buffer-gulp-drain-oscillation]]**, unrelated to the pitch work.
+   Live block-level telemetry showed the playout buffer overshooting its current 0.25s
+   target by 6-7x and gulp-draining, three times within one 7-second continuous utterance
+   — a plausible mechanism for a "voice gets blurred on long sentences" report. Not yet
+   fixed or confirmed by ear.
+
+Also corrected stale numbers found along the way: [[adaptive-playout-buffer]] still said
+"1.25s target, Phase 2 not landed" — the live value has been 0.25s since `b38070c` (a
+revert commit that predates this session). Updated the page and its buffer-history count
+(now five designs, not four).
+
 ## [2026-07-08] ingest | Voice identity + clarity root-caused and fixed; SIP-leg packet loss fixed; call-analysis instrumentation
 
 The long-open [voice-identity-mismatch-investigation](pages/issues/voice-identity-mismatch-investigation.md)

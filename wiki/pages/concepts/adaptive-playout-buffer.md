@@ -2,22 +2,30 @@
 title: Standing playout buffer
 type: concept
 sources: [subsystem-notes, decisions-log]
-updated: 2026-07-07
+updated: 2026-07-14
 ---
 
-> **Phase 1 landed 2026-07-07:** the TensorRT migration's phased reduction (see
-> [[tensorrt-migration]]) has merged to `main` — the target dropped from ~3s to **1.25s**
-> (cap still ~5s). Render auto-deploys on every push to `main`, so this is live on the
-> deployed backend. Phase 2 (0.25s + smaller blocks, benchmark-gated) has not landed. The
-> numbers below describe the **current (1.25s)** design; historical designs are noted inline.
+> **Current live value: 0.25s target (commit `b38070c`, "restore 320ms block geometry,
+> 80ms SOLA, 0.25s cushion"), ~5s cap.** History: ~3s (2026-07-03) → 1.25s (TRT phase 1,
+> 2026-07-07) → 0.25s (TRT phase 2, 2026-07-07) → reverted/re-landed at 0.25s again by
+> `b38070c` (date of that commit not confirmed from this page alone). This number has
+> already been wrong once in this file — always verify `_PLAYOUT_BUFFER_TARGET_BYTES` in
+> `backend/pipeline.py` directly before citing it elsewhere. Render auto-deploys on every
+> push to `main`, so whatever's on `main` is live on the deployed backend.
+>
+> **Open bug against the current 0.25s design, found 2026-07-14:** see
+> [[playout-buffer-gulp-drain-oscillation]] — the consumer's gulp-then-catch-up drain
+> pattern lets the buffer overshoot its own 0.25s target by 6-7x during sustained speech,
+> a plausible cause of a "voice gets blurred on long sentences" field report.
 
-**This page describes the current (2026-07-07, TRT phase 1) design.** The pre-2026-07-02
-adaptive buffer this page used to document (`_run_playout`, P95-based adaptive sizing,
-`_REORDER_WAIT_S` reorder-wait) was removed entirely in the 2026-07-02 streaming rebuild,
-replaced with a one-shot 100ms jitter fill, which was itself replaced by a bounded ~3s-target
-standing buffer on 2026-07-03, since reduced to 1.25s on 2026-07-07. Four distinct designs in
-one buffer's history — see [[buffering-history]] for the full migration path before assuming
-any of them is still current.
+**This page describes the buffer's mechanism, which hasn't changed since 2026-07-03 —
+only its target/cap constants have moved.** The pre-2026-07-02 adaptive buffer this page
+used to document (`_run_playout`, P95-based adaptive sizing, `_REORDER_WAIT_S`
+reorder-wait) was removed entirely in the 2026-07-02 streaming rebuild, replaced with a
+one-shot 100ms jitter fill, which was itself replaced by the bounded standing buffer
+described here on 2026-07-03. Five distinct designs in one buffer's history — see
+[[buffering-history]] for the full migration path before assuming any of them is still
+current.
 
 **Why it exists (2026-07-03):** the 2026-07-02 rebuild's one-shot 100ms jitter buffer only
 smoothed the *start* of a call — once drained, any converter block slower than its
@@ -34,14 +42,14 @@ converted audio to `self._playout_buffer` (a plain bounded `bytearray`, not a se
 numbered reorder structure — the underlying stream is already strictly ordered, there's
 nothing to reorder). A separate `_run_playout_consumer` task drains it into
 `_publish_frames` at a steady pace:
-1. **Filling** — wait until at least `_PLAYOUT_BUFFER_TARGET_BYTES` (1.25s of 48kHz 16-bit
-   mono, as of 2026-07-07; was ~3s from 2026-07-03 until the TRT migration phase 1) has
+1. **Filling** — wait until at least `_PLAYOUT_BUFFER_TARGET_BYTES` (0.25s of 48kHz 16-bit
+   mono as of `b38070c`; was ~3s from 2026-07-03, then 1.25s under TRT phase 1) has
    accumulated before the first publish.
 2. **Draining** — after that, publish whatever has accumulated since the last publish,
    continuously; `_publish_frames`' own `capture_frame` backpressure already paces real
    playback correctly, so the consumer just has to never be starved by one slow block.
 
-**Bounded, not adaptive**: unlike the old P95-based design, the target (1.25s) and cap
+**Bounded, not adaptive**: unlike the old P95-based design, the target (0.25s) and cap
 (~5s, `_PLAYOUT_BUFFER_MAX_BYTES`) are fixed constants, not recomputed per session. Beyond
 the cap, the **oldest** buffered audio is dropped (same policy as
 `RVCStreamingConverter`'s reconnect buffer, `backend/converters/rvc_stream.py`,
@@ -59,8 +67,10 @@ just raise the cap further.
 against it, nor final confirmation from a live call that "part by part" audio is actually
 gone. See [[active-backlog]].
 
-**Why the target could shrink to 1.25s**: the original ~3s target was sized to absorb a slow
-non-TRT inference path; the TRT migration's C3 benchmark measured median 66ms/p95 68ms
-inference per block on a live L4 ([[tensorrt-migration]]), which is why the buffer no longer
-needs as deep a cushion. Phase 2 (0.25s) is benchmark-gated on confirming that headroom holds
-up under real call load, not just the benchmark harness.
+**Why the target could shrink**: the original ~3s target was sized to absorb a slow
+non-TRT inference path; the TRT migration's benchmarks measured well under 70ms inference
+per block on a live L4 ([[tensorrt-migration]]), which is why the buffer no longer needs
+as deep a cushion. That headroom is real (confirmed again 2026-07-14: 56-64ms/block during
+a live call), but a small *target* isn't the whole story for smoothness — see
+[[playout-buffer-gulp-drain-oscillation]] for a drain-pattern bug that can still let the
+buffer balloon well past 0.25s even when inference itself is fast.

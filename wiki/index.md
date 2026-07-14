@@ -7,9 +7,11 @@ wiki. This index is the first stop for any query — find the page here, then dr
 - [audio-pipeline-latency-budget](pages/concepts/audio-pipeline-latency-budget.md) — full
   mouth-to-ear latency breakdown, stage by stage. Updated 2026-07-07 for the streaming
   rebuild + TRT migration (was stale on VAD/T4/raw-fallback claims before that).
-- [adaptive-playout-buffer](pages/concepts/adaptive-playout-buffer.md) — the current
-  (2026-07-07, TRT phase 1) standing playout buffer: 1.25s target/5s cap, drop-oldest
-  overflow, decoupled producer/consumer. Fourth distinct design this buffer has had.
+- [adaptive-playout-buffer](pages/concepts/adaptive-playout-buffer.md) — the standing
+  playout buffer: currently **0.25s** target/5s cap (as of `b38070c`), drop-oldest
+  overflow, decoupled producer/consumer. Fifth distinct design this buffer has had. Has an
+  **open bug** against the current design — see
+  [[playout-buffer-gulp-drain-oscillation]].
 - [buffering-history](pages/concepts/buffering-history.md) — the five-attempt,
   one-revert migration path that led to the current buffer design; check here before
   re-fixing an old bug.
@@ -19,6 +21,16 @@ wiki. This index is the first stop for any query — find the page here, then dr
   post-rebuild). The live worker moved from T4 to **L4** on 2026-07-03.
 
 ## Issues (open/resolved problems)
+- [adaptive-pitch-lock-rollout](pages/issues/adaptive-pitch-lock-rollout.md) — **open,
+  deployed + field-confirmed 2026-07-14.** Fixed-shift pitch constant replaced with a
+  per-call adaptive lock after the constant itself went stale; two live calls confirmed
+  the lock math exactly. Open: an audible mid-call pitch jump never listen-tested before
+  shipping, and the 208Hz target itself is a single old reference measurement.
+- [playout-buffer-gulp-drain-oscillation](pages/issues/playout-buffer-gulp-drain-oscillation.md)
+  — **open, found 2026-07-14.** The playout buffer's drain pattern lets it overshoot its
+  0.25s target by 6-7x during sustained speech, three times in one 7-second utterance —
+  plausible cause of a "voice gets blurred on long sentences" field report. Unrelated to
+  the pitch-lock work shipped the same week.
 - [tensorrt-migration](pages/issues/tensorrt-migration.md) — **merged to `main` 2026-07-07,
   already past Phase 1 into Phase 2 same day.** Migrated the Modal worker to 3 static-shape
   TRT engines on the L4 to re-enable RMVPE pitch tracking; Phase 1 C3 benchmark 66ms/68ms,
@@ -39,12 +51,12 @@ wiki. This index is the first stop for any query — find the page here, then dr
   (`_restrict_sip_audio`) had a wrong protobuf field name and failed silently on 100% of
   calls; fixed and now confirmed succeeding (`✅`) on every call sampled since.
 - [voice-identity-mismatch-investigation](pages/issues/voice-identity-mismatch-investigation.md)
-  — **RESOLVED 2026-07-08** (one live verification call pending). Two independent causes, both
-  upstream of the model: `+12` male pitch shift overshot the model's ~208Hz range (→274Hz;
-  now `RVC_MALE_PITCH_SHIFT=7`), and double noise-suppression (browser + server L3) stripped
-  HF detail (→ raw browser capture + `NS_LEVEL=1`). The 2026-07-03 "ruled out pitch/input"
-  conclusions were false negatives — every offline test used a female clip that never hit the
-  +12 male path. Fixed `f748a89`.
+  — **pitch axis superseded, clarity axis REOPENED 2026-07-14.** Originally two independent
+  causes fixed `f748a89` on 2026-07-08: pitch overshoot (→ [[adaptive-pitch-lock-rollout]]
+  now) and double noise-suppression (browser + server) stripping HF detail. Three field
+  calls since (07-13 x2, 07-14) measured input spectral centroid back down to 250-360Hz —
+  worse than the original 413Hz problem — likely the same browser-cache gotcha this page
+  already documented, recurring; not yet confirmed by a hard-refresh test.
 - [sip-leg-packet-loss-edge-pinning](pages/issues/sip-leg-packet-loss-edge-pinning.md) —
   **RESOLVED 2026-07-08** (field-verify pending). Lead heard clipped words: RTP loss on the
   LiveKit→Twilio leg because `{trunk}.pstn.twilio.com` resolves to Twilio US, a transpacific

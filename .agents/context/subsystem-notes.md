@@ -60,14 +60,34 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   convert a 320ms block even after the FAISS caching fix below (a ~1.5-1.8x real-time
   factor), which reliably starved the old design.
 - Replaced with a producer/consumer split: `_run_conversion_stream` only appends converted
-  audio to `self._playout_buffer` (bounded, `_PLAYOUT_BUFFER_TARGET_BYTES` 1.25s as of the
-  TRT migration phase 1 (down from an original 3s target — see [[log]]) /
-  `_PLAYOUT_BUFFER_MAX_BYTES` ~5s cap, drop-oldest on overflow — same policy as
-  `RVCStreamingConverter`'s reconnect buffer, `backend/converters/rvc_stream.py`,
+  audio to `self._playout_buffer` (bounded, `_PLAYOUT_BUFFER_TARGET_BYTES` **0.25s as of
+  commit `b38070c`** — "revert(latency): restore 320ms block geometry, 80ms SOLA, 0.25s
+  cushion", the state as of 2026-07-13/14; went 3s→1.25s (TRT phase 1)→0.25s (TRT phase 2,
+  2026-07-07) and has been reverted/re-landed at least once since — always verify the live
+  constant in `backend/pipeline.py` rather than trusting a remembered number, this file has
+  been wrong before) / `_PLAYOUT_BUFFER_MAX_BYTES` ~5s cap, drop-oldest on overflow — same
+  policy as `RVCStreamingConverter`'s reconnect buffer, `backend/converters/rvc_stream.py`,
   `_MAX_BUFFER_BYTES`). A separate `_run_playout_consumer` task drains it into
   `_publish_frames` at a steady pace, decoupled from how bursty/delayed the converter's
   arrival timing actually is. A slow block now grows delay instead of producing "part by
   part" audio.
+- **Open finding (2026-07-14, unconfirmed as audible, not yet fixed): the consumer's "steady
+  pace" isn't actually steady-draining — it gulps the ENTIRE current buffer in one
+  `_publish_frames` call per wake, then relies on `capture_frame`'s backpressure (LiveKit's
+  AudioSource queue, ~200ms deep) to pace the gulp back out in real time.** Live call
+  telemetry (`[Worker][LatencySummary]` block-level `playout_buffer_bytes`, a 2026-07-14
+  22:23 IST call) showed this oscillating far past the 0.25s (24000-byte) target — growing to
+  121-182KB (1.3-1.9s) over 5-6 blocks, then dropping back near 0 — **three times within one
+  single unbroken 7-second voiced utterance**, with GPU inference itself fine throughout
+  (56-64ms/block). Hypothesis: because LiveKit's queue has room, the first ~200ms of a large
+  gulp gets accepted by `capture_frame` faster than real-time before pacing kicks in, i.e. a
+  small burst of time-compressed audio every cycle — while the python-side buffer quietly
+  refills underneath for the next gulp. User-reported symptom the same night: "if I talk a
+  big sentence the voice is getting blurred at the last" — plausible match (progressive
+  distortion over a long continuous utterance, not a hard dropout) but NOT yet confirmed by
+  ear against this specific mechanism. Fix direction not yet chosen: either drain the buffer
+  in small steady increments instead of one gulp, or re-tune target/consumer pacing. See
+  [[active-backlog]].
 - **`rtc.AudioFrame.data` is an int16-typed `memoryview` — `len()` on it returns *sample*
   count, not byte count.** (`len(frame.data)` on a 960-byte/480-sample frame returns 480,
   not 960.) Wrap it as `bytes(frame.data)` first if you need the real byte length — this is
@@ -169,6 +189,18 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   Trap: `pitch_lock.py` must stay numpy+stdlib-only (it imports into the container
   via `add_local_python_source("pitch_lock")` in `modal_defs.py` — same mount rule
   as streaming.py).
+  **Deployed and field-confirmed 2026-07-14** on two live calls (`modal app logs
+  rvc-worker`): `[AdaptivePitch] locked shift=+3.33 st (median F0=171.6Hz → target
+  208Hz, 2.0s voiced, prior +7.0)` and `locked shift=+5.67 st (median F0=149.9Hz →
+  target 208Hz, 2.1s voiced, prior +7.0)` — both math-exact against the formula,
+  confirming the mechanism and the reconnect-resume design work as built. Two open
+  items surfaced by actually listening: (1) the prior→locked transition is one
+  audible pitch **jump** roughly 20-26s into the call — never listen-tested before
+  shipping (the design's own lock-once-not-continuous tradeoff, now confirmed to have
+  a real audible cost, not just a hypothetical one); (2) `RVC_TARGET_F0=208` is a
+  single 2026-07-08 reference-output measurement, not derived from the model's
+  training data — worth re-validating if a user's identity complaint persists after
+  ruling out the input-muffling regression noted above. See [[active-backlog]].
 
 ## TensorRT/ONNX migration (merged to main 2026-07-07, merge commit `9c1093a`)
 Full spec: `implementation_plan.md` / `TRT_ROLLOUT_STEPS.md` (repo root). `trt-migration`
@@ -430,6 +462,24 @@ authoritative "why"; [[log]] 2026-07-08 has the decision framing.
   `autoGainControl:false`, `echoCancellation:true`); server level is `NS_LEVEL` env
   (default 3, live 1). **Browser caches `app.js`** — the raw-capture change only takes
   effect after a hard refresh (tell: mic-permission re-prompt).
+- **Regression re-observed 2026-07-13/14, likely the same browser-cache gotcha.** Three
+  consecutive field calls (07-13 x2, 07-14 22:03) measured input spectral centroid back down
+  to 250-360Hz — *worse* than the original 413Hz pre-fix measurement, not close to the ~720Hz
+  the fix restored on 07-11 (628Hz that day). Both sides of the code were re-verified correct
+  (server logged `Noise Suppressor (Level 1)`; `frontend/app.js:429-431` still requests
+  `noiseSuppression:false, autoGainControl:false`), so this isn't a code regression — leading
+  hypothesis is a stale cached `app.js` on the agent's browser tab still requesting the old
+  defaults. Compounding structural risk found the same session: `backend/main.py:1249` serves
+  the frontend via plain `StaticFiles` with **no cache-control headers at all**, so nothing
+  prevents this from recurring for any agent whose tab loaded the dashboard before a future
+  frontend fix. Not yet confirmed by a hard-refresh test call. See [[active-backlog]].
+- **Adaptive per-call pitch lock (2026-07-13/14) superseded the fixed-shift half of this
+  fix** — see the decision entry in [[log]] and the dedicated note under "Modal RVC GPU
+  worker" below for the mechanism. Field-confirmed working on two live calls 2026-07-14
+  (locked +3.33st and +5.67st, both landing the converted output ≈208Hz as designed) — so the
+  *pitch* axis of this original bug is now handled adaptively per-call rather than by a
+  static constant. The muffled-input axis (this bullet) is separate and, per the regression
+  note above, needs its own fresh field verification.
 - **Diagnostic method (reusable).** Autocorrelation F0 of an output WAV (voiced frames,
   lag r/60..r/400) checks pitch targeting; per-file speech-frame power spectrum (centroid,
   85% rolloff, band ratios rel 0.3-1kHz) localizes muffle to input vs model. Offline replay
