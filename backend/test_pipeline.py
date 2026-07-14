@@ -508,6 +508,43 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
     print("RVCStreamingConverter buffer-cap drop-oldest test: SUCCESS")
 
 
+async def test_rvc_streaming_adaptive_config_and_locked_pitch_resume():
+    print("\n--- Testing RVCStreamingConverter adaptive-pitch config + locked_pitch resume ---")
+    import json as _json
+
+    converter = RVCStreamingConverter(
+        ws_url="ws://127.0.0.1:1/ws",  # never actually connected in this test
+        pitch_shift=7,
+        adaptive_pitch=True,
+        target_f0=208.0,
+    )
+    payload = _json.loads(converter._config_payload())
+    assert payload["adaptive_pitch"] is True
+    assert payload["target_f0"] == 208.0
+    assert payload["pitch_shift"] == 7
+
+    # Server reports the per-call lock via stats: the converter must adopt it so
+    # the NEXT (reconnect) config resumes the locked identity instead of
+    # re-adapting — the 2026-07-03 auto-detect revert was exactly about
+    # re-detection on reconnect changing identity mid-call.
+    await converter._handle_incoming(None, _json.dumps(
+        {"type": "stats", "infer_ms": 55.0, "locked_pitch": 5.39}
+    ))
+    assert converter.pitch_shift == 5.39
+    assert converter.adaptive_pitch is False
+    payload = _json.loads(converter._config_payload())
+    assert payload["pitch_shift"] == 5.39
+    assert payload["adaptive_pitch"] is False
+
+    # Non-adaptive converters ignore locked_pitch (defensive; server won't send it).
+    fixed = RVCStreamingConverter(ws_url="ws://127.0.0.1:1/ws", pitch_shift=7)
+    await fixed._handle_incoming(None, _json.dumps(
+        {"type": "stats", "infer_ms": 55.0, "locked_pitch": 3.0}
+    ))
+    assert fixed.pitch_shift == 7
+    print("RVCStreamingConverter adaptive config + locked_pitch resume: SUCCESS")
+
+
 async def test_worker_readiness_probe_dedup():
     print("\n--- Testing VoiceConversionWorker readiness-probe dedup (outbound race fix) ---")
 
@@ -947,6 +984,7 @@ async def main():
     await test_rvc_streaming_converter_basic()
     await test_rvc_streaming_converter_reconnect()
     await test_rvc_streaming_converter_buffer_cap_drop_oldest()
+    await test_rvc_streaming_adaptive_config_and_locked_pitch_resume()
     await test_worker_readiness_probe_dedup()
     await test_on_converter_stats_accumulates_full_breakdown()
     await test_log_call_latency_summary_prints_header_rows_and_aggregates()

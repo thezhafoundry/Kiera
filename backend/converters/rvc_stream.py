@@ -61,11 +61,13 @@ class RVCStreamingConverter(VoiceConverter):
         endpoint_url: str = "",
         ws_url: str = "",
         api_key: str = "",
-        pitch_shift: int = -1,
+        pitch_shift: float = -1,
         index_rate: float = 0.75,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
         connect_timeout: float = 10.0,
+        adaptive_pitch: bool = False,
+        target_f0: float = 208.0,
     ):
         self.ws_url = (
             ws_url
@@ -74,6 +76,8 @@ class RVCStreamingConverter(VoiceConverter):
         ).rstrip("/")
         self.api_key = api_key
         self.pitch_shift = pitch_shift
+        self.adaptive_pitch = adaptive_pitch
+        self.target_f0 = target_f0
         self.index_rate = index_rate
         self.rms_mix_rate = rms_mix_rate
         self.protect = protect
@@ -101,6 +105,8 @@ class RVCStreamingConverter(VoiceConverter):
             "index_rate": self.index_rate,
             "rms_mix_rate": self.rms_mix_rate,
             "protect": self.protect,
+            "adaptive_pitch": self.adaptive_pitch,
+            "target_f0": self.target_f0,
         })
 
     def _connect_kwargs(self) -> dict:
@@ -311,6 +317,17 @@ class RVCStreamingConverter(VoiceConverter):
 
         msg_type = data.get("type")
         if msg_type == "stats":
+            locked = data.get("locked_pitch")
+            if locked is not None and self.adaptive_pitch:
+                # Adopt the server's per-call locked shift so any WS reconnect
+                # RESUMES this identity (concrete pitch + adaptive_pitch=False in
+                # the next _config_payload) instead of re-detecting mid-call.
+                self.pitch_shift = float(locked)
+                self.adaptive_pitch = False
+                logger.info(
+                    "[RVCStreamingConverter] adaptive pitch locked at %+.2f st — "
+                    "reconnects will resume this value", self.pitch_shift,
+                )
             if self.on_stats is not None:
                 try:
                     self.on_stats({k: v for k, v in data.items() if k != "type"})
