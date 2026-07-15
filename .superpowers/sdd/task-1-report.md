@@ -97,3 +97,53 @@ Each production behavior was preceded by a focused failing test. Representative 
 - Local tests emit existing FastAPI `on_event` deprecation warnings; they are unrelated to Task 1 and do not fail verification.
 - Real Render, LiveKit, Twilio, RVC, and LLVC behavior remains unverified; this task intentionally performed checkout-only tests and no external deployment.
 - The initial full-suite attempt could not bind loopback under the default sandbox; the same exact suite passed after loopback permission was granted.
+
+## Review fixes: PSTN boundary revalidation and stale pending input
+
+### Implementation
+
+- Outbound `/api/call/outbound/dial` now revalidates the actual LLVC converter socket after browser-track preparation and before SIP participant creation. An unhealthy session is replaced with RVC first; engine metadata is persisted before dialing.
+- Inbound `/api/call/wait` now revalidates the actual LLVC converter socket before returning bridge TwiML. It replaces LLVC with RVC and persists the fallback state before bridging; fallback failure remains on hold.
+- `_ensure_pstn_worker_ready` no longer trusts cached LLVC readiness. It reads `converter.is_healthy` and, if needed, waits up to 3 seconds on `worker.wait_until_ready()`, which is backed by the same call session rather than a probe socket.
+- The watchdog now requires pending input submitted within `_LLVC_PENDING_INPUT_RECENCY_S` (3 seconds). Old unacknowledged input expires during a mute/pause and cannot later trigger when the connection fails; recent pending input plus continuous unhealthy state remains fatal after 2 seconds.
+
+### Additional files changed
+
+- `backend/main.py`
+- `backend/pipeline.py`
+- `backend/test_call_safety.py`
+- `.superpowers/sdd/task-1-report.md`
+
+### Review-fix RED evidence
+
+1. Outbound boundary health loss:
+   - Command: `PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m unittest backend.test_call_safety.ControlPlaneSafetyTests.test_outbound_dial_revalidates_llvc_session_and_falls_back -v`
+   - RED: `Expected mock to have been awaited once. Awaited 0 times.` The old path created the SIP participant without starting RVC.
+2. Inbound boundary health loss:
+   - Command: `PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m unittest backend.test_call_safety.ControlPlaneSafetyTests.test_inbound_bridge_revalidates_llvc_session_and_falls_back -v`
+   - RED: `Expected mock to have been awaited once. Awaited 0 times.` The old path returned `<Dial>` using cached readiness without starting RVC.
+3. Stale pending input after mute/pause:
+   - Command: `.venv/bin/python -m unittest backend.test_call_safety.LLVCOutageDecisionTests.test_stale_pending_input_then_muted_pause_does_not_trigger -v`
+   - RED: `Expected mock to not have been awaited. Awaited 1 times.`
+
+### Review-fix GREEN evidence
+
+- Boundary tests:
+  - Command: `PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m unittest backend.test_call_safety.ControlPlaneSafetyTests.test_outbound_dial_revalidates_llvc_session_and_falls_back backend.test_call_safety.ControlPlaneSafetyTests.test_inbound_bridge_revalidates_llvc_session_and_falls_back -v`
+  - Result: `Ran 2 tests ... OK`.
+- Stale/recent watchdog pair:
+  - Command: `.venv/bin/python -m unittest backend.test_call_safety.LLVCOutageDecisionTests.test_stale_pending_input_then_muted_pause_does_not_trigger backend.test_call_safety.LLVCOutageDecisionTests.test_unhealthy_converter_with_unacknowledged_input_triggers_after_timeout -v`
+  - Result: `Ran 2 tests ... OK`.
+- Full focused suite:
+  - Command: `PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m unittest backend.test_call_safety -v`
+  - Result: `Ran 18 tests ... OK`.
+- Syntax/diff checks:
+  - Commands: `.venv/bin/python -m py_compile backend/main.py backend/pipeline.py backend/test_call_safety.py` and `git diff --check`
+  - Result: exit 0, no findings.
+- Full pipeline suite:
+  - Command: `PYTHON_DOTENV_DISABLED=1 .venv/bin/python -m backend.test_pipeline`
+  - Result: exit 0 with `All automated verification tests completed successfully!` (loopback test-server permission granted; no external service access).
+
+### Review-fix verification boundary
+
+- These fixes were verified locally with mocked control-plane boundaries and local loopback converter tests. No Modal, Twilio, LiveKit, or Render workspace was accessed.

@@ -103,6 +103,26 @@ class LLVCOutageDecisionTests(unittest.IsolatedAsyncioTestCase):
 
         callback.assert_awaited_once()
 
+    async def test_stale_pending_input_then_muted_pause_does_not_trigger(self):
+        worker = _make_llvc_worker(healthy=True)
+        worker._LLVC_PENDING_INPUT_RECENCY_S = 0.08
+        worker._last_submitted_input_at = time.monotonic() - 1.0
+        worker._last_converted_output_at = 0.0
+
+        callback = AsyncMock()
+        worker.on_llvc_fatal_failure = callback
+        task = asyncio.create_task(worker._holding_watchdog())
+        try:
+            await asyncio.sleep(0.03)
+            worker.converter.is_healthy = False
+            await asyncio.sleep(0.12)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        callback.assert_not_awaited()
+
     async def test_fatal_cleanup_callback_failure_is_observed(self):
         worker = _make_llvc_worker(healthy=False)
         worker._last_submitted_input_at = time.monotonic()
@@ -279,6 +299,8 @@ class ControlPlaneSafetyTests(unittest.IsolatedAsyncioTestCase):
         llvc_worker.effective_engine = "llvc"
         llvc_worker.fallback_reason = None
         llvc_worker.model_version = "llvc-pilot"
+        llvc_worker.converter.is_healthy = False
+        llvc_worker.wait_until_ready = AsyncMock(return_value=False)
         llvc_worker.wait_for_readiness_probe = AsyncMock(return_value=False)
 
         rvc_worker = MagicMock()
@@ -333,6 +355,144 @@ class ControlPlaneSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted["requested_engine"], "llvc")
         self.assertEqual(persisted["effective_engine"], "rvc")
         self.assertEqual(persisted["model_version"], "rvc-test")
+
+    async def test_outbound_dial_revalidates_llvc_session_and_falls_back(self):
+        room_name = "outbound_15551234567_boundary"
+        llvc_worker = MagicMock()
+        llvc_worker.requested_engine = "llvc"
+        llvc_worker.effective_engine = "llvc"
+        llvc_worker.fallback_reason = None
+        llvc_worker.model_version = "llvc-pilot"
+        llvc_worker.is_ready = True
+        llvc_worker.converter.is_healthy = True
+        llvc_worker.wait_until_ready = AsyncMock(return_value=False)
+        llvc_worker.wait_for_readiness_probe = AsyncMock(return_value=True)
+
+        rvc_worker = MagicMock()
+        rvc_worker.requested_engine = "llvc"
+        rvc_worker.effective_engine = "rvc"
+        rvc_worker.fallback_reason = "LLVC call session was not ready"
+        rvc_worker.model_version = "rvc-test"
+        rvc_worker.wait_for_readiness_probe = AsyncMock(return_value=True)
+
+        async def cleanup(room, **_kwargs):
+            self.main.active_workers.pop(room, None)
+
+        async def start_rvc(room, *_args, **_kwargs):
+            self.main.active_workers[room] = rvc_worker
+            return {"status": "started"}
+
+        start_mock = AsyncMock(side_effect=start_rvc)
+        fake_lk = MagicMock()
+        fake_lk.sip.create_sip_participant = AsyncMock(
+            return_value=MagicMock(participant_id="sip-participant")
+        )
+        fake_lk.aclose = AsyncMock()
+        self.main.active_workers.clear()
+        self.main.active_calls.clear()
+        self.main.active_workers[room_name] = llvc_worker
+        self.main.active_calls[room_name] = {
+            "status": "ready-to-dial",
+            "to": "+15551234567",
+            "agent_gender": "male",
+            "requested_engine": "llvc",
+            "effective_engine": "llvc",
+            "fallback_reason": "",
+            "model_version": "llvc-pilot",
+        }
+
+        # Preparation succeeded, then the real LLVC socket died before dialing.
+        llvc_worker.converter.is_healthy = False
+        request = self.main.OutboundDialRequest(
+            roomName=room_name,
+            phoneNumber="+15551234567",
+        )
+        with (
+            patch.object(self.main, "_agent_has_audio_track", AsyncMock(return_value=True)),
+            patch.object(self.main, "_cleanup_room_state", AsyncMock(side_effect=cleanup)),
+            patch.object(self.main, "_do_start_bot", start_mock),
+            patch.object(self.main, "_wait_for_worker_started", AsyncMock()),
+            patch.object(self.main, "_find_outbound_trunk", AsyncMock(return_value="trunk")),
+            patch.object(self.main, "_restrict_sip_audio", AsyncMock(return_value=True)),
+            patch.object(self.main.api, "LiveKitAPI", return_value=fake_lk),
+        ):
+            response = await self.main.dial_outbound(request)
+
+        self.assertEqual(response["status"], "initiated")
+        start_mock.assert_awaited_once()
+        self.assertEqual(self.main.active_calls[room_name]["effective_engine"], "rvc")
+        self.assertEqual(
+            self.main.active_calls[room_name]["fallback_reason"],
+            "LLVC call session was not ready",
+        )
+        fake_lk.sip.create_sip_participant.assert_awaited_once()
+
+    async def test_inbound_bridge_revalidates_llvc_session_and_falls_back(self):
+        sid = "CA789"
+        room_name = f"inbound_{sid}"
+        llvc_worker = MagicMock()
+        llvc_worker.requested_engine = "llvc"
+        llvc_worker.effective_engine = "llvc"
+        llvc_worker.fallback_reason = None
+        llvc_worker.model_version = "llvc-pilot"
+        llvc_worker.is_ready = True
+        llvc_worker.converter.is_healthy = True
+        llvc_worker.wait_until_ready = AsyncMock(return_value=False)
+        llvc_worker.wait_for_readiness_probe = AsyncMock(return_value=True)
+
+        rvc_worker = MagicMock()
+        rvc_worker.requested_engine = "llvc"
+        rvc_worker.effective_engine = "rvc"
+        rvc_worker.fallback_reason = "LLVC call session was not ready"
+        rvc_worker.model_version = "rvc-test"
+        rvc_worker.is_ready = True
+        rvc_worker.wait_for_readiness_probe = AsyncMock(return_value=True)
+
+        async def cleanup(room, **_kwargs):
+            self.main.active_workers.pop(room, None)
+
+        async def start_rvc(room, *_args, **_kwargs):
+            self.main.active_workers[room] = rvc_worker
+            return {"status": "started"}
+
+        start_mock = AsyncMock(side_effect=start_rvc)
+        self.main.active_workers.clear()
+        self.main.active_calls.clear()
+        self.main.worker_start_states.clear()
+        self.main.isolation_events.clear()
+        self.main.active_workers[room_name] = llvc_worker
+        self.main.active_calls[room_name] = {
+            "status": "accepted",
+            "agent_gender": "male",
+            "requested_engine": "llvc",
+            "effective_engine": "llvc",
+            "fallback_reason": "",
+            "model_version": "llvc-pilot",
+        }
+        start_state = self.main._WorkerStartState()
+        start_state.event.set()
+        self.main.worker_start_states[room_name] = start_state
+        isolation_event = asyncio.Event()
+        isolation_event.set()
+        self.main.isolation_events[room_name] = isolation_event
+
+        # Acceptance succeeded, then the real LLVC socket died before Twilio bridged.
+        llvc_worker.converter.is_healthy = False
+        with (
+            patch.object(self.main, "require_twilio_signature", AsyncMock()),
+            patch.object(self.main, "_cleanup_room_state", AsyncMock(side_effect=cleanup)),
+            patch.object(self.main, "_do_start_bot", start_mock),
+            patch.object(self.main, "_wait_for_worker_started", AsyncMock()),
+        ):
+            response = await self.main.call_wait(MagicMock(), callSid=sid)
+
+        self.assertIn("<Dial", response.body.decode())
+        start_mock.assert_awaited_once()
+        self.assertEqual(self.main.active_calls[room_name]["effective_engine"], "rvc")
+        self.assertEqual(
+            self.main.active_calls[room_name]["fallback_reason"],
+            "LLVC call session was not ready",
+        )
 
     def test_outbound_room_ids_are_collision_resistant(self):
         room_ids = {

@@ -725,8 +725,21 @@ async def _ensure_pstn_worker_ready(room_name: str, agent_gender: str):
     if worker is None:
         raise HTTPException(status_code=503, detail="Voice worker is unavailable.")
 
-    timeout = 3.0 if worker.effective_engine == "llvc" else 150.0
-    if await worker.wait_for_readiness_probe(timeout):
+    if worker.effective_engine == "llvc":
+        # The cached readiness probe only proves the session was healthy at some
+        # earlier instant. PSTN boundaries must inspect the socket that will carry
+        # this call's audio right now, after preparation and before bridge/dial.
+        if bool(getattr(worker.converter, "is_healthy", False)):
+            return worker
+        # LLVC wait_until_ready delegates to the same live converter session; it
+        # never opens a temporary probe socket. Give an in-flight handshake or
+        # reconnect its bounded pre-PSTN opportunity before selecting RVC.
+        if (
+            await worker.wait_until_ready(3.0)
+            and bool(getattr(worker.converter, "is_healthy", False))
+        ):
+            return worker
+    elif await worker.wait_for_readiness_probe(150.0):
         return worker
 
     if worker.effective_engine != "llvc":
@@ -749,6 +762,16 @@ async def _ensure_pstn_worker_ready(room_name: str, agent_gender: str):
         await _cleanup_room_state(room_name, remove_call=False)
         raise HTTPException(status_code=503, detail="Fallback RVC engine is not ready.")
     return fallback_worker
+
+
+def _persist_engine_state(call_info: dict, worker) -> None:
+    call_info.update({
+        "requested_engine": worker.requested_engine,
+        "effective_engine": worker.effective_engine,
+        "fallback_reason": worker.fallback_reason or "",
+        "model_version": worker.model_version,
+    })
+
 
 class TokenRequest(BaseModel):
     roomName: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
@@ -887,12 +910,10 @@ async def call_outbound(request: OutboundCallRequest):
             "status": "ready-to-dial",
             "direction": "outbound",
             "agent_identity": request.agentIdentity,
-            "requested_engine": worker.requested_engine,
-            "effective_engine": worker.effective_engine,
-            "fallback_reason": worker.fallback_reason or "",
-            "model_version": worker.model_version,
+            "agent_gender": request.agentGender,
             "created_at": datetime.datetime.now().isoformat(),
         }
+        _persist_engine_state(active_calls[room_name], worker)
     except HTTPException:
         await _cleanup_room_state(room_name, delete_room=True)
         raise
@@ -928,6 +949,16 @@ async def dial_outbound(request: OutboundDialRequest):
     if not await _agent_has_audio_track(request.roomName):
         await _cleanup_room_state(request.roomName, delete_room=True)
         raise HTTPException(status_code=503, detail="Agent audio track was not ready.")
+
+    try:
+        worker = await _ensure_pstn_worker_ready(
+            request.roomName,
+            call_info.get("agent_gender", "male"),
+        )
+    except HTTPException:
+        await _cleanup_room_state(request.roomName, delete_room=True)
+        raise
+    _persist_engine_state(call_info, worker)
 
     sip_trunk_id = await _find_outbound_trunk()
     if not sip_trunk_id:
@@ -1077,23 +1108,39 @@ async def call_wait(
     if call_info and call_info.get("isolation_failed"):
         return Response(content="""<?xml version="1.0" encoding="UTF-8"?>
 <Response><Hangup/></Response>""", media_type="application/xml")
-    if call_info and call_info.get("status") == "accepted" and worker and worker_started and worker.is_ready and isolation_confirmed:
-        # Agent has accepted AND the voice engine is confirmed ready — bridge to
-        # LiveKit SIP. Fail-closed: if the worker isn't ready yet, this falls
-        # through to the hold-TwiML branch below and re-polls in 3s rather than
-        # bridging a call that would only publish silence (never raw audio).
-        sip_domain = get_livekit_sip_domain()
-        status_callback = f"{SERVER_URL.rstrip('/') if SERVER_URL else ''}/api/call/status-event"
-        print(f"[Twilio Wait] Agent accepted! Bridging to LiveKit SIP: {room_name}@{sip_domain}")
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    can_check_boundary = bool(
+        call_info
+        and call_info.get("status") == "accepted"
+        and worker
+        and worker_started
+        and isolation_confirmed
+        and (worker.effective_engine == "llvc" or worker.is_ready)
+    )
+    if can_check_boundary:
+        try:
+            worker = await _ensure_pstn_worker_ready(
+                room_name,
+                call_info.get("agent_gender", "male"),
+            )
+        except HTTPException as exc:
+            print(
+                f"[Twilio Wait] Voice session not ready at bridge boundary "
+                f"for {room_name}: {exc.status_code}; holding"
+            )
+        else:
+            _persist_engine_state(call_info, worker)
+            sip_domain = get_livekit_sip_domain()
+            status_callback = f"{SERVER_URL.rstrip('/') if SERVER_URL else ''}/api/call/status-event"
+            print(f"[Twilio Wait] Agent accepted! Bridging to LiveKit SIP: {room_name}@{sip_domain}")
+            twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial timeout="60" action="{status_callback}" method="POST">
         <Sip>sip:{room_name}@{sip_domain};transport=tcp</Sip>
     </Dial>
 </Response>"""
-        return Response(content=twiml, media_type="application/xml")
+            return Response(content=twiml, media_type="application/xml")
 
-    elif call_info is None:
+    if call_info is None:
         # Call was ended/rejected
         print(f"[Twilio Wait] Call {sid} not found — hanging up")
         return Response(content="""<?xml version="1.0" encoding="UTF-8"?>
@@ -1145,10 +1192,7 @@ async def call_accept(request: AcceptCallRequest):
     # Mark as 'accepted' — /api/call/wait polls this and will then bridge the SIP call
     active_calls[room_name]["status"] = "accepted"
     active_calls[room_name]["agent_gender"] = request.agentGender
-    active_calls[room_name]["requested_engine"] = worker.requested_engine
-    active_calls[room_name]["effective_engine"] = worker.effective_engine
-    active_calls[room_name]["fallback_reason"] = worker.fallback_reason or ""
-    active_calls[room_name]["model_version"] = worker.model_version
+    _persist_engine_state(active_calls[room_name], worker)
     print(f"[Call Accept] Status set to 'accepted' for room={room_name}")
 
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:

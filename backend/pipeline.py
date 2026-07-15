@@ -88,6 +88,7 @@ class VoiceConversionWorker:
     _HOLD_TIMEOUT_S = 0.75
     _WATCHDOG_POLL_S = 0.2
     _LLVC_OUTAGE_TIMEOUT_S = 2.0
+    _LLVC_PENDING_INPUT_RECENCY_S = 3.0
 
     # Bytes of 48kHz 16-bit mono PCM equivalent to one 20ms (640-byte, 16kHz)
     # input frame, used to align the local timestamp-based latency estimate (the
@@ -591,10 +592,11 @@ class VoiceConversionWorker:
         """Runs alongside the conversion stream. Flips is_holding back to True (and
         republishes the latency metric so the frontend badge reacts promptly) if no
         converted audio has arrived for _HOLD_TIMEOUT_S. LLVC termination is a
-        separate fail-closed decision: it requires input newer than the last
-        converted output and a continuously unhealthy real converter session for
-        _LLVC_OUTAGE_TIMEOUT_S. Idle calls, muted tracks, and healthy speech pauses
-        therefore cannot be mistaken for converter outages."""
+        separate fail-closed decision: it requires recent input newer than the
+        last converted output and a continuously unhealthy real converter session
+        for _LLVC_OUTAGE_TIMEOUT_S. Stale pending input expires after
+        _LLVC_PENDING_INPUT_RECENCY_S, so idle calls, muted tracks, and healthy
+        speech pauses cannot be mistaken for converter outages."""
         try:
             llvc_fatal_triggered = False
             while True:
@@ -605,10 +607,20 @@ class VoiceConversionWorker:
                 pending_input = (
                     self._last_submitted_input_at > self._last_converted_output_at
                 )
+                recent_input = (
+                    self._last_submitted_input_at > 0.0
+                    and now - self._last_submitted_input_at
+                    <= self._LLVC_PENDING_INPUT_RECENCY_S
+                )
                 converter_healthy = bool(
                     getattr(self.converter, "is_healthy", False)
                 )
-                if self.effective_engine == "llvc" and pending_input and not converter_healthy:
+                if (
+                    self.effective_engine == "llvc"
+                    and pending_input
+                    and recent_input
+                    and not converter_healthy
+                ):
                     if self._llvc_unhealthy_since is None:
                         self._llvc_unhealthy_since = now
                 else:
