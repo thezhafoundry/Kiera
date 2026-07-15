@@ -148,8 +148,8 @@ remembered number in this file.
 
 ### Telephony & SIP ([backend/main.py](backend/main.py))
 `POST /api/setup` provisions the LiveKit↔Twilio SIP trunks + dispatch rule and points the
-Twilio webhook at this server — **destructive**, see `.agents/projects/active-backlog.md`
-before running it against a shared LiveKit project. Both outbound dial and inbound bridge
+Twilio webhook at this server — **non-destructive reconciliation**, though it still needs
+provider credentials and live verification. Both outbound dial and inbound bridge
 gate on `worker.is_ready` (fail-closed warm gate) before touching the lead. See
 `.agents/context/stack-and-rules.md` (File Map) and `.agents/context/subsystem-notes.md`
 for endpoint-level detail, known races, and open findings.
@@ -157,9 +157,20 @@ for endpoint-level detail, known races, and open findings.
 ### Environment
 Config is read from `.env` (no `.env.example` is checked in — see
 [README.md §3](README.md#3-environment-variables-reference) for the reference list):
-`LIVEKIT_*`, `RVC_ENDPOINT_URL`, `RVC_API_KEY`, `RVC_PITCH_SHIFT`, `RVC_INDEX_RATE`,
+`LIVEKIT_*`, `RVC_ENDPOINT_URL`, `RVC_API_KEY`, `KEIRA_CONTROL_TOKEN`, `RVC_PITCH_SHIFT`, `RVC_INDEX_RATE`,
 `RVC_WS_URL`, `RVC_KEEPWARM`, `RVC_ADAPTIVE_PITCH`, `RVC_TARGET_F0`, `CORS_ORIGINS`, `TWILIO_*`, `SERVER_URL`. Never commit `.env` or
 model files (`.pth`/`.index`/`.wav`) — they are gitignored.
+
+### Current control-plane rules
+- Operator HTTP routes require `Authorization: Bearer <KEIRA_CONTROL_TOKEN>`; the dashboard asks
+  for this token in memory only. The public `/api/health` endpoint is read-only.
+- Twilio inbound, wait, and status callbacks require valid `X-Twilio-Signature` values.
+- Modal `/convert` and `/ws` require the `RVC_API_KEY` from the `rvc-api-key` Modal secret.
+- Outbound calls are two-phase: prepare the room, let the browser publish its agent track, then
+  dial via `/api/call/outbound/dial`. Inbound calls remain held until the worker is ready and SIP
+  isolation succeeds.
+- Run `make session-close` before ending a session. It is a read-only repo/wiki/secret audit;
+  use `--write-report` only when you want a durable `.agents/session-reports/` handoff.
 
 ### Code Style
 - **Python**: PEP 8, type hints where useful. Never block the event loop — offload CPU/network

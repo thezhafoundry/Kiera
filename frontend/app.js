@@ -12,6 +12,24 @@ let isMuted = false;
 let agentIdentity = `agent-${Math.floor(1000 + Math.random() * 9000)}`;
 let localAudioTrack = null;
 let wsConn = null;
+let controlToken = null; // kept in memory only; never persisted in localStorage
+
+function getControlToken() {
+    if (controlToken) return controlToken;
+    const entered = window.prompt('Enter the Keira control token:');
+    if (!entered || !entered.trim()) {
+        throw new Error('A Keira control token is required');
+    }
+    controlToken = entered.trim();
+    return controlToken;
+}
+
+async function apiFetch(url, options = {}) {
+    const headers = new Headers(options.headers || {});
+    headers.set('Authorization', `Bearer ${getControlToken()}`);
+    if (!wsConn) initWebSocket();
+    return fetch(url, { ...options, headers });
+}
 
 document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
@@ -40,13 +58,18 @@ function setupEventListeners() {
     document.getElementById('btn-end-call').addEventListener('click', endActiveCall);
 }
 
+function selectedAgentGender() {
+    return document.getElementById('agent-gender')?.value || 'male';
+}
+
 
 // Initialize WebSockets for Incoming Call Webhook Broadcasts
 function initWebSocket() {
+    if (wsConn || !controlToken) return;
     const wsProto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
     const wsUrl = `${wsProto}${window.location.host}/api/call/ws`;
     
-    wsConn = new WebSocket(wsUrl);
+    wsConn = new WebSocket(wsUrl, [`keira-auth.${controlToken}`]);
 
     wsConn.onopen = () => {
         console.log("[WebSocket] Connection established");
@@ -104,7 +127,7 @@ async function startShift() {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 7 * 60 * 1000);
 
-        const resp = await fetch(`${API_BASE}/api/warmup`, {
+        const resp = await apiFetch(`${API_BASE}/api/warmup`, {
             method: 'POST',
             signal: controller.signal
         });
@@ -116,9 +139,9 @@ async function startShift() {
         if (data.status === 'success') {
             gpuIndicator.className = 'status-indicator online';
             gpuVal.innerText = 'Warm (Ready)';
-            shiftVal.innerText = 'Shift Active';
+            shiftVal.innerText = 'Warmup Complete';
             shiftVal.className = 'status-value online-text';
-            warmupBtn.innerText = 'Shift Started';
+            warmupBtn.innerText = 'Warmup Complete';
         } else {
             gpuIndicator.className = 'status-indicator error';
             gpuVal.innerText = 'Cold / Error — try again';
@@ -151,7 +174,7 @@ async function deployGPU() {
     gpuVal.innerText = 'Deploying in cloud...';
 
     try {
-        const resp = await fetch(`${API_BASE}/api/deploy`, { method: 'POST' });
+        const resp = await apiFetch(`${API_BASE}/api/deploy`, { method: 'POST' });
         const data = await resp.json();
         
         if (data.status === 'success') {
@@ -202,10 +225,10 @@ async function acceptIncomingCall() {
     setupCallUI();
 
     try {
-        const resp = await fetch(`${API_BASE}/api/call/accept`, {
+        const resp = await apiFetch(`${API_BASE}/api/call/accept`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ roomName, agentIdentity })
+            body: JSON.stringify({ roomName, agentIdentity, agentGender: selectedAgentGender() })
         });
         
         if (!resp.ok) throw new Error("Accept endpoint failed");
@@ -225,7 +248,7 @@ async function rejectIncomingCall() {
     hideIncomingCallPopup();
 
     try {
-        await fetch(`${API_BASE}/api/call/end`, {
+        await apiFetch(`${API_BASE}/api/call/end`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ roomName })
@@ -242,11 +265,12 @@ async function startOutboundCall(phone, name) {
     document.getElementById('active-lead-number').innerText = phone;
     setupCallUI();
 
+    let preparedRoom = null;
     try {
-        const resp = await fetch(`${API_BASE}/api/call/outbound`, {
+        const resp = await apiFetch(`${API_BASE}/api/call/outbound`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ phoneNumber: phone, agentIdentity, agentGender: 'male' })
+            body: JSON.stringify({ phoneNumber: phone, agentIdentity, agentGender: selectedAgentGender() })
         });
         
         if (!resp.ok) {
@@ -256,9 +280,34 @@ async function startOutboundCall(phone, name) {
         }
 
         const data = await resp.json();
+        preparedRoom = data.roomName;
         await connectToRoom(data.serverUrl, data.token, data.roomName);
+
+        const dialResp = await apiFetch(`${API_BASE}/api/call/outbound/dial`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ roomName: data.roomName, phoneNumber: phone })
+        });
+        if (!dialResp.ok) {
+            let detail = `Server error ${dialResp.status}`;
+            try { const err = await dialResp.json(); detail = err.detail || JSON.stringify(err); } catch {}
+            throw new Error(detail);
+        }
     } catch (e) {
         alert("Outbound call failed:\n\n" + e.message);
+        const failedRoom = preparedRoom || currentRoomName;
+        if (failedRoom && controlToken) {
+            try {
+                await apiFetch(`${API_BASE}/api/call/end`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ roomName: failedRoom })
+                });
+            } catch (cleanupError) {
+                console.error("Failed to clean up outbound room:", cleanupError);
+            }
+        }
+        leaveRoom();
         resetCallUI();
     }
 }
@@ -317,7 +366,9 @@ async function connectToRoom(serverUrl, token, roomName) {
     } catch (e) {
         console.error("LiveKit connection error:", e);
         alert("LiveKit connection failed: " + e.message);
+        leaveRoom();
         resetCallUI();
+        throw e;
     }
 }
 
@@ -472,7 +523,7 @@ async function endActiveCall() {
     leaveRoom();
 
     try {
-        await fetch(`${API_BASE}/api/call/end`, {
+        await apiFetch(`${API_BASE}/api/call/end`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ roomName })

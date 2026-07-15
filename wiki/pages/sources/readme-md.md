@@ -2,12 +2,12 @@
 title: README.md
 type: source
 sources: [../../../README.md]
-updated: 2026-07-07
+updated: 2026-07-15
 ---
 
 [README.md](../../../README.md) — account setup and end-to-end run guide for Keira.
-Updated 2026-07-07 (stale-data audit) to reflect the current fail-closed/streaming/L4
-pipeline.
+Updated 2026-07-15 to include the control-plane token, Modal secret requirement, and
+two-phase call-ordering safeguards.
 
 ## Key claims
 - High-level architecture: agent browser mic → LiveKit room → Python bot → WebRTC noise
@@ -16,6 +16,11 @@ pipeline.
 - **Fail-closed, never raw**: no raw-voice fallback (removed structurally). On any
   conversion outage the bot publishes silence and recovers when real converted audio
   resumes.
+- Operator routes require `KEIRA_CONTROL_TOKEN`; Twilio webhooks require signed callbacks;
+  Modal conversion endpoints require the shared `RVC_API_KEY` secret. Outbound calls prepare
+  the room before dialing, and inbound calls bridge only after readiness and isolation checks.
+- The session-close check is available as `make session-close`; `--write-report` creates a
+  dated local handoff report without contacting providers.
 - One-way conversion (agent→lead only) restated, consistent with all other sources.
 - Setup requires LiveKit Cloud, Twilio (Elastic SIP Trunk), and Modal accounts.
   Environment variable reference expanded to include `RVC_INDEX_RATE`, `RVC_WS_URL`,

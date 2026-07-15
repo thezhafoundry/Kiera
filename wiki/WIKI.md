@@ -46,7 +46,7 @@ same decision's full context for a human trying to understand *why*.
   updated: YYYY-MM-DD
   ---
   ```
-- **Linking**: use Obsidian-style `[[page-name]]` (no `.md`, no path — filenames are
+- **Linking**: use Obsidian-style `[[adaptive-playout-buffer]]` links (no `.md`, no path — filenames are
   unique across `pages/`) for wiki-to-wiki links, matching the convention already used
   in `.agents/`. Use normal markdown links for paths outside the wiki (source files,
   `.agents/` pages).

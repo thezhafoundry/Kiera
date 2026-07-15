@@ -154,10 +154,10 @@ throwaway debug code:
   file via `modal run modal_deploy/worker.py::main_chunked --input-file <path> --pitch <n>`,
   with no network/SIP/telephony involved. Use this for *any* future "does the live pipeline's
   audio processing itself produce X" question before touching production.
-- **`_DEBUG_SAVE_RAW_AUDIO`** (currently `True` in the deployed worker) — saves the first 30s
-  of real pre-conversion PCM per live call to the Modal volume. **Must be flipped back to
-  `False` and redeployed once this investigation concludes** — not meant to run indefinitely
-  (storage, and it's per-call overhead). See [[active-backlog]].
+- **`_DEBUG_SAVE_AUDIO`** is the current temporary capture flag. It saves bounded post-denoise
+  input and converted output WAVs per live call and now defaults OFF. Enable it only with
+  `DEBUG_SAVE_AUDIO=1` for an explicitly approved diagnostic session; it is not a permanent
+  production feature. See [[active-backlog]].
 
 ## Side finding: GPU tier was silently stale
 

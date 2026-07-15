@@ -1,9 +1,9 @@
 ---
 title: "Part by part" audio investigation (post-rebuild)
 type: issue
-status: resolved
+status: open
 sources: [decisions-log, subsystem-notes, active-backlog]
-updated: 2026-07-03
+updated: 2026-07-15
 ---
 
 After the 2026-07-02 streaming rebuild shipped and went live, the user reported call audio
@@ -76,7 +76,6 @@ insufficient.
 
 ## Status
 
-Findings 1-3 confirmed fixed via production log evidence. Finding 4's buffer/block-size
-change is deployed but **not yet confirmed on a live call** — see [[active-backlog]]. Next
-lever if still insufficient: Modal GPU tier bump (T4 → A10G/L4, no retraining), then
-ONNX/TensorRT export of the HuBERT/generator inference path (no retraining, more effort).
+Findings 1-3 were confirmed fixed via production evidence. The current consumer drains the
+standing buffer in bounded 100ms chunks rather than gulping the entire buffer, but that change
+still needs live-call verification — see [[active-backlog]].

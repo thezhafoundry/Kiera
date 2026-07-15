@@ -2,7 +2,7 @@
 title: .agents/context/subsystem-notes.md
 type: source
 sources: [../../../.agents/context/subsystem-notes.md]
-updated: 2026-07-07
+updated: 2026-07-15
 ---
 
 [.agents/context/subsystem-notes.md](../../../.agents/context/subsystem-notes.md) —
@@ -12,9 +12,10 @@ load-bearing gotchas per subsystem, the "why" the code alone doesn't convey.
 - **Pipeline/playout (current)**: the converter is driven as one long-lived duplex WS
   stream (`_run_conversion_stream`) — frames arrive strictly in order, so there is nothing
   to reorder (no sequence numbers, no `_run_playout`). Since 2026-07-03, converted output
-  feeds a bounded standing playout buffer (**1.25s target** / 5s cap as of 2026-07-07 TRT
-  phase 1, down from an original ~3s target; drop-oldest overflow) drained by a separate
-  `_run_playout_consumer` task. See [[adaptive-playout-buffer]], [[buffering-history]],
+  feeds a bounded standing playout buffer (**0.25s target** / 5s cap as of 2026-07-13 TRT
+  phase 2, down from an original ~3s target; drop-oldest overflow) drained by a separate
+  `_run_playout_consumer` task. After the initial target fill, the consumer drains bounded
+  100ms chunks rather than the entire queue at once. See [[adaptive-playout-buffer]], [[buffering-history]],
   [[tensorrt-migration]].
 - `contextlib.aclosing(gen)` around the conversion generator is load-bearing, not
   optional — a bare `async for ... break` won't reliably call the generator's `aclose()`,
@@ -40,3 +41,7 @@ load-bearing gotchas per subsystem, the "why" the code alone doesn't convey.
   kills in-flight calls. See [[render-autodeploy-kills-live-calls]].
 - **Windows dev**: `webrtc-noise-gain` silently degrades to passthrough if its native lib
   is missing. `webrtcvad` is gone entirely post-rebuild — unused dependency.
+- **Call-control safety (2026-07-15)**: `/api/call/outbound` prepares but does not dial;
+  `/api/call/outbound/dial` waits for an agent audio track and verified SIP restriction.
+  Inbound `/api/call/wait` hangs up instead of bridging when worker readiness or isolation
+  fails. These gates are local until a deployed live call confirms them.

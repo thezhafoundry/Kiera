@@ -43,13 +43,16 @@
   that returns 16kHz output will play back at the wrong speed/pitch, not just be mis-sliced.
 - **Noise suppressor frame contract**: `process_frame` must accept/return exactly 320
   bytes (10ms @ 16kHz mono 16-bit PCM).
-- **There is no playout queue anymore** — the old "sequence numbers are never reset mid-call"
-  invariant doesn't apply to anything that still exists (no `_run_playout`, no
-  `_next_publish_seq`). The nearest equivalent invariants now: (1) the conversion stream generator
-  must always be torn down via `contextlib.aclosing` (a bare `async for ... break` will not
-  reliably close it and stop the converter's backend session) — see [[subsystem-notes]]; (2)
-  `VoiceConversionWorker.is_ready` must stay a cheap cached-property read, never a live re-probe,
-  since Twilio polls `/api/call/wait` roughly every 3s — see [[subsystem-notes]].
+- **The standing playout buffer is load-bearing.** `_run_conversion_stream` appends converted
+  48kHz PCM to bounded `_playout_buffer`; `_run_playout_consumer` drains it at a steady pace.
+  The current target is 0.25s with a 5s cap; preserve drop-oldest overflow, the wake-up event,
+  and exact 960-byte publication frames unless a live quality/latency test approves a change.
+  The old sequence-number queue (`_run_playout` / `_next_publish_seq`) is gone, but the current
+  byte-buffer queue is present — see [[subsystem-notes]].
+- **Always close the conversion generator.** Use `contextlib.aclosing`; a bare
+  `async for ... break` will not reliably stop the converter's backend session.
+- **Readiness polling must stay cheap.** `VoiceConversionWorker.is_ready` is a cached property,
+  never a live network probe, because Twilio polls `/api/call/wait` roughly every 3s.
 - **Don't push to `main` mid-call during manual testing.** Render's `autoDeploy: commit`
   redeploys on every push, killing the LiveKit worker and any in-flight
   `VoiceConversionWorker`, forcing a Modal cold-start on the next call. This has been

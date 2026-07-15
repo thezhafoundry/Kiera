@@ -403,7 +403,7 @@ these are lasting tools, not throwaway debug code:
   converted output (48 kHz post-SOLA, **pre-PresenceEQ** — the backend EQs after this point)
   to `/root/rvc-models/debug/` when the session closes — download with
   `modal volume get rvc-models debug/<filename> <local-path>`. Default ON; disable with
-  `DEBUG_SAVE_AUDIO=0` + redeploy. Same "temporary while investigating" caveat as its
+  `DEBUG_SAVE_AUDIO=1` + redeploy for a deliberate diagnostic session. Default OFF; same "temporary while investigating" caveat as its
   predecessor (per-call overhead, volume storage). Pairs with the Twilio trunk recording
   (`record-from-answer-dual`, enabled 2026-07-08 on trunk `TK8958...da94`) for 3-point
   clarity isolation on outbound demo calls: raw input → converted output → what the lead
@@ -497,8 +497,8 @@ artifacts and diff stage-by-stage:
    `.wav?RequestedChannels=2` (ch0 converted voice, ch1 lead — verify by envelope corr).
 2. **Modal debug WAVs** = `modal volume ls rvc-models debug/` → `call_<ts>_in16k.wav`
    (post-denoise input) + `call_<ts>_out48k.wav` (post-SOLA, **pre-PresenceEQ** output).
-   `_DEBUG_SAVE_AUDIO` flag in `worker.py`, default ON — **temporary**, disable via
-   `DEBUG_SAVE_AUDIO=0` + redeploy once the identity/clarity work is field-verified.
+   `_DEBUG_SAVE_AUDIO` flag in `worker.py`, default OFF — **temporary**, enable via
+   `DEBUG_SAVE_AUDIO=1` + redeploy only for an explicitly approved diagnostic session.
 3. **Render logs** via Render MCP (`srv-d932m4cvikkc73belt1g`, workspace
    `tea-d91lambtqb8s7398mfd0`); legible now that `PYTHONUNBUFFERED=1` is set.
 Envelope method: 20ms RMS envelopes; windowed xcorr out48k↔twilio-conv gives delay(t)

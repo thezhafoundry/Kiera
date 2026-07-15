@@ -3,7 +3,7 @@ title: README states a stale 5000ms fail-safe budget
 type: issue
 status: resolved
 sources: [readme-md, latency-md]
-updated: 2026-07-07
+updated: 2026-07-15
 ---
 
 **Resolved 2026-07-07**: the fail-safe/budget concept itself is gone from the code, not just

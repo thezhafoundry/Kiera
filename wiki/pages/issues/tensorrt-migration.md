@@ -1,9 +1,9 @@
 ---
 title: TensorRT migration (RMVPE re-enable + phased latency plan)
 type: issue
-status: merged-pending-verification
+status: open
 sources: [decisions-log, subsystem-notes, active-backlog]
-updated: 2026-07-07
+updated: 2026-07-15
 ---
 
 **Status as of 2026-07-07: merged to `main` (`9c1093a`) and already past Phase 1 into
@@ -47,7 +47,7 @@ confirming the live Modal deploy is actually serving the TRT path (`/api/health`
   FP32 while HuBERT/RMVPE stay FP16.
 
 The full spec is
-[implementation_plan.md](../../../implementation_plan.md) at the repo root. Unusually for
+[TRT_ROLLOUT_STEPS.md](../../../TRT_ROLLOUT_STEPS.md) at the repo root. Unusually for
 this project, the implementation is being done by a *different* AI model; the resident
 agent's role is reviewing the resulting diffs against the plan's gates (checklist in the
 TensorRT row of [.agents/projects/active-backlog.md](../../../.agents/projects/active-backlog.md)).

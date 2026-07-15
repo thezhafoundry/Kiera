@@ -3,6 +3,21 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
+## [2026-07-15] ingest | Control-plane hardening + session-close workflow implemented locally
+
+Closed the highest-risk local gaps found in the runtime review: operator routes now use
+Bearer authentication, Twilio webhooks validate signatures, the Modal `/convert` and
+`/ws` paths require the shared RVC key, worker startup is managed by the application,
+outbound dialing is two-phase (prepare, then dial after an agent track exists), inbound
+bridging waits for readiness and confirmed SIP isolation, and `/api/setup` no longer
+deletes unrelated trunks or dispatch rules. The playout consumer now drains in bounded
+100ms chunks instead of gulping the whole buffer. Added `make session-close` for a
+repeatable end-of-session lint and handoff report.
+
+These changes are implemented in the checkout but still need Render/Modal configuration,
+deployment, and live inbound/outbound verification. The exposed Render MCP credential
+also remains an external rotation task; removing it from files does not revoke it.
+
 ## [2026-07-14] ingest | Adaptive pitch lock shipped + field-verified; two new open issues from live-call diagnosis
 
 Built and merged the adaptive per-call pitch lock ([[adaptive-pitch-lock-rollout]],

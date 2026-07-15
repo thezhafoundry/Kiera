@@ -1,13 +1,24 @@
 import os
 import asyncio
+import contextlib
 import datetime
 import time
-from typing import Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Form, Response
+from typing import Literal, Optional
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+    Form,
+)
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from livekit import api
@@ -15,11 +26,114 @@ from .converters.rvc_stream import RVCStreamingConverter
 from .converters.dummy import DummyVoiceConverter
 from .noise.noise_suppressor import WebRTCNoiseSuppressor
 from .pipeline import VoiceConversionWorker
+from .security import (
+    redact_phone_number,
+    validate_agent_identity,
+    validate_e164_phone,
+    verify_bearer_token,
+    RateLimiter,
+)
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI(title="Keira MVP Voice Conversion Server")
+
+# Operator control-plane authentication. Fail closed when this is absent: a
+# public deployment must never silently fall back to unauthenticated controls.
+CONTROL_PLANE_TOKEN = os.getenv("KEIRA_CONTROL_TOKEN") or os.getenv("CONTROL_PLANE_TOKEN", "")
+
+# Small per-process rate limiter. This is a first guard, not a replacement for
+# a shared gateway limiter when the service is scaled beyond one instance.
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+_RATE_LIMIT_DEFAULT = 120
+_RATE_LIMIT_EXPENSIVE = 10
+_EXPENSIVE_PATHS = {"/api/setup", "/api/deploy", "/api/warmup"}
+_rate_limiter = RateLimiter(window_seconds=_RATE_LIMIT_WINDOW_SECONDS)
+
+
+def _rate_limit_allows(client_key: str, path: str) -> bool:
+    limit = _RATE_LIMIT_EXPENSIVE if path in _EXPENSIVE_PATHS else _RATE_LIMIT_DEFAULT
+    return _rate_limiter.allows(
+        client_key,
+        path if path in _EXPENSIVE_PATHS else "api",
+        limit,
+    )
+
+
+@app.middleware("http")
+async def rate_limit_api(request: Request, call_next):
+    if request.url.path.startswith("/api/") and not _rate_limit_allows(
+        request.client.host if request.client else "unknown",
+        request.url.path,
+    ):
+        return JSONResponse({"detail": "Too many requests. Try again later."}, status_code=429)
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def disable_static_asset_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.endswith((".js", ".css")):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
+async def require_control_token(authorization: str = Header(default="")):
+    if not CONTROL_PLANE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Control-plane authentication is not configured.",
+        )
+    if not verify_bearer_token(authorization, CONTROL_PLANE_TOKEN):
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def require_twilio_signature(request: Request):
+    """Validate Twilio's signed callback before accepting form data."""
+    if not TWILIO_AUTH_TOKEN:
+        raise HTTPException(status_code=503, detail="Twilio callback validation is not configured.")
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        raise HTTPException(status_code=403, detail="Invalid Twilio callback signature.")
+
+    from twilio.request_validator import RequestValidator
+
+    form_values = dict(await request.form())
+    url = f"{SERVER_URL.rstrip('/')}{request.url.path}" if SERVER_URL else str(request.url)
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    if not RequestValidator(TWILIO_AUTH_TOKEN).validate(url, form_values, signature):
+        raise HTTPException(status_code=403, detail="Invalid Twilio callback signature.")
+
+
+def _validate_room_name(value: str) -> str:
+    if not value or len(value) > 128 or not all(c.isalnum() or c in "_.-" for c in value):
+        raise ValueError("invalid room name")
+    return value
+
+
+def _require_agent_identity(value: str) -> None:
+    if not validate_agent_identity(value):
+        raise HTTPException(
+            status_code=422,
+            detail="identity must be 5-64 safe characters and include 'agent'.",
+        )
+
+
+class _WorkerStartState:
+    def __init__(self):
+        self.event = asyncio.Event()
+        self.error: Optional[str] = None
+
+
+worker_tasks: dict[str, asyncio.Task] = {}
+worker_start_states: dict[str, _WorkerStartState] = {}
+isolation_events: dict[str, asyncio.Event] = {}
 
 
 @app.on_event("startup")
@@ -140,7 +254,8 @@ async def _rvc_keepwarm_loop():
     Timeout is 150s to cover Modal cold-start time (~60-90s).
 
     Disabled by default to avoid 24/7 GPU billing (~$550-600/mo on the L4).
-    Enable at shift start via Render env: RVC_KEEPWARM=1. No redeploy needed.
+    Enable by setting RVC_KEEPWARM=1 before backend startup. On Render, changing the
+    environment normally restarts the service, which is when this loop reads the setting.
     """
     # Phase D decision (2026-07-06): env-gated to save cost; default OFF.
     if os.getenv("RVC_KEEPWARM", "0") != "1":
@@ -187,10 +302,10 @@ async def _restrict_sip_audio(room_name: str, sip_identity: str = "sip-lead"):
     and/or SIP participant hasn't joined yet.
     """
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
-        return
+        return False
 
-    max_attempts = 8
-    retry_delay = 2.0  # seconds between attempts
+    max_attempts = 20
+    retry_delay = 0.25  # keep the lead held behind the gate while participants settle
 
     for attempt in range(1, max_attempts + 1):
         await asyncio.sleep(retry_delay)
@@ -252,7 +367,7 @@ async def _restrict_sip_audio(room_name: str, sip_identity: str = "sip-lead"):
                 f"tracks {raw_agent_track_sids}. "
                 f"Only bot converted tracks {bot_track_sids} will reach the phone."
             )
-            return  # done
+            return True
 
         except Exception as e:
             print(f"[SIP Isolation] Attempt {attempt} failed: {e}")
@@ -261,6 +376,7 @@ async def _restrict_sip_audio(room_name: str, sip_identity: str = "sip-lead"):
                 await lk.aclose()
 
     print(f"[SIP Isolation] ⚠️ Could not restrict SIP subscriptions for room {room_name} after {max_attempts} attempts.")
+    return False
 
 
 # Log Twilio configuration state at startup so misconfigurations are obvious in logs
@@ -285,8 +401,9 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
+    async def connect(self, websocket: WebSocket, *, already_accepted: bool = False):
+        if not already_accepted:
+            await websocket.accept()
         self.active_connections.append(websocket)
         print(f"[WebSockets] Agent connected. Total agents: {len(self.active_connections)}")
 
@@ -355,8 +472,48 @@ async def _wait_for_rvc_ready(max_wait_seconds: float = 360.0, poll_interval: fl
     print(f"[RVC Warmup] TIMEOUT: GPU did not become ready within {max_wait_seconds:.0f}s")
     return {"status": "error", "message": f"GPU did not become ready within {max_wait_seconds:.0f}s."}
 
+# Shared lifecycle helpers for converter bots
+async def _wait_for_worker_started(room_name: str, timeout: float = 30.0) -> None:
+    state = worker_start_states.get(room_name)
+    if state is None:
+        raise HTTPException(status_code=500, detail="Bot startup state is missing.")
+    try:
+        await asyncio.wait_for(state.event.wait(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=503, detail="Voice bot did not join LiveKit in time.") from exc
+    if state.error:
+        raise HTTPException(status_code=503, detail="Voice bot failed to join LiveKit.")
+
+
+async def _cleanup_room_state(room_name: str, *, delete_room: bool = False) -> None:
+    worker = active_workers.pop(room_name, None)
+    task = worker_tasks.pop(room_name, None)
+    worker_start_states.pop(room_name, None)
+    isolation_events.pop(room_name, None)
+
+    if task and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    if worker:
+        await worker.stop()
+
+    if delete_room and LIVEKIT_API_KEY and LIVEKIT_API_SECRET:
+        lk = None
+        try:
+            lk = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+            await lk.room.delete_room(api.DeleteRoomRequest(room=room_name))
+        except Exception as exc:
+            print(f"[Server] Room cleanup failed for {room_name}: {type(exc).__name__}")
+        finally:
+            if lk:
+                await lk.aclose()
+    active_calls.pop(room_name, None)
+
+
 # Shared logic to spawn a converter bot for a room
-async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent_gender: str = "male"):
+async def _do_start_bot(room_name: str, agent_gender: str = "male"):
+    _validate_room_name(room_name)
     if room_name in active_workers:
         return {"status": "already_running", "message": f"Voice conversion bot is already active in room {room_name}."}
 
@@ -429,21 +586,30 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
     # slow) wait_until_ready() exactly once and caches the result.
     worker.start_readiness_probe(150.0)
 
-    # Start bot in background
+    # Start bot in a managed task immediately. FastAPI BackgroundTasks begin only
+    # after the HTTP response, which was too late for readiness-gated dialing.
+    start_state = _WorkerStartState()
+    worker_start_states[room_name] = start_state
+
     async def run_worker_task():
         try:
             await worker.start()
+            start_state.event.set()
             while worker.running:
                 await asyncio.sleep(1.0)
         except Exception as e:
+            start_state.error = type(e).__name__
+            start_state.event.set()
             print(f"[Server Error running bot] {e}")
         finally:
             active_workers.pop(room_name, None)
-            await worker.stop()
+            worker_tasks.pop(room_name, None)
+            if worker.running or worker.room.isconnected():
+                await worker.stop()
             print(f"[Server] Bot cleaned up for room: {room_name}")
 
     # Kick off a GPU warm-up ping the instant the bot starts. Modal cold-starts the
-    # T4 on the first request (~8-30s); firing /health now overlaps that cold start
+    # Modal L4 on the first request (cold-start timing varies); firing /health now overlaps that cold start
     # with call setup and the lead's phone ringing, so the GPU is (nearly) warm by the
     # time the agent's first words arrive — instead of the cold start being added on
     # top of the first converted audio. Fire-and-forget; failures are non-fatal.
@@ -462,19 +628,23 @@ async def _do_start_bot(room_name: str, background_tasks: BackgroundTasks, agent
                 print(f"[Server] RVC pre-warm ping failed (non-fatal): {e}")
         asyncio.create_task(_prewarm_rvc())
 
-    background_tasks.add_task(run_worker_task)
+    worker_tasks[room_name] = asyncio.create_task(
+        run_worker_task(),
+        name=f"keira-worker-{room_name}",
+    )
     return {"status": "started", "botIdentity": bot_identity}
 
 class TokenRequest(BaseModel):
-    roomName: str
-    identity: str
-    agentGender: str = "male"  # 'male' or 'female' — sets pitch shift automatically
+    roomName: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
+    identity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    agentGender: Literal["male", "female"] = "male"
 
-@app.post("/api/token")
+@app.post("/api/token", dependencies=[Depends(require_control_token)])
 async def get_token(request: TokenRequest):
     """
     Brokers LiveKit client access tokens for browser web clients.
     """
+    _require_agent_identity(request.identity)
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         raise HTTPException(
             status_code=500, 
@@ -497,14 +667,15 @@ async def get_token(request: TokenRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/start-bot")
-async def start_bot(request: TokenRequest, background_tasks: BackgroundTasks):
+@app.post("/api/start-bot", dependencies=[Depends(require_control_token)])
+async def start_bot(request: TokenRequest):
     """
     Spawns the real-time audio pipeline bot and connects it to the specified LiveKit room.
     """
-    return await _do_start_bot(request.roomName, background_tasks, request.agentGender)
+    _require_agent_identity(request.identity)
+    return await _do_start_bot(request.roomName, request.agentGender)
 
-@app.post("/api/stop-bot")
+@app.post("/api/stop-bot", dependencies=[Depends(require_control_token)])
 async def stop_bot(request: TokenRequest):
     """
     Forces the voice conversion bot in a specific room to disconnect and clean up.
@@ -512,168 +683,155 @@ async def stop_bot(request: TokenRequest):
     room_name = request.roomName
     worker = active_workers.get(room_name)
     if worker:
-        await worker.stop()
-        active_workers.pop(room_name, None)
+        await _cleanup_room_state(room_name)
         return {"status": "stopped", "message": f"Voice conversion bot stopped in room {room_name}."}
     return {"status": "not_running", "message": f"No active bot found in room {room_name}."}
 
 # --- TWILIO & SIP INTEGRATION ENDPOINTS ---
 
 class OutboundCallRequest(BaseModel):
-    phoneNumber: str
-    agentIdentity: str
-    agentGender: str = "male"  # 'male' or 'female' — sets pitch shift automatically
+    phoneNumber: str = Field(pattern=r"^\+\d{8,15}$")
+    agentIdentity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    agentGender: Literal["male", "female"] = "male"
 
-@app.post("/api/call/outbound")
-async def call_outbound(request: OutboundCallRequest, background_tasks: BackgroundTasks):
-    """
-    Triggered when an agent clicks "Call" to dial a lead.
-    LiveKit dials the lead via its SIP outbound trunk (Twilio Elastic SIP Trunking),
-    so the lead's phone appears as a SIP participant directly in the LiveKit room.
-    This avoids the Twilio PV → LiveKit inbound SIP path that Twilio PV cannot reach.
-    """
-    import traceback as _tb
 
+class OutboundDialRequest(BaseModel):
+    roomName: str = Field(min_length=1, max_length=128, pattern=r"^outbound_[A-Za-z0-9_.-]+$")
+    phoneNumber: str = Field(pattern=r"^\+\d{8,15}$")
+
+
+async def _find_outbound_trunk():
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
-        raise HTTPException(status_code=500, detail="LiveKit API keys are not configured.")
-
-    # Resolve the outbound SIP trunk ID.
-    # Always do a live lookup first (by name) so a stale TWILIO_SIP_TRUNK_ID env var
-    # never causes a 404 after /api/setup recreates the trunk.
-    sip_trunk_id = None
-    try:
-        lk_tmp = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-        trunks = await lk_tmp.sip.list_outbound_trunk(api.ListSIPOutboundTrunkRequest())
-        trunk = next((t for t in trunks.items if t.name == "Keira Twilio Outbound"), None)
-        if trunk:
-            sip_trunk_id = trunk.sip_trunk_id
-            print(f"[Server] Resolved SIP trunk via live lookup: {sip_trunk_id}")
-        await lk_tmp.aclose()
-    except Exception as e:
-        print(f"[Server] Live trunk lookup failed ({e}); falling back to env var.")
-
-    # Fall back to the env var if the live lookup missed (e.g. name mismatch)
-    if not sip_trunk_id:
-        sip_trunk_id = TWILIO_SIP_TRUNK_ID
-
-    if not sip_trunk_id:
-        raise HTTPException(status_code=503, detail="No SIP outbound trunk found. Run /api/setup first.")
-
-    room_name = f"outbound_{request.phoneNumber.replace('+', '').replace(' ', '')}_{int(time.time())}"
-
-    # 1. Spawn the conversion bot (pass agent gender so pitch shift is correct)
-    try:
-        await _do_start_bot(room_name, background_tasks, request.agentGender)
-    except HTTPException:
-        raise
-    except Exception as e:
-        _tb.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to start conversion bot: {str(e)}")
-
-    # 1b. Fail-closed warm gate: block until the converter's backend session can
-    # actually accept audio before ringing the lead. The bot's own pre-warm ping
-    # (fired inside _do_start_bot) starts the cold start, but a cold T4 can take
-    # 60-90s to load the model. Unlike the old fail-open wait, we do NOT dial on
-    # failure — publishing converted audio to a lead requires a ready GPU session
-    # (the pipeline never falls back to raw voice; see pipeline.py), so an unready
-    # engine here must abort the call, not proceed with silence.
-    #
-    # We await wait_for_readiness_probe() here rather than wait_until_ready()
-    # directly: _do_start_bot already kicked off a background readiness probe
-    # via worker.start_readiness_probe() with no `await` between that call and
-    # this one, so a direct wait_until_ready() call here would open a *second*,
-    # independent probe session racing the background one against the backend's
-    # 1-concurrent-session limit — the loser gets {"type":"busy"} and reports
-    # not-ready even when the GPU is actually warm. wait_for_readiness_probe()
-    # instead awaits that same background task, so exactly one probe connection
-    # is opened per outbound call.
-    worker = active_workers.get(room_name)
-    if not worker:
-        # _do_start_bot() above sets active_workers[room_name] synchronously
-        # before returning (it's a plain await, not a BackgroundTasks entry),
-        # so reaching here with no worker is an invariant violation, not an
-        # expected "not started yet" state.
-        raise HTTPException(status_code=500, detail="Bot worker failed to initialize.")
-
-    ok = await worker.wait_for_readiness_probe(150.0)
-    if not ok:
-        await worker.stop()
-        active_workers.pop(room_name, None)
-        raise HTTPException(
-            status_code=503,
-            detail="Voice engine not ready — GPU still warming. Try again shortly.",
-        )
-
-    # 2. LiveKit dials the lead via Twilio Elastic SIP Trunking.
-    #    LiveKit → SIP trunk → Twilio → PSTN → lead's phone.
-    #    The lead appears as a SIP participant in the LiveKit room directly.
-    print(f"[Server] LiveKit SIP dial: {request.phoneNumber} via trunk {sip_trunk_id} → room {room_name}")
+        return None
     lk = None
     try:
         lk = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-
-        # Look up trunk to log what number it dials from
-        try:
-            trunks = await lk.sip.list_outbound_trunk(api.ListSIPOutboundTrunkRequest())
-            trunk_info = next((t for t in trunks.items if t.sip_trunk_id == sip_trunk_id), None)
-            if trunk_info:
-                print(f"[Server] Trunk address: {trunk_info.address}, numbers: {list(trunk_info.numbers)}")
-        except Exception:
-            pass
-
-        result = await lk.sip.create_sip_participant(
-            api.CreateSIPParticipantRequest(
-                sip_trunk_id=sip_trunk_id,
-                sip_call_to=request.phoneNumber,
-                room_name=room_name,
-                participant_identity="sip-lead",
-                participant_name="Lead",
-            )
-        )
-        print(f"[Server] SIP participant created: id={result.participant_id} sip_call_id={result.sip_call_id}")
-    except Exception as e:
-        _tb.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to initiate SIP call: {str(e)}")
+        trunks = await lk.sip.list_outbound_trunk(api.ListSIPOutboundTrunkRequest())
+        trunk = next((t for t in trunks.items if t.name == "Keira Twilio Outbound"), None)
+        return trunk.sip_trunk_id if trunk else TWILIO_SIP_TRUNK_ID
+    except Exception as exc:
+        print(f"[Server] Live trunk lookup failed: {type(exc).__name__}")
+        return TWILIO_SIP_TRUNK_ID
     finally:
         if lk:
             await lk.aclose()
 
-    # 3. Fire-and-forget: unsubscribe the SIP lead from the raw agent mic track so
-    # they ONLY hear the bot's converted Keira voice. The SIP bridge ignores
-    # browser-level setTrackSubscriptionPermissions — this must be done server-side.
-    asyncio.create_task(_restrict_sip_audio(room_name, sip_identity="sip-lead"))
 
-    # Record active call details
-    active_calls[room_name] = {
-        "room_name": room_name,
-        "from": TWILIO_PHONE_NUMBER or "Keira Outbound",
-        "to": request.phoneNumber,
-        "status": "in-progress",
-        "direction": "outbound",
-        "created_at": datetime.datetime.now().isoformat()
-    }
+async def _agent_has_audio_track(room_name: str, timeout: float = 15.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        lk = None
+        try:
+            lk = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+            participants = await lk.room.list_participants(
+                api.ListParticipantsRequest(room=room_name)
+            )
+            for participant in participants.participants:
+                if "agent" not in participant.identity.lower():
+                    continue
+                if any(track.type == 0 for track in participant.tracks):
+                    return True
+        except Exception as exc:
+            print(f"[Server] Agent-track check failed: {type(exc).__name__}")
+        finally:
+            if lk:
+                await lk.aclose()
+        await asyncio.sleep(0.25)
+    return False
 
-    # 3. Generate access token for the agent
+
+@app.post("/api/call/outbound", dependencies=[Depends(require_control_token)])
+async def call_outbound(request: OutboundCallRequest):
+    """Prepare a room and bot; the browser joins before the SIP leg is dialed."""
+    _require_agent_identity(request.agentIdentity)
+    if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
+        raise HTTPException(status_code=500, detail="LiveKit API keys are not configured.")
+
+    room_name = f"outbound_{request.phoneNumber[1:]}_{int(time.time())}"
+    try:
+        await _do_start_bot(room_name, request.agentGender)
+        await _wait_for_worker_started(room_name)
+        worker = active_workers.get(room_name)
+        if not worker or not await worker.wait_for_readiness_probe(150.0):
+            raise HTTPException(status_code=503, detail="Voice engine is not ready.")
+        active_calls[room_name] = {
+            "room_name": room_name,
+            "from": redact_phone_number(TWILIO_PHONE_NUMBER),
+            "to": request.phoneNumber,
+            "status": "ready-to-dial",
+            "direction": "outbound",
+            "agent_identity": request.agentIdentity,
+            "created_at": datetime.datetime.now().isoformat(),
+        }
+    except HTTPException:
+        await _cleanup_room_state(room_name, delete_room=True)
+        raise
+    except Exception:
+        await _cleanup_room_state(room_name, delete_room=True)
+        raise HTTPException(status_code=503, detail="Unable to prepare the voice call.")
+
     agent_token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
         .with_identity(request.agentIdentity) \
         .with_name(f"Agent {request.agentIdentity}") \
-        .with_grants(api.VideoGrants(
-            room_join=True,
-            room=room_name,
-            can_publish=True,
-            can_subscribe=True
-        )) \
+        .with_grants(api.VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True)) \
         .with_ttl(datetime.timedelta(seconds=3600))
-
     return {
-        "status": "initiated",
+        "status": "ready_to_dial",
         "roomName": room_name,
         "token": agent_token.to_jwt(),
-        "serverUrl": LIVEKIT_URL
+        "serverUrl": LIVEKIT_URL,
     }
+
+
+@app.post("/api/call/outbound/dial", dependencies=[Depends(require_control_token)])
+async def dial_outbound(request: OutboundDialRequest):
+    """Dial only after the agent track exists, then confirm SIP isolation."""
+    call_info = active_calls.get(request.roomName)
+    if not call_info or call_info.get("status") != "ready-to-dial":
+        raise HTTPException(status_code=404, detail="Prepared outbound call not found.")
+    if call_info.get("to") != request.phoneNumber:
+        raise HTTPException(status_code=409, detail="Outbound call details do not match.")
+    if not await _agent_has_audio_track(request.roomName):
+        await _cleanup_room_state(request.roomName, delete_room=True)
+        raise HTTPException(status_code=503, detail="Agent audio track was not ready.")
+
+    sip_trunk_id = await _find_outbound_trunk()
+    if not sip_trunk_id:
+        await _cleanup_room_state(request.roomName, delete_room=True)
+        raise HTTPException(status_code=503, detail="No SIP outbound trunk is configured.")
+
+    lk = None
+    try:
+        lk = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        result = await lk.sip.create_sip_participant(
+            api.CreateSIPParticipantRequest(
+                sip_trunk_id=sip_trunk_id,
+                sip_call_to=request.phoneNumber,
+                room_name=request.roomName,
+                participant_identity="sip-lead",
+                participant_name="Lead",
+            )
+        )
+        print(f"[Server] SIP participant created: id={result.participant_id}")
+    except Exception as exc:
+        print(f"[Server] SIP dial failed: {type(exc).__name__}")
+        await _cleanup_room_state(request.roomName, delete_room=True)
+        raise HTTPException(status_code=502, detail="Unable to initiate the SIP call.") from exc
+    finally:
+        if lk:
+            await lk.aclose()
+
+    isolated = await _restrict_sip_audio(request.roomName, sip_identity="sip-lead")
+    if not isolated:
+        await _cleanup_room_state(request.roomName, delete_room=True)
+        raise HTTPException(status_code=502, detail="SIP audio isolation could not be confirmed.")
+    isolation_events.setdefault(request.roomName, asyncio.Event()).set()
+    call_info["status"] = "in-progress"
+    return {"status": "initiated", "roomName": request.roomName}
 
 @app.post("/api/call/status-event")
 async def call_status_event(
+    request: Request,
     CallSid: str = Form(default=""),
     CallStatus: str = Form(default=""),
     CallDuration: str = Form(default=""),
@@ -683,12 +841,13 @@ async def call_status_event(
     ErrorMessage: str = Form(default=""),
 ):
     """Twilio status callback — logs every call state change so we can diagnose failures."""
+    await require_twilio_signature(request)
     print(f"[Twilio Status] SID={CallSid} status={CallStatus} duration={CallDuration}s to={To} from={From} error={ErrorCode} {ErrorMessage}")
     return Response(status_code=204)
 
 @app.post("/api/call/inbound")
 async def call_inbound(
-    background_tasks: BackgroundTasks,
+    request: Request,
     From: str = Form(...),
     CallSid: str = Form(...),
     To: str = Form(default=""),
@@ -706,11 +865,13 @@ async def call_inbound(
     This avoids the previous bug where Twilio bridged to LiveKit before LiveKit was ready,
     causing an immediate SIP rejection and 2-4 second drops.
     """
-    print(f"[Twilio Inbound] CallSid={CallSid} From={From} To={To} Status={CallStatus}")
+    await require_twilio_signature(request)
+    print(f"[Twilio Inbound] CallSid={CallSid} From={redact_phone_number(From)} Status={CallStatus}")
     room_name = f"inbound_{CallSid}"
 
-    # 1. Spawn conversion bot for this incoming call room
-    await _do_start_bot(room_name, background_tasks)
+    # 1. Hold the caller and defer bot creation until the operator accepts with
+    # an explicit voice profile.
+    isolation_events[room_name] = asyncio.Event()
 
     # 2. Record the inbound call
     active_calls[room_name] = {
@@ -740,27 +901,23 @@ async def call_inbound(
     <Pause length="60"/>
     <Hangup/>
 </Response>"""
-    # If SERVER_URL is set, use Gather/Redirect polling; otherwise fall back to immediate SIP bridge
+    # If SERVER_URL is set, use Redirect polling. Without a public callback URL we
+    # cannot validate Twilio requests or safely gate the SIP bridge, so fail closed
+    # instead of reviving the old immediate-bridge behavior.
     if SERVER_URL:
         twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Redirect method="POST">{wait_url}</Redirect>
 </Response>"""
     else:
-        # Fallback: immediate SIP bridge (old behaviour) when SERVER_URL is not configured
-        sip_domain = get_livekit_sip_domain()
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Dial timeout="30" action="{status_callback}" method="POST">
-        <Sip>sip:{room_name}@{sip_domain};transport=tcp</Sip>
-    </Dial>
-</Response>"""
+        print("[Twilio Inbound] SERVER_URL is not configured; refusing an ungated SIP bridge")
     print(f"[Twilio Inbound] Returning TwiML for CallSid={CallSid}")
     return Response(content=twiml, media_type="application/xml")
 
 
 @app.post("/api/call/wait")
 async def call_wait(
+    request: Request,
     callSid: str,
     CallSid: str = Form(default=""),
     CallStatus: str = Form(default=""),
@@ -769,6 +926,7 @@ async def call_wait(
     Polling endpoint called by Twilio every few seconds while caller is on hold.
     Returns hold TwiML until the agent accepts, then returns the SIP bridge TwiML.
     """
+    await require_twilio_signature(request)
     # callSid can come from query param (our redirect) or Twilio form POST
     sid = callSid or CallSid
     room_name = f"inbound_{sid}"
@@ -776,7 +934,16 @@ async def call_wait(
 
     call_info = active_calls.get(room_name)
     worker = active_workers.get(room_name)
-    if call_info and call_info.get("status") == "accepted" and worker and worker.is_ready:
+    worker_started = bool(
+        worker_start_states.get(room_name)
+        and worker_start_states[room_name].event.is_set()
+        and not worker_start_states[room_name].error
+    )
+    isolation_confirmed = bool(isolation_events.get(room_name) and isolation_events[room_name].is_set())
+    if call_info and call_info.get("isolation_failed"):
+        return Response(content="""<?xml version="1.0" encoding="UTF-8"?>
+<Response><Hangup/></Response>""", media_type="application/xml")
+    if call_info and call_info.get("status") == "accepted" and worker and worker_started and worker.is_ready and isolation_confirmed:
         # Agent has accepted AND the voice engine is confirmed ready — bridge to
         # LiveKit SIP. Fail-closed: if the worker isn't ready yet, this falls
         # through to the hold-TwiML branch below and re-polls in 3s rather than
@@ -810,10 +977,11 @@ async def call_wait(
         return Response(content=twiml, media_type="application/xml")
 
 class AcceptCallRequest(BaseModel):
-    roomName: str
-    agentIdentity: str
+    roomName: str = Field(min_length=1, max_length=128, pattern=r"^inbound_[A-Za-z0-9_.-]+$")
+    agentIdentity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    agentGender: Literal["male", "female"] = "male"
 
-@app.post("/api/call/accept")
+@app.post("/api/call/accept", dependencies=[Depends(require_control_token)])
 async def call_accept(request: AcceptCallRequest):
     """
     Triggered when an agent accepts an incoming call.
@@ -821,14 +989,21 @@ async def call_accept(request: AcceptCallRequest):
     - Returns LiveKit access token for the agent to join the room.
     """
     room_name = request.roomName
+    _require_agent_identity(request.agentIdentity)
     print(f"[Call Accept] Agent {request.agentIdentity} accepting room={room_name}")
 
-    if room_name in active_calls:
-        # Mark as 'accepted' — /api/call/wait polls this and will then bridge the SIP call
-        active_calls[room_name]["status"] = "accepted"
-        print(f"[Call Accept] Status set to 'accepted' for room={room_name}")
-    else:
-        print(f"[Call Accept] WARNING: room {room_name} not found in active_calls — call may have already ended")
+    if room_name not in active_calls:
+        raise HTTPException(status_code=404, detail="Incoming call not found.")
+    try:
+        await _do_start_bot(room_name, request.agentGender)
+    except Exception as exc:
+        await _cleanup_room_state(room_name, delete_room=True)
+        raise HTTPException(status_code=503, detail="Unable to start the voice bot.") from exc
+
+    # Mark as 'accepted' — /api/call/wait polls this and will then bridge the SIP call
+    active_calls[room_name]["status"] = "accepted"
+    active_calls[room_name]["agent_gender"] = request.agentGender
+    print(f"[Call Accept] Status set to 'accepted' for room={room_name}")
 
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         raise HTTPException(status_code=500, detail="LiveKit server keys are not configured.")
@@ -838,7 +1013,15 @@ async def call_accept(request: AcceptCallRequest):
     # participant identity is the caller's phone number (From field), but LiveKit
     # names them by their From URI — we scan by exclusion instead of hardcoded identity.
     # The helper retries until the agent browser joins and publishes their mic track.
-    asyncio.create_task(_restrict_sip_audio(room_name, sip_identity="sip-caller"))
+    async def isolate_inbound_sip():
+        isolated = await _restrict_sip_audio(room_name, sip_identity="sip-caller")
+        if isolated:
+            isolation_events.setdefault(room_name, asyncio.Event()).set()
+        elif room_name in active_calls:
+            active_calls[room_name]["isolation_failed"] = True
+            print(f"[SIP Isolation] Inbound isolation failed closed for room {room_name}")
+
+    asyncio.create_task(isolate_inbound_sip(), name=f"keira-sip-isolation-{room_name}")
 
     # Generate access token for the agent
     agent_token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
@@ -862,18 +1045,16 @@ async def call_accept(request: AcceptCallRequest):
 class EndCallRequest(BaseModel):
     roomName: str
 
-@app.post("/api/call/end")
+@app.post("/api/call/end", dependencies=[Depends(require_control_token)])
 async def call_end(request: EndCallRequest):
     """
     Disconnects the bot, deletes the LiveKit room, and broadcasts the disconnect event.
     """
     room_name = request.roomName
 
-    # 1. Stop the voice conversion bot
-    worker = active_workers.get(room_name)
-    if worker:
-        await worker.stop()
-        active_workers.pop(room_name, None)
+    call_info = active_calls.get(room_name)
+    # 1. Stop the voice conversion bot and cancel managed lifecycle state.
+    await _cleanup_room_state(room_name)
 
     # 2. Programmatically close the LiveKit Room (disconnects all participants)
     if LIVEKIT_API_KEY and LIVEKIT_API_SECRET:
@@ -888,8 +1069,7 @@ async def call_end(request: EndCallRequest):
     # 3. Twilio client hangup fallback (inbound calls have a Twilio CallSid).
     # Outbound calls are LiveKit-originated SIP — there is no Twilio CallSid.
     # Those are ended by deleting the LiveKit room (step 2 above).
-    if twilio_client and room_name in active_calls:
-        call_info = active_calls[room_name]
+    if twilio_client and call_info:
         if call_info.get("direction") == "inbound" and "call_sid" in call_info:
             try:
                 twilio_client.calls(call_info["call_sid"]).update(status="completed")
@@ -903,10 +1083,9 @@ async def call_end(request: EndCallRequest):
         "roomName": room_name
     })
 
-    active_calls.pop(room_name, None)
     return {"status": "ended", "roomName": room_name}
 
-@app.get("/api/call/status")
+@app.get("/api/call/status", dependencies=[Depends(require_control_token)])
 async def call_status(roomName: str = None):
     """
     Returns status of active calls.
@@ -934,8 +1113,8 @@ async def health_check():
         "twilio": {
             "account_sid_set": bool(TWILIO_ACCOUNT_SID),
             "auth_token_set": bool(TWILIO_AUTH_TOKEN),
-            "phone_number": TWILIO_PHONE_NUMBER or "not set",
-            "sip_uri": TWILIO_SIP_URI or "not set",
+            "phone_number_configured": bool(TWILIO_PHONE_NUMBER),
+            "sip_uri_configured": bool(TWILIO_SIP_URI),
             "client_initialized": bool(twilio_client),
         },
         "livekit_sip": {
@@ -951,7 +1130,7 @@ async def health_check():
         "active_bots": len(active_workers),
     }
 
-@app.post("/api/setup")
+@app.post("/api/setup", dependencies=[Depends(require_control_token)])
 async def setup_integrations():
     """
     One-time setup endpoint. Call this once after filling in all credentials.
@@ -1051,10 +1230,8 @@ async def setup_integrations():
             _tb.print_exc()
             errors["twilio_webhook"] = str(e)
 
-    # Steps 3+4: Clean up old SIP trunks/rules and recreate them linked to each other.
-    # The old "twilioinbound" trunk may have IP/auth restrictions that block Twilio PV.
-    # We delete everything and recreate a permissive trunk + a dispatch rule that
-    # explicitly targets only that trunk so there is no ambiguity.
+    # Steps 3+4: Reconcile only Keira-owned resources. Never delete unrelated
+    # trunks/rules from a shared LiveKit project.
     inbound_trunk_id = None
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         errors["sip_inbound_trunk"] = "Missing LIVEKIT_API_KEY or LIVEKIT_API_SECRET."
@@ -1067,19 +1244,12 @@ async def setup_integrations():
             # --- Inbound trunk ---
             existing_trunks = await lk.sip.list_inbound_trunk(api.ListSIPInboundTrunkRequest())
             keira_trunk = None
-            deleted_trunks = []
+            ignored_trunks = []
             for t in existing_trunks.items:
                 if t.name == "Keira Twilio Inbound":
                     keira_trunk = t
                 else:
-                    # Delete any other inbound trunk (e.g. old "twilioinbound") that
-                    # may have IP ACLs or auth requirements blocking Twilio PV calls.
-                    try:
-                        await lk.sip.delete_trunk(api.DeleteSIPTrunkRequest(sip_trunk_id=t.sip_trunk_id))
-                        deleted_trunks.append(t.sip_trunk_id)
-                        print(f"[Setup] Deleted conflicting inbound trunk: {t.sip_trunk_id} ({t.name})")
-                    except Exception:
-                        pass
+                    ignored_trunks.append({"trunk_id": t.sip_trunk_id, "name": t.name})
 
             if keira_trunk is None:
                 keira_trunk = await lk.sip.create_inbound_trunk(
@@ -1097,44 +1267,49 @@ async def setup_integrations():
             results["sip_inbound_trunk"] = {
                 "status": "ready",
                 "trunk_id": inbound_trunk_id,
-                "deleted_conflicting": deleted_trunks,
+                "ignored_unrelated": ignored_trunks,
             }
 
             # --- Dispatch rule ---
             existing_rules = await lk.sip.list_dispatch_rule(api.ListSIPDispatchRuleRequest())
-            deleted_rules = []
-            for r in existing_rules.items:
-                # Delete ALL existing rules so we can recreate fresh with correct trunk_id
-                try:
-                    await lk.sip.delete_dispatch_rule(
-                        api.DeleteSIPDispatchRuleRequest(sip_dispatch_rule_id=r.sip_dispatch_rule_id)
-                    )
-                    deleted_rules.append(r.sip_dispatch_rule_id)
-                    print(f"[Setup] Deleted old dispatch rule: {r.sip_dispatch_rule_id} ({r.name})")
-                except Exception:
-                    pass
-
-            rule = await lk.sip.create_dispatch_rule(
-                api.CreateSIPDispatchRuleRequest(
-                    rule=api.SIPDispatchRule(
-                        dispatch_rule_callee=api.SIPDispatchRuleCallee(
-                            room_prefix="",
-                            randomize=False,
-                        )
-                    ),
-                    # Restrict to only our permissive trunk so the old "twilioinbound"
-                    # trunk cannot intercept calls first.
-                    trunk_ids=[inbound_trunk_id],
-                    name="Keira Inbound Routing",
-                )
+            keira_rule = next(
+                (r for r in existing_rules.items if r.name == "Keira Inbound Routing"),
+                None,
             )
-            print(f"[Setup] Created SIP dispatch rule: {rule.sip_dispatch_rule_id}")
-            results["sip_dispatch_rule"] = {
-                "status": "created",
-                "rule_id": rule.sip_dispatch_rule_id,
-                "trunk_id": inbound_trunk_id,
-                "deleted_old_rules": deleted_rules,
-            }
+            if keira_rule:
+                configured_trunks = set(getattr(keira_rule, "trunk_ids", []))
+                if configured_trunks and inbound_trunk_id not in configured_trunks:
+                    errors["sip_dispatch_rule"] = (
+                        "Keira Inbound Routing exists but targets a different trunk; "
+                        "no rules were deleted. Reconcile it manually."
+                    )
+                else:
+                    results["sip_dispatch_rule"] = {
+                        "status": "already_exists",
+                        "rule_id": keira_rule.sip_dispatch_rule_id,
+                        "trunk_id": inbound_trunk_id,
+                        "ignored_unrelated": len(existing_rules.items) - 1,
+                    }
+            else:
+                rule = await lk.sip.create_dispatch_rule(
+                    api.CreateSIPDispatchRuleRequest(
+                        rule=api.SIPDispatchRule(
+                            dispatch_rule_callee=api.SIPDispatchRuleCallee(
+                                room_prefix="",
+                                randomize=False,
+                            )
+                        ),
+                        trunk_ids=[inbound_trunk_id],
+                        name="Keira Inbound Routing",
+                    )
+                )
+                print(f"[Setup] Created SIP dispatch rule: {rule.sip_dispatch_rule_id}")
+                results["sip_dispatch_rule"] = {
+                    "status": "created",
+                    "rule_id": rule.sip_dispatch_rule_id,
+                    "trunk_id": inbound_trunk_id,
+                    "ignored_unrelated": len(existing_rules.items),
+                }
 
         except Exception as e:
             _tb.print_exc()
@@ -1152,10 +1327,10 @@ async def setup_integrations():
 
 # --- GPU KEEP-WARM ENDPOINT ---
 
-@app.post("/api/warmup")
+@app.post("/api/warmup", dependencies=[Depends(require_control_token)])
 async def warmup_gpu():
     """
-    Pings the RVC endpoint /health to ensure the T4 GPU is warm.
+    Pings the RVC endpoint /health to ensure the Modal GPU is warm.
     Retries every 30 seconds for up to 6 minutes to handle Modal cold starts.
     """
     if not RVC_ENDPOINT_URL:
@@ -1166,7 +1341,7 @@ async def warmup_gpu():
 
 # --- GPU DEPLOY ENDPOINT ---
 
-@app.post("/api/deploy")
+@app.post("/api/deploy", dependencies=[Depends(require_control_token)])
 async def deploy_gpu():
     """
     Executes 'modal deploy modal_deploy/worker.py' to deploy the RVC worker to Modal.
@@ -1229,7 +1404,17 @@ async def deploy_gpu():
 
 @app.websocket("/api/call/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+    # Browser WebSocket clients cannot set arbitrary Authorization headers. Use a
+    # subprotocol for the in-memory control token instead of putting it in the URL,
+    # where access logs and proxy metrics commonly record query strings.
+    offered = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
+    auth_protocol = next((item for item in offered if item.startswith("keira-auth.")), "")
+    token = auth_protocol[len("keira-auth."):] if auth_protocol else ""
+    if not CONTROL_PLANE_TOKEN or not verify_bearer_token(f"Bearer {token}", CONTROL_PLANE_TOKEN):
+        await websocket.close(code=1008, reason="Authentication required")
+        return
+    await websocket.accept(subprotocol=auth_protocol)
+    await manager.connect(websocket, already_accepted=True)
     try:
         while True:
             # Maintain active connection and listen for client-side pings

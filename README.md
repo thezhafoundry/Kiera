@@ -26,7 +26,7 @@ graph TD
 - **Browser-to-Phone**: Agents dial leads directly from a clean dark glassmorphism dashboard. Incoming calls dial in from the PSTN, trigger a Twilio webhook, and are routed via SIP into a LiveKit room.
 - **Brand Voice Conversion**: Agent audio is captured at 16kHz, denoised, and streamed continuously over a persistent WebSocket to a serverless L4 GPU running RVC v2 on Modal (optionally accelerated with TensorRT). Converted 48kHz audio is returned, held in a standing playout buffer, and published into the room.
 - **One-Way Conversion**: Voice conversion is applied only to the agent-to-lead stream. The lead-to-agent stream is bridged directly and unmodified so the agent hears the lead's raw voice.
-- **Fail-Closed, Never Raw**: There is no raw-voice fallback — it was removed structurally. If the GPU connection drops or errors, the bot publishes silence until real converted audio resumes; the lead never hears the agent's unconverted voice. A standing playout buffer (~1.25s target/5s cap) absorbs GPU blocks that run slower than real-time, trading latency for voice continuity, rather than trying to fail over to raw audio. See [CLAUDE.md](CLAUDE.md) and [LATENCY.md](LATENCY.md) for the full mechanism.
+- **Fail-Closed, Never Raw**: There is no raw-voice fallback — it was removed structurally. If the GPU connection drops or errors, the bot publishes silence until real converted audio resumes; the lead never hears the agent's unconverted voice. A standing playout buffer (0.25s target/5s cap) absorbs jitter, then drains in bounded 100ms chunks to avoid gulping long utterances. See [CLAUDE.md](CLAUDE.md) and [LATENCY.md](LATENCY.md) for the full mechanism.
 
 ---
 
@@ -58,11 +58,12 @@ LIVEKIT_API_SECRET=your_livekit_api_secret
 
 # RVC Serverless GPU
 RVC_ENDPOINT_URL=https://your-modal-app--rvc-convert.modal.run
-RVC_API_KEY=your_custom_api_key
-RVC_PITCH_SHIFT=0 # Semitones (e.g. +12 male / 0 female — see the agentGender toggle)
+RVC_API_KEY=your_modal_secret_value # must match the Modal rvc-api-key secret
+KEIRA_CONTROL_TOKEN=your_operator_token # required for dashboard/control routes
+RVC_PITCH_SHIFT=0 # fallback semitones; dashboard selects male/female per call
 RVC_INDEX_RATE=0.9 # FAISS-retrieved timbre mix; defaults to 0.9 if unset
 RVC_WS_URL= # optional explicit /ws URL override; derived from RVC_ENDPOINT_URL if unset
-RVC_KEEPWARM=0 # set to 1 at shift start to keep the GPU warm (no redeploy needed)
+RVC_KEEPWARM=0 # read at backend startup; changing it on Render restarts the service
 RVC_ADAPTIVE_PITCH=1 # per-call F0-derived pitch lock; 0 = legacy fixed RVC_MALE_PITCH_SHIFT only
 RVC_TARGET_F0=208 # Hz center of the trained model's pitch range the adaptive lock targets
 PRESENCE_EQ_GAIN_DB=4 # dB boost on 1.2-3.4kHz before publish (PSTN clarity); 0 disables
@@ -138,7 +139,7 @@ MODAL_TOKEN_SECRET=your_modal_token_secret
    ```
 
 4. **Access the Dashboard**:
-   Open **`http://localhost:8000`** in your browser. Click **Start Shift** to warm up the RVC GPU container, and then select a lead to call.
+   Open **`http://localhost:8000`** in your browser. Click **Warm GPU** before selecting a lead to call.
 
 ---
 
@@ -191,4 +192,3 @@ When deploying this project to staging or production environments, complete the 
   1. Log in to your [LiveKit Cloud Dashboard](https://cloud.livekit.io/) (or your staging LiveKit server instance).
   2. Select your staging/production project.
   3. Navigate to **SIP** / **Ingress Settings** (or Project Settings > Keys) to retrieve the environment's specific SIP ingress address and credentials.
-

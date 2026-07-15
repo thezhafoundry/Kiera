@@ -2,32 +2,24 @@
 title: .agents/projects/active-backlog.md
 type: source
 sources: [../../../.agents/projects/active-backlog.md]
-updated: 2026-07-07
+updated: 2026-07-15
 ---
 
 [.agents/projects/active-backlog.md](../../../.agents/projects/active-backlog.md) —
 current roadmap and known tech debt.
 
 ## Key claims
-- Backlog (open, as of 2026-07-07):
-  1. **High** — verify the 2026-07-03 standing-buffer/bigger-block fix actually
-     eliminates "part by part" audio on a real live call. See
-     [[part-by-part-audio-investigation]].
-  2. **High** — `TWILIO_AUTH_TOKEN` on Render appears stale/invalid; re-run `/api/setup`.
-  3. **High** — confirm the retried outbound call with new SIP trunk ID succeeds.
-  4. **High** — flip `_DEBUG_SAVE_RAW_AUDIO` back to `False` and redeploy once voice-identity
-     investigation concludes.
-  5. **High** — voice-identity mismatch investigation (open). See
-     [[voice-identity-mismatch-investigation]].
-  6. **High** — **TensorRT migration**: merged to `main` 2026-07-07 (`9c1093a`). C3 GPU
-     benchmark passed (median 66ms/p95 68ms). Remaining: C4 (offline A/B WAVs), C5 (listen
-     test for breathiness tradeoff), and confirming the live Modal deploy actually serves TRT
-     (`/api/health` → `"engine": "trt"`) before assuming it from committed code.
-  7. **Medium** — `RVC/` folder: ~195 files tracked in git despite intended gitignore
-     (unblocked 2026-07-07 — TRT shims now committed).
-  8. **Medium** — avoid Render `autoDeploy: commit` killing in-flight calls mid-test.
-     See [[render-autodeploy-kills-live-calls]].
-  9. **Low** — compile RNNoise / get `webrtc-noise-gain` MSVC build working on Windows.
+- Backlog (open, as of 2026-07-15): P0 items now cover credential rotation, control-plane
+  authentication, Modal authentication, managed worker/call ordering, and non-destructive
+  `/api/setup`. The code changes are local; provider secrets, deployment, and live-call
+  acceptance remain open.
+- Remaining high-priority verification includes the stale Twilio token, a retried outbound
+  call, confirming the deployed worker keeps debug WAV capture disabled, TRT live/C4/C5 checks, the
+  adaptive-pitch listen test, and a real-call test of the bounded playout drain. See the
+  linked issue pages in `wiki/index.md`.
+- Medium/low work remains: preserve the Singapore SIP edge during future setup, avoid Render
+  auto-deploy interruptions, clean tracked `RVC/` files deliberately, and improve Windows
+  RNNoise support.
 - **Resolved** (moved out of open backlog):
   - Modal/Render region mismatch (Render confirmed live in Singapore, 2026-07-03).
   - Modal worker `max_containers` gap.

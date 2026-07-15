@@ -21,6 +21,10 @@ wiki. This index is the first stop for any query — find the page here, then dr
   post-rebuild). The live worker moved from T4 to **L4** on 2026-07-03.
 
 ## Issues (open/resolved problems)
+- [control-plane-security-and-call-ordering-audit](pages/issues/control-plane-security-and-call-ordering-audit.md)
+  — **open for deployment verification.** Operator bearer auth, Twilio signature validation,
+  Modal auth, managed worker lifecycle, two-phase outbound dialing, fail-closed SIP gating,
+  and non-destructive setup are implemented locally; provider configuration and live calls remain.
 - [adaptive-pitch-lock-rollout](pages/issues/adaptive-pitch-lock-rollout.md) — **open,
   deployed + field-confirmed 2026-07-14.** Fixed-shift pitch constant replaced with a
   per-call adaptive lock after the constant itself went stale; two live calls confirmed
@@ -47,9 +51,8 @@ wiki. This index is the first stop for any query — find the page here, then dr
   `modal deploy` of the streaming rebuild failed twice: a stale folder-name reference, then a
   sibling module Modal never bundled into the container.
 - [sip-audio-mixing-isolation-bug](pages/issues/sip-audio-mixing-isolation-bug.md) —
-  **resolved, confirmed live.** The "unsubscribe raw agent track from the SIP leg" fix
-  (`_restrict_sip_audio`) had a wrong protobuf field name and failed silently on 100% of
-  calls; fixed and now confirmed succeeding (`✅`) on every call sampled since.
+  **open for fail-closed verification.** The protobuf field bug is fixed; the current code
+  gates outbound dialing and inbound bridging on confirmed server-side isolation.
 - [voice-identity-mismatch-investigation](pages/issues/voice-identity-mismatch-investigation.md)
   — **pitch axis superseded, clarity axis REOPENED 2026-07-14.** Originally two independent
   causes fixed `f748a89` on 2026-07-08: pitch overshoot (→ [[adaptive-pitch-lock-rollout]]
@@ -63,15 +66,14 @@ wiki. This index is the first stop for any query — find the page here, then dr
   hop from Singapore. Re-pointed the trunk to the Singapore edge; dropouts 5→1 on the next
   call. Open drift trap: `/api/setup` drops the inbound `;edge=singapore` pin.
 - [part-by-part-audio-investigation](pages/issues/part-by-part-audio-investigation.md) —
-  **resolved 2026-07-03** (buffer fix not yet live-call-verified). Four distinct root
-  causes found via production logs: Modal container fan-out, unreliable pitch
-  auto-detection, FAISS index re-read-per-call, and a latency-vs-quality product tradeoff.
+  **open for live acceptance.** The current bounded 100ms drain fix still needs a real call
+  verification.
 - [modal-render-region-mismatch](pages/issues/modal-render-region-mismatch.md) —
   **resolved 2026-07-03.** Render confirmed live in Singapore, colocated with Modal.
 - [render-autodeploy-kills-live-calls](pages/issues/render-autodeploy-kills-live-calls.md)
   — **open, medium priority.** Every push to `main` redeploys and kills in-flight calls.
 - [readme-latency-budget-contradiction](pages/issues/readme-latency-budget-contradiction.md)
-  — **open, doc bug found by lint.** README says 5000ms, code/LATENCY.md say 2000ms.
+  — **resolved historical doc bug.** The old per-request budget was removed by the streaming rebuild.
 
 ## Sources (ingested raw material)
 - [latency-md](pages/sources/latency-md.md) — `LATENCY.md`

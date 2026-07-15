@@ -50,7 +50,7 @@
         <section class="system-bar glass-card">
             <div class="system-status-group">
                 <div class="status-item">
-                    <span class="status-label">Shift Status</span>
+                    <span class="status-label">GPU Warmup</span>
                     <span class="status-value offline-text" id="val-shift-status">Offline</span>
                 </div>
                 <div class="status-item">
@@ -70,7 +70,7 @@
             </div>
             <div class="system-actions" style="display: flex; gap: 10px;">
                 <button id="btn-deploy" class="btn btn-secondary" style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.15); color: #e4e6eb;">🚀 Deploy GPU</button>
-                <button id="btn-warmup" class="btn btn-primary">Start Shift (Warm GPU)</button>
+                <button id="btn-warmup" class="btn btn-primary">Warm GPU</button>
             </div>
         </section>
 
@@ -83,6 +83,11 @@
                     <input type="tel" id="dial-input" placeholder="+91XXXXXXXXXX or 10-digit number" autocomplete="off" />
                     <button id="btn-dial" class="call-action-btn">📞 Call</button>
                 </div>
+                <label for="agent-gender" class="description">Agent voice profile</label>
+                <select id="agent-gender" aria-label="Agent voice profile">
+                    <option value="male" selected>Male input voice</option>
+                    <option value="female">Female input voice</option>
+                </select>
                 <div id="dial-error" class="dial-error" style="display: none;"></div>
             </div>
 
@@ -91,7 +96,7 @@
                 <div class="console-idle-state" id="console-idle-view">
                     <div class="pulse-phone-icon">👤</div>
                     <h3>Ready for Calls</h3>
-                    <p class="helper-text">Start your shift to prepare the GPU, then select a lead to call, or wait for inbound leads.</p>
+                    <p class="helper-text">Warm the GPU before calling, then select a lead, or wait for inbound leads.</p>
                 </div>
 
                 <div class="console-active-state" id="console-active-view" style="display: none;">

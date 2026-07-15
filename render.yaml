@@ -16,15 +16,17 @@ services:
       - key: RVC_ENDPOINT_URL
         sync: false
       - key: RVC_API_KEY
-        sync: false
+        sync: false         # must match the Modal rvc-api-key secret
+      - key: KEIRA_CONTROL_TOKEN
+        sync: false         # bearer token for operator/dashboard control routes
       - key: RVC_PITCH_SHIFT
-        sync: false         # semitones, e.g. +12 male / 0 female (see agentGender toggle)
+        sync: false         # fallback semitones; dashboard selects male/female per call
       - key: RVC_INDEX_RATE
         sync: false         # defaults to 0.9 if unset
       - key: RVC_WS_URL
         sync: false         # optional explicit override; derived from RVC_ENDPOINT_URL if unset
       - key: RVC_KEEPWARM
-        sync: false         # set to "1" at shift start to keep the GPU warm; default off
+        sync: false         # read at startup; changing Render env restarts the service
       - key: CORS_ORIGINS
         sync: false         # comma-separated allowed origins; defaults to "*" if unset
       - key: TWILIO_ACCOUNT_SID

@@ -2,7 +2,7 @@
 title: .agents/context/stack-and-rules.md
 type: source
 sources: [../../../.agents/context/stack-and-rules.md]
-updated: 2026-07-07
+updated: 2026-07-15
 ---
 
 [.agents/context/stack-and-rules.md](../../../.agents/context/stack-and-rules.md) —
@@ -24,6 +24,10 @@ tech stack inventory, hard invariants, and file map.
   960-byte/10ms published frames); noise suppressor frame contract (exactly 320 bytes);
   the conversion generator must always be torn down via `contextlib.aclosing`; don't push
   to `main` mid-call (Render auto-redeploys); never commit `.env`/model files.
+- Control-plane invariants (2026-07-15): operator API routes require `KEIRA_CONTROL_TOKEN`,
+  Twilio webhook routes require a valid signature, Modal `/convert` and `/ws` require
+  `RVC_API_KEY`, and outbound/inbound call ordering is fail-closed around worker readiness,
+  agent audio, and SIP isolation. `/api/setup` must preserve unrelated provider resources.
 - File map updated 2026-07-07 with TRT-era `modal_deploy/` files: `modal_defs.py`,
   `trt_pipeline.py`, `export_onnx.py`, `compile_trt.py`, `test_trt_pipeline.py`.
 - Region mismatch — **resolved 2026-07-03**, Render confirmed colocated with Modal in

@@ -1,9 +1,9 @@
 ---
 title: SIP audio isolation silently failing — lead heard raw+converted voice mixed
 type: issue
-status: resolved
+status: open
 sources: [decisions-log, subsystem-notes, active-backlog]
-updated: 2026-07-03
+updated: 2026-07-15
 ---
 
 User reported a live call where the voice "was not clear and it was breaking" while
@@ -71,9 +71,16 @@ playout buffer was reintroduced (see [[adaptive-playout-buffer]]). The commit th
 updating `CLAUDE.md`'s "Audio Pipeline & Streaming" section in place to match
 `.agents/context/subsystem-notes.md`.
 
-## Status
+## Historical fix status
 
-**Confirmed live 2026-07-03.** The fix was pushed and deployed, and Render logs
+**The protobuf field fix was confirmed live 2026-07-03.** The fix was pushed and deployed, and Render logs
 (`srv-d932m4cvikkc73belt1g`) now show `[SIP Isolation] ✅ 'sip-lead' unsubscribed from raw
 agent tracks [...]` on every outbound call sampled since (15:05:27, 15:07:21, 16:10:22,
-17:05:19, 17:07:43) — zero failure lines in that window. The mixing bug is resolved.
+17:05:19, 17:07:43) — zero failure lines in that window.
+
+## Current fail-closed gate
+
+The checkout now requires the agent track before outbound dialing, then waits for
+`_restrict_sip_audio` to succeed before reporting the call as initiated. Inbound callers remain
+held until the same isolation event is confirmed. Keep this issue open until those gates are
+deployed and verified on real inbound and outbound calls.

@@ -48,6 +48,7 @@ class VoiceConversionWorker:
     # Cap: beyond this, drop the OLDEST buffered audio rather than let delay
     # grow unbounded. 5.0s is an overflow safety cap, not a latency target.
     _PLAYOUT_BUFFER_MAX_BYTES = int(48000 * 2 * 5.0)
+    _PLAYOUT_DRAIN_BYTES = int(48000 * 2 * 0.10)
 
 
     # If no converted audio has arrived for this long, the data-channel latency
@@ -581,12 +582,16 @@ class VoiceConversionWorker:
         try:
             while True:
                 async with self._playout_buffer_lock:
-                    if not filled and len(self._playout_buffer) < self._PLAYOUT_BUFFER_TARGET_BYTES:
-                        chunk = b""
+                    if not filled:
+                        if len(self._playout_buffer) < self._PLAYOUT_BUFFER_TARGET_BYTES:
+                            chunk = b""
+                        else:
+                            chunk = bytes(self._playout_buffer[:self._PLAYOUT_BUFFER_TARGET_BYTES])
+                            del self._playout_buffer[:self._PLAYOUT_BUFFER_TARGET_BYTES]
+                            filled = True
                     else:
-                        filled = True
-                        chunk = bytes(self._playout_buffer)
-                        self._playout_buffer.clear()
+                        chunk = bytes(self._playout_buffer[:self._PLAYOUT_DRAIN_BYTES])
+                        del self._playout_buffer[:self._PLAYOUT_DRAIN_BYTES]
                     self._playout_ready.clear()
                 if chunk:
                     await self._publish_frames(chunk)

@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import hmac
 import modal
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from contextlib import asynccontextmanager
@@ -61,6 +62,23 @@ async def lifespan(app: FastAPI):
     yield
 
 web_app = FastAPI(lifespan=lifespan)
+
+
+def _modal_request_authorized(authorization: str) -> bool:
+    configured = os.getenv("RVC_API_KEY", "")
+    if not configured or not authorization.startswith("Bearer "):
+        return False
+    presented = authorization[7:].strip()
+    return bool(presented) and hmac.compare_digest(presented, configured)
+
+
+def _require_modal_auth(authorization: str) -> None:
+    from fastapi import HTTPException
+
+    if not os.getenv("RVC_API_KEY", ""):
+        raise HTTPException(status_code=503, detail="RVC endpoint authentication is not configured.")
+    if not _modal_request_authorized(authorization):
+        raise HTTPException(status_code=401, detail="Authentication required.")
 
 
 # Persistent Modal Volume and images — defined in modal_defs.py (single source of
@@ -438,8 +456,9 @@ _gpu_lock = asyncio.Lock()       # serializes inference — the GPU is single-te
 # (48 kHz post-SOLA PCM, exactly what was sent back — the backend applies PresenceEQ
 # *after* this point, so expect a ~4dB 1.2-3.4kHz difference vs what gets published)
 # to the volume's debug/ dir for offline clarity analysis against the Twilio call
-# recording. Bounded per side; disable with DEBUG_SAVE_AUDIO=0 and redeploy.
-_DEBUG_SAVE_AUDIO = os.environ.get("DEBUG_SAVE_AUDIO", "1") == "1"
+# recording. Bounded per side; opt in with DEBUG_SAVE_AUDIO=1 only for a deliberate
+# diagnostic session. The safe default is off so calls are not recorded silently.
+_DEBUG_SAVE_AUDIO = os.environ.get("DEBUG_SAVE_AUDIO", "0") == "1"
 _DEBUG_MAX_SECONDS = 120
 
 
@@ -478,6 +497,7 @@ def _save_debug_wavs(in_pcm16k: bytes, out_pcm48k: bytes) -> None:
     # (~75s) or mid-call. Cap at 1 so extra connection attempts queue against the single
     # container instead of each paying for its own T4 GPU concurrently.
     max_containers=1,
+    secrets=[modal.Secret.from_name("rvc-api-key")],
     env={"USE_TRT": "1"},
 )
 @modal.asgi_app()
@@ -509,6 +529,7 @@ def fastapi_app():
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
     ):
+        _require_modal_auth(request.headers.get("Authorization", ""))
         audio_bytes = await request.body()
 
         try:
@@ -555,6 +576,11 @@ def fastapi_app():
 
         global _session_active
 
+        if not os.getenv("RVC_API_KEY", "") or not _modal_request_authorized(
+            ws.headers.get("authorization", "")
+        ):
+            await ws.close(code=1008, reason="Authentication required")
+            return
         await ws.accept()
 
         # ---- Single-tenancy gate (MVP = 1 session) ----
