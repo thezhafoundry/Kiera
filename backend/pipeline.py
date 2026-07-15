@@ -6,7 +6,7 @@ import os
 import statistics
 import time
 import traceback
-from typing import AsyncIterator, Optional, Callable
+from typing import AsyncIterator, Awaitable, Callable, Optional
 from livekit import rtc
 
 from .audio_eq import PresenceEQ
@@ -117,7 +117,8 @@ class VoiceConversionWorker:
         self.effective_engine = effective_engine
         self.fallback_reason = fallback_reason
         self.model_version = model_version
-        self.on_llvc_fatal_failure: Optional[Callable[[], None]] = None
+        self.on_llvc_fatal_failure: Optional[Callable[[], Awaitable[None]]] = None
+        self._fatal_cleanup_task: Optional[asyncio.Task] = None
 
         self._current_ingress_queue_latency_ms = 0.0
         self._current_converter_wait_ms = 0.0
@@ -638,25 +639,7 @@ class VoiceConversionWorker:
                         "— triggering fatal failure callback"
                     )
                     if self.on_llvc_fatal_failure:
-                        cleanup_task = asyncio.create_task(
-                            self.on_llvc_fatal_failure(),
-                            name=f"keira-llvc-fatal-cleanup-{self.call_id}",
-                        )
-
-                        def observe_cleanup(done: asyncio.Task) -> None:
-                            if done.cancelled():
-                                return
-                            try:
-                                error = done.exception()
-                            except asyncio.CancelledError:
-                                return
-                            if error is not None:
-                                print(
-                                    "[Worker] LLVC fatal cleanup callback failed: "
-                                    f"{type(error).__name__}"
-                                )
-
-                        cleanup_task.add_done_callback(observe_cleanup)
+                        self._start_llvc_fatal_cleanup()
 
                 if not self._is_holding and idle_duration > self._HOLD_TIMEOUT_S:
                     self._is_holding = True
@@ -732,18 +715,12 @@ class VoiceConversionWorker:
             print(f"[Worker Error in conversion stream] {e}")
             traceback.print_exc()
             if self.effective_engine == "llvc" and self.on_llvc_fatal_failure:
-                try:
-                    # A protocol-level fatal error ends the converter generator,
-                    # so the polling watchdog below is about to be cancelled in
-                    # `finally`. Propagate cleanup here and await it before
-                    # teardown; otherwise the PSTN call could remain connected
-                    # indefinitely with only fail-closed silence.
-                    await self.on_llvc_fatal_failure()
-                except Exception as cleanup_error:
-                    print(
-                        "[Worker] LLVC fatal cleanup callback failed: "
-                        f"{type(cleanup_error).__name__}"
-                    )
+                # Run cleanup outside this conversion task. The production
+                # callback cancels/awaits the managed worker lifecycle, whose
+                # teardown in turn cancels/awaits this conversion task. Awaiting
+                # the callback here creates an owner cycle and can cancel cleanup
+                # before LiveKit/Twilio/broadcast work completes.
+                self._start_llvc_fatal_cleanup()
         finally:
             consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -751,6 +728,39 @@ class VoiceConversionWorker:
             watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watchdog_task
+
+    def _start_llvc_fatal_cleanup(self) -> Optional[asyncio.Task]:
+        """Start at most one independent fatal-cleanup task for this call.
+
+        Worker teardown deliberately does not cancel this task: the callback owns
+        the production call shutdown and must be allowed to finish after it stops
+        the worker that detected the fatal converter error.
+        """
+        if self.on_llvc_fatal_failure is None:
+            return None
+        if self._fatal_cleanup_task is not None:
+            return self._fatal_cleanup_task
+
+        self._fatal_cleanup_task = asyncio.create_task(
+            self.on_llvc_fatal_failure(),
+            name=f"keira-llvc-fatal-cleanup-{self.call_id}",
+        )
+
+        def observe_cleanup(done: asyncio.Task) -> None:
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                print(
+                    "[Worker] LLVC fatal cleanup callback failed: "
+                    f"{type(error).__name__}"
+                )
+
+        self._fatal_cleanup_task.add_done_callback(observe_cleanup)
+        return self._fatal_cleanup_task
 
     async def _run_playout_consumer(self):
         """Drains _playout_buffer into LiveKit at a steady pace, decoupled from

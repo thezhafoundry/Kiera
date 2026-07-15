@@ -263,6 +263,11 @@ class RVCStreamingConverter(VoiceConverter):
     def _put_control(self, item) -> None:
         if self._out_queue is None:
             return
+        if item is _CLOSE_SENTINEL and self._fatal_error is not None:
+            # FatalOutput has priority over normal closure. In a one-slot queue,
+            # replacing it with the close sentinel would turn a fatal error into
+            # clean exhaustion and make call cleanup nondeterministic.
+            return
         while self._out_queue.full():
             self._out_queue.get_nowait()
         self._out_queue.put_nowait(item)
@@ -325,6 +330,41 @@ class RVCStreamingConverter(VoiceConverter):
                 )
         self._buffer_not_empty.set()
 
+    async def _requeue_input(self, buffered: BufferedInput) -> None:
+        """Requeue a failed send without exceeding the 500ms live edge/cap."""
+        async with self._buffer_lock:
+            if time.monotonic() - buffered.enqueued_at > LIVE_EDGE_MAX_AGE_S:
+                self.drop_count += 1
+                self.stale_input_drop_count += 1
+                logger.warning(
+                    "[RVCStreamingConverter] failed-send frame became stale — dropped"
+                )
+                return
+
+            self._buffer.appendleft(buffered)
+            self._buffered_bytes += len(buffered.payload)
+            while self._buffered_bytes > _MAX_BUFFER_BYTES and self._buffer:
+                dropped = self._buffer.popleft()
+                self._buffered_bytes -= len(dropped.payload)
+                self.drop_count += 1
+                self.input_overflow_drop_count += 1
+                logger.warning(
+                    "[RVCStreamingConverter] failed-send requeue exceeded 500ms cap — "
+                    "dropped oldest input frame (%d bytes)",
+                    len(dropped.payload),
+                )
+            if self._buffer:
+                self._buffer_not_empty.set()
+
+    def _apply_stats_sequence(self, data: dict) -> None:
+        next_sequence = self._stats_sequence + 1
+        try:
+            server_sequence = int(data.get("sequence_id", next_sequence))
+        except (TypeError, ValueError):
+            server_sequence = next_sequence
+        self._stats_sequence = max(next_sequence, server_sequence)
+        data["sequence_id"] = self._stats_sequence
+
     # ---- connection manager: connect/handshake, reconnect with backoff, and
     # run the send/receive loop for as long as the socket stays up ----
     async def _connection_loop(self):
@@ -363,7 +403,7 @@ class RVCStreamingConverter(VoiceConverter):
                             writer_task.cancel()
                             try:
                                 await writer_task
-                            except (asyncio.CancelledError, Exception):
+                            except asyncio.CancelledError:
                                 pass
 
                         # Reader loop only ends when the socket closes (or we're
@@ -426,20 +466,14 @@ class RVCStreamingConverter(VoiceConverter):
                     self._block_sent_timestamps.append(time.monotonic())
                     self._sent_bytes_count -= bytes_per_block
             except asyncio.CancelledError:
-                async with self._buffer_lock:
-                    self._buffer.appendleft(buffered)
-                    self._buffered_bytes += len(buffered.payload)
-                    self._buffer_not_empty.set()
+                await self._requeue_input(buffered)
                 raise
             except Exception as e:
                 # Send failed on a still-"open" socket (mirror the reader-side
                 # log): requeue the un-acked frame and let the connection loop
                 # reconnect. Log so a flapping socket is diagnosable.
                 logger.warning("[RVCStreamingConverter] WS send failed — requeuing frame, will reconnect: %r", e)
-                async with self._buffer_lock:
-                    self._buffer.appendleft(buffered)
-                    self._buffered_bytes += len(buffered.payload)
-                    self._buffer_not_empty.set()
+                await self._requeue_input(buffered)
                 return
 
     async def _handle_incoming(self, ws, message):
@@ -456,8 +490,7 @@ class RVCStreamingConverter(VoiceConverter):
 
         msg_type = data.get("type")
         if msg_type == "stats":
-            self._stats_sequence += 1
-            data.setdefault("sequence_id", self._stats_sequence)
+            self._apply_stats_sequence(data)
             if data.get("model_version"):
                 self.model_version = str(data["model_version"])
             data.setdefault("model_version", self.model_version)

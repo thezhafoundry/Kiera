@@ -185,6 +185,8 @@ class LLVCStreamingConverter(VoiceConverter):
     def _put_control(self, item) -> None:
         if self._out_queue is None:
             return
+        if item is _CLOSE_SENTINEL and self._fatal_error is not None:
+            return
         while self._out_queue.full():
             self._out_queue.get_nowait()
         self._out_queue.put_nowait(item)
@@ -247,6 +249,52 @@ class LLVCStreamingConverter(VoiceConverter):
                 )
         self._buffer_not_empty.set()
 
+    async def _requeue_input(self, buffered: BufferedInput) -> None:
+        """Requeue a failed send without exceeding the 500ms live edge/cap."""
+        async with self._buffer_lock:
+            if time.monotonic() - buffered.enqueued_at > LIVE_EDGE_MAX_AGE_S:
+                self.drop_count += 1
+                self.stale_input_drop_count += 1
+                logger.warning(
+                    "[LLVCStreamingConverter] failed-send frame became stale — dropped"
+                )
+                return
+
+            self._buffer.appendleft(buffered)
+            self._buffered_bytes += len(buffered.payload)
+            while self._buffered_bytes > _MAX_BUFFER_BYTES and self._buffer:
+                dropped = self._buffer.popleft()
+                self._buffered_bytes -= len(dropped.payload)
+                self.drop_count += 1
+                self.input_overflow_drop_count += 1
+                logger.warning(
+                    "[LLVCStreamingConverter] failed-send requeue exceeded 500ms cap — "
+                    "dropped oldest input frame (%d bytes)",
+                    len(dropped.payload),
+                )
+            if self._buffer:
+                self._buffer_not_empty.set()
+
+    def _apply_stats_sequence(self, data: dict) -> None:
+        next_sequence = self._stats_sequence + 1
+        try:
+            server_sequence = int(data.get("sequence_id", next_sequence))
+        except (TypeError, ValueError):
+            server_sequence = next_sequence
+        self._stats_sequence = max(next_sequence, server_sequence)
+        data["sequence_id"] = self._stats_sequence
+
+    async def _cancel_and_await_connection_children(self, *tasks: asyncio.Task) -> None:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, (asyncio.CancelledError, ConnectionClosed)):
+                continue
+            if isinstance(result, BaseException):
+                raise result
+
     async def _connection_loop(self):
         backoff = _BACKOFF_INITIAL_S
         try:
@@ -294,13 +342,15 @@ class LLVCStreamingConverter(VoiceConverter):
                         writer_task = asyncio.create_task(self._writer_loop(ws))
                         reader_task = asyncio.create_task(self._reader_loop(ws))
                         try:
-                            done, pending = await asyncio.wait(
+                            await asyncio.wait(
                                 [writer_task, reader_task],
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
-                            for t in pending:
-                                t.cancel()
                         finally:
+                            await self._cancel_and_await_connection_children(
+                                writer_task,
+                                reader_task,
+                            )
                             self._mark_connection_lost("reader or writer stopped")
                             self._session_ready.clear()
 
@@ -351,17 +401,11 @@ class LLVCStreamingConverter(VoiceConverter):
                     self._block_sent_timestamps.append(time.monotonic())
                     self._sent_bytes_count -= bytes_per_block
             except asyncio.CancelledError:
-                async with self._buffer_lock:
-                    self._buffer.appendleft(buffered)
-                    self._buffered_bytes += len(buffered.payload)
-                    self._buffer_not_empty.set()
+                await self._requeue_input(buffered)
                 raise
             except Exception as e:
                 logger.warning("[LLVCStreamingConverter] WS send failed — requeuing frame, will reconnect: %r", e)
-                async with self._buffer_lock:
-                    self._buffer.appendleft(buffered)
-                    self._buffered_bytes += len(buffered.payload)
-                    self._buffer_not_empty.set()
+                await self._requeue_input(buffered)
                 return
 
     async def _reader_loop(self, ws):
@@ -383,8 +427,7 @@ class LLVCStreamingConverter(VoiceConverter):
 
         msg_type = data.get("type")
         if msg_type == "stats":
-            self._stats_sequence += 1
-            data.setdefault("sequence_id", self._stats_sequence)
+            self._apply_stats_sequence(data)
             if data.get("model_version"):
                 self.model_version = str(data["model_version"])
             data.setdefault("model_version", self.model_version)

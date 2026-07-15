@@ -273,6 +273,8 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
 # Global tracking
 active_workers = {}
 active_calls = {}
+_LLVC_PILOT_MAX_SESSIONS = 2
+_llvc_pilot_rooms: set[str] = set()
 
 # Background keep-warm task handle
 _rvc_keepwarm_task: Optional[asyncio.Task] = None
@@ -531,12 +533,15 @@ async def _cleanup_room_state(
     worker_start_states.pop(room_name, None)
     isolation_events.pop(room_name, None)
 
-    if task and task is not asyncio.current_task() and not task.done():
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    if worker:
-        await worker.stop()
+    try:
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if worker:
+            await worker.stop()
+    finally:
+        _release_llvc_pilot_admission(room_name)
 
     if delete_room and LIVEKIT_API_KEY and LIVEKIT_API_SECRET:
         lk = None
@@ -550,6 +555,37 @@ async def _cleanup_room_state(
                 await lk.aclose()
     if remove_call:
         active_calls.pop(room_name, None)
+
+
+def _select_engine_with_llvc_admission(
+    room_name: str,
+    requested_engine: str,
+    effective_engine_override: Optional[str],
+    fallback_reason_override: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Select an engine and atomically reserve one of two LLVC pilot slots."""
+    effective_engine = effective_engine_override or requested_engine
+    fallback_reason = fallback_reason_override
+
+    if requested_engine == "llvc" and effective_engine_override is None:
+        if not LLVC_PILOT_ENABLED:
+            effective_engine = "rvc"
+            fallback_reason = "LLVC pilot is disabled"
+
+    if effective_engine == "llvc" and room_name not in _llvc_pilot_rooms:
+        if len(_llvc_pilot_rooms) >= _LLVC_PILOT_MAX_SESSIONS:
+            effective_engine = "rvc"
+            fallback_reason = "LLVC pilot capacity reached (max 2 calls)"
+        else:
+            # No await occurs between capacity check and add, so this section is
+            # atomic with respect to concurrent asyncio request handlers.
+            _llvc_pilot_rooms.add(room_name)
+
+    return effective_engine, fallback_reason
+
+
+def _release_llvc_pilot_admission(room_name: str) -> None:
+    _llvc_pilot_rooms.discard(room_name)
 
 
 # Shared logic to spawn a converter bot for a room
@@ -582,13 +618,12 @@ async def _do_start_bot(
         )) \
         .with_ttl(datetime.timedelta(seconds=3600))
     
-    effective_engine = effective_engine_override or requested_engine
-    fallback_reason = fallback_reason_override
-
-    if requested_engine == "llvc" and effective_engine_override is None:
-        if not LLVC_PILOT_ENABLED:
-            effective_engine = "rvc"
-            fallback_reason = "LLVC pilot is disabled"
+    effective_engine, fallback_reason = _select_engine_with_llvc_admission(
+        room_name,
+        requested_engine,
+        effective_engine_override,
+        fallback_reason_override,
+    )
 
     if effective_engine == "rvc" and not RVC_ENDPOINT_URL:
         if require_real_engine or not ALLOW_DUMMY_CONVERTER:
@@ -604,12 +639,16 @@ async def _do_start_bot(
     # Choose voice conversion engine
     if effective_engine == "llvc":
         print(f"[Server] Spawning LLVC Streaming Voice Changer (URL: {LLVC_WS_URL})")
-        converter = LLVCStreamingConverter(
-            ws_url=LLVC_WS_URL,
-            api_key=LLVC_API_KEY,
-            connect_timeout=5.0,
-            model_version=LLVC_MODEL_VERSION,
-        )
+        try:
+            converter = LLVCStreamingConverter(
+                ws_url=LLVC_WS_URL,
+                api_key=LLVC_API_KEY,
+                connect_timeout=5.0,
+                model_version=LLVC_MODEL_VERSION,
+            )
+        except Exception:
+            _release_llvc_pilot_admission(room_name)
+            raise
         model_version = LLVC_MODEL_VERSION
     elif effective_engine == "rvc":
         pitch_shift = RVC_MALE_PITCH_SHIFT if agent_gender.lower() == "male" else 0
@@ -637,19 +676,23 @@ async def _do_start_bot(
     # Initialize noise suppression (WebRTC). Level via NS_LEVEL env — lowering it
     # preserves the high-frequency voice detail the RVC model needs for a clear,
     # on-identity conversion (see NS_LEVEL definition above).
-    suppressor = WebRTCNoiseSuppressor(ns_level=NS_LEVEL)
+    try:
+        suppressor = WebRTCNoiseSuppressor(ns_level=NS_LEVEL)
 
-    worker = VoiceConversionWorker(
-        room_url=LIVEKIT_URL,
-        token=bot_token.to_jwt(),
-        converter=converter,
-        suppressor=suppressor,
-        call_id=room_name,
-        requested_engine=requested_engine,
-        effective_engine=effective_engine,
-        fallback_reason=fallback_reason,
-        model_version=model_version,
-    )
+        worker = VoiceConversionWorker(
+            room_url=LIVEKIT_URL,
+            token=bot_token.to_jwt(),
+            converter=converter,
+            suppressor=suppressor,
+            call_id=room_name,
+            requested_engine=requested_engine,
+            effective_engine=effective_engine,
+            fallback_reason=fallback_reason,
+            model_version=model_version,
+        )
+    except Exception:
+        _release_llvc_pilot_admission(room_name)
+        raise
 
     async def handle_fatal_failure():
         print(f"[Server] Watchdog: LLVC fatal stream outage in room={room_name}. Terminating call programmatically.")
@@ -687,8 +730,11 @@ async def _do_start_bot(
         finally:
             active_workers.pop(room_name, None)
             worker_tasks.pop(room_name, None)
-            if worker.running or worker.room.isconnected():
-                await worker.stop()
+            try:
+                if worker.running or worker.room.isconnected():
+                    await worker.stop()
+            finally:
+                _release_llvc_pilot_admission(room_name)
             print(f"[Server] Bot cleaned up for room: {room_name}")
 
     # Kick off a GPU warm-up ping the instant the bot starts. Modal cold-starts the
