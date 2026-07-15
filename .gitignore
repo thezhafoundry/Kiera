@@ -24,3 +24,8 @@ RVC/
 # and guard int-vs-tensor length checks; removing them breaks TRT ONNX export.
 !RVC/infer/lib/infer_pack/models_onnx.py
 !RVC/infer/lib/infer_pack/attentions_onnx.py
+
+debug
+
+# Auto-generated graphify codemap — regenerate on demand, do not track
+graphify-out/

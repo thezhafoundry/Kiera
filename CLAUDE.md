@@ -138,54 +138,21 @@ this from the running server if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set.
    - Both built-in suppressors degrade gracefully to passthrough if their native lib is missing.
 
 ### Audio Pipeline & Streaming ([backend/pipeline.py](backend/pipeline.py))
-- **Producer**: reads the agent track at 16 kHz, denoises each 10 ms (320-byte) frame with the
-  active `NoiseSuppressor`, and enqueues it with an ingress timestamp.
-- **No chunking, no VAD.** `webrtcvad` is not imported or used anywhere in `pipeline.py` anymore —
-  the whole "cut at natural pauses" concept from the old design is gone. `_frame_pairs()` simply
-  pairs two consecutive denoised 10 ms frames into one 20 ms (640-byte) input frame and feeds it
-  continuously into `converter.convert_stream(...)`, which is driven as a single long-lived duplex
-  stream for the life of the worker's active pipeline.
-- **No reordering, no semaphore.** `_run_conversion_stream()` republishes whatever the converter
-  yields, in arrival order — a single ordered stream (WS or local generator) has nothing to
-  reorder, so the old parallel-RVC-request semaphore no longer exists.
-- **Standing playout buffer (reintroduced 2026-07-03).** The original rebuild's one-shot ~100ms
-  jitter fill only smoothed the *start* of a call and starved on any slow block. It's since been
-  replaced by a producer/consumer split: `_run_conversion_stream` appends converted audio to a
-  bounded `self._playout_buffer` (1.25s target/5s cap as of the TRT migration phase 1, down
-  from an earlier 3s target — see `.agents/context/subsystem-notes.md`; drop-oldest on
-  overflow), and a separate
-  `_run_playout_consumer` task drains it into `_publish_frames` at a steady pace — a slow RVC
-  block now grows delay instead of producing "part by part" audio. This reflects a deliberate
-  2026-07-03 product decision that call latency is not a priority, voice continuity is — see
-  `.agents/context/subsystem-notes.md` for the full mechanism and `.agents/decisions/log.md` for
-  the tradeoff reasoning.
-- **Fail-CLOSED, never raw.** There is no raw-audio-fallback path — it was removed structurally,
-  not just avoided. If the converter's backend connection drops or errors, output is **silence**
-  (nothing published) until real converted audio resumes; the lead never hears the agent's
-  original, unconverted voice. See `RVCStreamingConverter` in `backend/converters/rvc_stream.py`
-  for the bounded (5 s) reconnect-buffer + exponential-backoff behavior backing this.
-- **Publishing**: push exact 10 ms frames of 960 bytes (480 samples @ 48 kHz mono). LiveKit's
-  `AudioSource.capture_frame()` handles pacing/backpressure. LiveKit resamples inbound tracks,
-  so we subscribe at `sample_rate=16000` and avoid manual resampling on ingress.
+Single long-lived duplex stream per call (no VAD/chunking, no reordering — one ordered
+WS/generator stream in, one steady playout consumer out), agent→lead only, **fail-closed**:
+any conversion outage publishes silence, never the raw unconverted voice. Buffer targets,
+block sizes, and the exact mechanism change often and are tracked in one place, not here —
+see `.agents/context/stack-and-rules.md` (hard invariants) and
+`.agents/context/subsystem-notes.md` (current constants + why) rather than trusting a
+remembered number in this file.
 
 ### Telephony & SIP ([backend/main.py](backend/main.py))
-- **One-time setup**: `POST /api/setup` creates the LiveKit↔Twilio SIP trunks + dispatch rule
-  and points the Twilio number's inbound webhook at this server. Run it once after filling env vars.
-- **Outbound**: `POST /api/call/outbound` spawns the bot then dials the lead via
-  `create_sip_participant` on the LiveKit outbound trunk (LiveKit → Twilio → PSTN). **Fail-closed
-  warm gate**: after spawning the bot it `await`s `worker.wait_until_ready(150.0)` before dialing;
-  if the converter's backend isn't ready in time, the bot is stopped and the endpoint returns
-  HTTP 503 instead of ringing the lead — a cold/unready GPU now blocks the call rather than
-  proceeding and leaking anything.
-- **Inbound**: Twilio hits `/api/call/inbound` → caller is held (TwiML) while `/api/call/wait`
-  polls until the agent accepts (`/api/call/accept`) **and** the bot's `worker.is_ready` is true,
-  then bridges to LiveKit SIP. `is_ready` is a cheap cached property backed by a one-shot
-  background readiness probe started when the bot spawns (not a fresh network probe on every
-  ~3s poll). This avoids bridging before LiveKit — or the voice engine — is ready.
-- **Bot identity/subscription**: the bot joins as `voice-converter-bot-<roomName>` and subscribes
-  to participants whose identity contains `agent`.
-- **Health**: `GET /api/health` reports live integration status; `POST /api/warmup` pings the
-  RVC `/health` to warm the GPU (call it at shift start to hide cold-start latency).
+`POST /api/setup` provisions the LiveKit↔Twilio SIP trunks + dispatch rule and points the
+Twilio webhook at this server — **destructive**, see `.agents/projects/active-backlog.md`
+before running it against a shared LiveKit project. Both outbound dial and inbound bridge
+gate on `worker.is_ready` (fail-closed warm gate) before touching the lead. See
+`.agents/context/stack-and-rules.md` (File Map) and `.agents/context/subsystem-notes.md`
+for endpoint-level detail, known races, and open findings.
 
 ### Environment
 Config is read from `.env` (no `.env.example` is checked in — see
