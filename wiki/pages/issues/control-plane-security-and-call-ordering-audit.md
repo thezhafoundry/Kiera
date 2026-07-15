@@ -20,7 +20,7 @@ plane. Live provider configuration and deployment still require verification.
 - Worker startup uses managed tasks rather than FastAPI `BackgroundTasks`; failure cleanup removes
   worker/call state and deletes failed rooms.
 - `/api/setup` only reuses/creates Keira-named resources and never deletes unrelated rules/trunks.
-- `make session-close` audits wiki structure, stale claims, credential patterns, and diff hygiene.
+- `make second-brain-close` audits wiki structure, stale claims, credential patterns, and diff hygiene.
 
 ## Still required outside the checkout
 

@@ -1,4 +1,4 @@
-.PHONY: session-close
+.PHONY: second-brain-close
 
-session-close:
-	python3 scripts/session_close.py
+second-brain-close:
+	python3 scripts/second_brain_close.py

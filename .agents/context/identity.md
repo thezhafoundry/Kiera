@@ -30,9 +30,9 @@ after the fact (see [[log]] and [[subsystem-notes]] for examples).
   a concrete second implementation driving it.
 
 ## End-of-session routine
-- Run `make session-close` before ending a work session. It is read-only and checks git diff
-  formatting, wiki links/frontmatter, stale claims, credential patterns, and changed files.
-- Use `python3 scripts/session_close.py --write-report` only when a durable handoff report is wanted
-  under `.agents/session-reports/`; review it before staging or committing.
+- Run `make second-brain-close` before ending a work session. It is read-only and checks git
+  diff formatting, wiki links/frontmatter, stale claims, credential patterns, and changed files.
+- Use `python3 scripts/second_brain_close.py --write-report` only when a durable handoff report
+  is wanted under `.agents/session-reports/`; review it before staging or committing.
 - Treat Render/Modal/Twilio state as a separate verification boundary. A green local report never
   proves that the deployed service matches the checkout.

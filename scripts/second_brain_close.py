@@ -78,7 +78,7 @@ def scan_repo(root: Path, pattern: re.Pattern[str]) -> list[str]:
         if not path.is_file() or any(part in ignored for part in path.parts):
             continue
         # The checker source necessarily contains the patterns it scans for.
-        if path == root / "scripts" / "session_close.py":
+        if path == root / "scripts" / "second_brain_close.py":
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -113,7 +113,7 @@ def build_report(root: Path, write_report: bool) -> tuple[int, str]:
     stale_lines = [f"- Stale claim: `{item}`" for item in stale_claims]
 
     lines = [
-        f"# Keira session-close report — {datetime.now().astimezone().isoformat(timespec='seconds')}",
+        f"# Keira second-brain-close report — {datetime.now().astimezone().isoformat(timespec='seconds')}",
         "",
         f"Result: {'BLOCKED — ' + ', '.join(failures) if failures else 'CHECKS PASSED'}",
         "",

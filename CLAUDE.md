@@ -169,8 +169,8 @@ model files (`.pth`/`.index`/`.wav`) — they are gitignored.
 - Outbound calls are two-phase: prepare the room, let the browser publish its agent track, then
   dial via `/api/call/outbound/dial`. Inbound calls remain held until the worker is ready and SIP
   isolation succeeds.
-- Run `make session-close` before ending a session. It is a read-only repo/wiki/secret audit;
-  use `--write-report` only when you want a durable `.agents/session-reports/` handoff.
+- Run `make second-brain-close` before ending a session. It is a read-only repo/wiki/secret
+  audit; use `--write-report` only when you want a durable `.agents/session-reports/` handoff.
 
 ### Code Style
 - **Python**: PEP 8, type hints where useful. Never block the event loop — offload CPU/network

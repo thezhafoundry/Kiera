@@ -19,7 +19,7 @@ two-phase call-ordering safeguards.
 - Operator routes require `KEIRA_CONTROL_TOKEN`; Twilio webhooks require signed callbacks;
   Modal conversion endpoints require the shared `RVC_API_KEY` secret. Outbound calls prepare
   the room before dialing, and inbound calls bridge only after readiness and isolation checks.
-- The session-close check is available as `make session-close`; `--write-report` creates a
+- The session-close check is available as `make second-brain-close`; `--write-report` creates a
   dated local handoff report without contacting providers.
 - One-way conversion (agent→lead only) restated, consistent with all other sources.
 - Setup requires LiveKit Cloud, Twilio (Elastic SIP Trunk), and Modal accounts.

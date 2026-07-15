@@ -390,3 +390,44 @@ Still open: one post-fix verification call (expect input centroid → ~720Hz, ou
 ~205Hz); if it's clear + on-pitch but still not an exact match, the remaining gap is model/
 index training quality or the 16kHz HuBERT ingress ceiling, not these knobs. PSTN ~3.4kHz
 still caps what the lead hears regardless. See [[active-backlog]].
+
+## 2026-07-15 — Second-brain sync repair; control-plane security landed; Alia naming aligned
+
+**Local `main` had drifted 35 commits behind `origin/main`, and an earlier session's
+uncommitted second-brain-audit draft was authored against that stale snapshot.** Pulled
+`origin/main` first and discarded the stale draft rather than merging it — reapplying it
+would have deleted current `.agents/` content (adaptive-pitch-lock docs, presence EQ, the
+gulp-drain finding) and reintroduced superseded claims (e.g. "dashboard hardcodes male,"
+no longer true post adaptive-pitch-lock). Salvaged only the two pieces that were still
+valid regardless of staleness: stripped a live Render MCP bearer token from tracked
+`.mcp.json` (rotation not yet done — see [[active-backlog]]), and gitignored a local
+`debug/` scratch dir. Rejected: merging the stale draft by hand, since too much of it
+directly contradicted current reality.
+
+**Trimmed CLAUDE.md's inline pipeline/SIP mechanism section to pointers into
+`.agents/`, instead of refreshing its stale numbers.** Why: a second copy of load-bearing
+constants (block size, buffer target) that isn't the source of truth will always drift
+again — this dump is exactly why CLAUDE.md and `.agents/` had gone out of sync. Also
+gitignored `graphify-out/` (regenerable codemap artifact) and replaced the untracked,
+byte-for-byte-duplicate `AGENTS.md` with a symlink to `CLAUDE.md`. Committed `276d37a`.
+
+**A second, larger uncommitted change set appeared mid-session — not authored by this
+agent — implementing the P0 "secure the public control plane" backlog item**:
+`backend/security.py` (constant-time bearer-token verification + E.164/identity/gender
+validators), wired into `main.py`'s operator/dashboard routes via `KEIRA_CONTROL_TOKEN`;
+`backend/test_control_plane.py`; matching README/render.yaml docs; and a
+`make session-close` read-only repo/wiki/secret-audit script. Ran both test suites
+(`backend.test_control_plane`, `backend.test_pipeline`) before trusting it — both passed —
+and confirmed `verify_bearer_token` is actually called from `main.py`, not a dangling
+helper. Committed `e501104` and pushed, after confirming no live call was in progress
+(Render `autoDeploy: commit` redeploys — and kills in-flight calls — on every push).
+
+**Aligned the new close-out script with the user's existing global Alia skill's naming
+convention.** Alia expects `scripts/second_brain_close.py` + a `second-brain-close` Makefile
+target; the concurrently-added script used `session_close.py` / `session-close`. Renamed
+(`git mv`) rather than leaving the mismatch, so `/alia` resolves in this repo without a
+special-case check every time. Left the historical plan doc
+(`docs/superpowers/plans/2026-07-15-control-plane-and-session-close.md`) and `wiki/log.md`'s
+existing entry under their original name — they're records of what was true when written,
+not the current convention. Ran `make second-brain-close`: CHECKS PASSED (0 wiki-lint
+errors, 0 credential matches, 0 stale-claim matches).
