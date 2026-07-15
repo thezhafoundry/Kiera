@@ -346,8 +346,10 @@ async def test_rvc_streaming_converter_reconnect():
         await server.wait_closed()
         server1_closed = True
 
-        # Frames sent during the outage must be buffered (bounded, replayed
-        # on reconnect), never dropped silently and never leaked raw.
+        # Frames sent during the outage are buffered only while they remain
+        # within the 500ms live edge. These frames are deliberately left stale
+        # to prove they are discarded before reconnect send, never replayed or
+        # leaked raw.
         in_queue.put_nowait(_make_frame(2))
         in_queue.put_nowait(_make_frame(3))
 
@@ -362,24 +364,26 @@ async def test_rvc_streaming_converter_reconnect():
             )
             await asyncio.sleep(0.05)
 
-        # 4. Restart a fake server on the SAME port. The connection loop's
-        # backoff (0.5s -> 5s exponential, reset on each successful handshake)
-        # means the very next retry after this restart should succeed --
-        # only one reconnect cycle is needed to demonstrate the behavior.
+        # 4. Restart a fake server on the SAME port and wait for the live
+        # session handshake before submitting one fresh frame.
         server2 = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", port)
 
         reconnect_deadline = time.monotonic() + 4.0
-        expected_count = pre_outage_count + 2
+        while not converter.is_healthy and time.monotonic() < reconnect_deadline:
+            await asyncio.sleep(0.02)
+        assert converter.is_healthy, "converter did not establish its reconnect session"
+        in_queue.put_nowait(_make_frame(4))
+
+        expected_count = pre_outage_count + 1
         while len(output_chunks) < expected_count and time.monotonic() < reconnect_deadline:
             await asyncio.sleep(0.05)
 
         assert len(output_chunks) == expected_count, (
-            f"expected reconnect to replay buffered frames: got {len(output_chunks)}, wanted {expected_count}"
+            f"expected only fresh post-reconnect audio: got {len(output_chunks)}, wanted {expected_count}"
         )
-        # Buffered frames must be replayed in the order they were produced.
-        assert _decode_frame_value(output_chunks[pre_outage_count]) == 2
-        assert _decode_frame_value(output_chunks[pre_outage_count + 1]) == 3
-        print("Reconnect-with-backoff: silence during outage, buffered replay in order: OK")
+        assert _decode_frame_value(output_chunks[pre_outage_count]) == 4
+        assert converter.stale_input_drop_count == 2
+        print("Reconnect-with-backoff: stale outage audio dropped, fresh audio converted: OK")
     finally:
         if not server1_closed:
             server.close()
@@ -450,8 +454,8 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
             
         await asyncio.sleep(0.6)  # Ensure connection is fully closed on client side before feeding
 
-        # 3. Feed well over 5s worth of 16kHz PCM (each frame is 320 bytes =
-        # 10ms; _MAX_BUFFER_BYTES caps at 500 such frames = 5s). Each frame's
+        # 3. Feed well over 500ms of 16kHz PCM (each frame is 320 bytes =
+        # 10ms; _MAX_BUFFER_BYTES caps at 50 such frames = 500ms). Each frame's
         # sample value encodes its own sequence index, so which frames survive
         # the drop-oldest policy is externally verifiable after reconnect.
         frame_len_bytes = 320
@@ -459,7 +463,7 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
         assert _MAX_BUFFER_BYTES % frame_len_bytes == 0, (
             "test assumes the cap is an exact multiple of the frame size"
         )
-        n_fed = cap_frames + 200  # ~7s worth fed against a 5s cap
+        n_fed = cap_frames + 200  # 2.5s fed against a 500ms cap
         for i in range(n_fed):
             in_queue.put_nowait(_make_frame(i))
 
@@ -485,7 +489,7 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
             f"expected exactly {cap_frames} surviving frames, got {len(converter._buffer)}"
         )
 
-        survivor_values = [_decode_frame_value(f) for f in converter._buffer]
+        survivor_values = [_decode_frame_value(f.payload) for f in converter._buffer]
         expected_survivors = list(range(n_fed - cap_frames, n_fed))
         assert survivor_values == expected_survivors, (
             "drop-oldest policy violated: surviving buffered frames are not exactly the "
@@ -497,30 +501,27 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
             f"oldest {n_fed - cap_frames} of {n_fed} fed frames dropped, newest survive in order: OK"
         )
 
-        # 5. Reconnect and confirm the survivors (and only the survivors) get
-        # converted/yielded once the connection resumes.
+        # 5. Reconnect. By now the bounded survivors are all older than 500ms,
+        # so they must be discarded at the send boundary. Only audio submitted
+        # after the new session handshake may be converted.
         server2 = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", port)
 
-        expected_count = pre_outage_count + cap_frames
         reconnect_deadline = time.monotonic() + 10.0
+        while not converter.is_healthy and time.monotonic() < reconnect_deadline:
+            await asyncio.sleep(0.02)
+        assert converter.is_healthy, "converter did not reconnect"
+        in_queue.put_nowait(_make_frame(3000))
+
+        expected_count = pre_outage_count + 1
         while len(output_chunks) < expected_count and time.monotonic() < reconnect_deadline:
             await asyncio.sleep(0.05)
 
-        print(f"DEBUG: len(output_chunks)={len(output_chunks)}, expected_count={expected_count}")
-        print(f"DEBUG: output values = {[_decode_frame_value(c) for c in output_chunks]}")
-        print(f"DEBUG: expected survivors = {expected_survivors}")
-
         assert len(output_chunks) == expected_count, (
-            f"expected reconnect to replay exactly the {cap_frames} surviving buffered frames: "
-            f"got {len(output_chunks) - pre_outage_count}, wanted {cap_frames}"
+            "stale reconnect survivors must not be emitted as converted output"
         )
-        replayed_values = [
-            _decode_frame_value(c) for c in output_chunks[pre_outage_count:]
-        ]
-        assert replayed_values == expected_survivors, (
-            "replayed post-reconnect frames were not exactly the newest surviving frames, in order"
-        )
-        print("Reconnect replay after cap/trim matches surviving newest frames, in order: OK")
+        assert _decode_frame_value(output_chunks[-1]) == 3000
+        assert converter.stale_input_drop_count == cap_frames
+        print("Reconnect discarded all stale survivors and converted only fresh audio: OK")
     finally:
         if not server1_closed:
             server.close()
@@ -1320,15 +1321,25 @@ async def test_llvc_streaming_converter_reconnect():
     assert converter.drop_count == 50
     assert len(converter._buffer) == 50
     
-    # Reconnect
+    # Reconnect. The retained 50 frames are older than the live-edge cap and
+    # must be discarded before send; only a fresh post-handshake frame returns.
     server2 = await websockets.serve(llvc_fake_ws_handler, "127.0.0.1", port)
-    
-    expected_count = 1 + 50
+
     deadline = time.monotonic() + 10.0
+    while not converter.is_healthy and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    assert converter.is_healthy
+    in_queue.put_nowait(_make_frame(1000))
+
+    expected_count = 2
     while len(output_chunks) < expected_count and time.monotonic() < deadline:
         await asyncio.sleep(0.05)
-        
+
     assert len(output_chunks) == expected_count
+    assert converter.stale_input_drop_count == 50
+    assert _decode_frame_value(output_chunks[-1]) != 1000, (
+        "LLVC fake server must return converted, not representative raw audio"
+    )
     
     await converter.close()
     await asyncio.wait_for(collect_task, timeout=2.0)

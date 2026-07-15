@@ -608,6 +608,7 @@ async def _do_start_bot(
             ws_url=LLVC_WS_URL,
             api_key=LLVC_API_KEY,
             connect_timeout=5.0,
+            model_version=LLVC_MODEL_VERSION,
         )
         model_version = LLVC_MODEL_VERSION
     elif effective_engine == "rvc":
@@ -623,6 +624,7 @@ async def _do_start_bot(
             adaptive_pitch=RVC_ADAPTIVE_PITCH,
             target_f0=RVC_TARGET_F0,
             connect_timeout=150.0,  # allow full Modal cold-start window (~60-90s)
+            model_version=RVC_MODEL_VERSION,
         )
         model_version = RVC_MODEL_VERSION
     elif effective_engine == "dummy":

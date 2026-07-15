@@ -10,6 +10,16 @@ import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .base import VoiceConverter
+from .streaming_safety import (
+    BufferedInput,
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    DEFAULT_HEARTBEAT_TIMEOUT_S,
+    DEFAULT_MAX_MESSAGE_SIZE,
+    DEFAULT_OUTPUT_QUEUE_MAX_CHUNKS,
+    FatalOutput,
+    LIVE_EDGE_MAX_AGE_S,
+    validate_streaming_endpoint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +79,19 @@ class RVCStreamingConverter(VoiceConverter):
         connect_timeout: float = 10.0,
         adaptive_pitch: bool = False,
         target_f0: float = 208.0,
+        output_queue_max_chunks: int = DEFAULT_OUTPUT_QUEUE_MAX_CHUNKS,
+        max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+        heartbeat_timeout: float = DEFAULT_HEARTBEAT_TIMEOUT_S,
+        model_version: str = "unknown",
     ):
         self.ws_url = (
             ws_url
             or os.getenv("RVC_WS_URL", "")
             or derive_ws_url(endpoint_url or os.getenv("RVC_ENDPOINT_URL", ""))
         ).rstrip("/")
-        self.api_key = api_key
+        self.api_key = api_key or ""
+        validate_streaming_endpoint(self.ws_url, self.api_key)
         self.pitch_shift = pitch_shift
         self.adaptive_pitch = adaptive_pitch
         self.target_f0 = target_f0
@@ -83,9 +99,19 @@ class RVCStreamingConverter(VoiceConverter):
         self.rms_mix_rate = rms_mix_rate
         self.protect = protect
         self.connect_timeout = connect_timeout
+        self.output_queue_max_chunks = max(1, int(output_queue_max_chunks))
+        self.max_message_size = max(1, int(max_message_size))
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_timeout = heartbeat_timeout
         self.drop_count = 0
+        self.stale_input_drop_count = 0
+        self.input_overflow_drop_count = 0
+        self.output_drop_count = 0
+        self.connection_failure_count = 0
+        self.model_version = model_version or "unknown"
         self._block_sent_timestamps = deque()
         self._sent_bytes_count = 0
+        self._stats_sequence = 0
 
         # Optional callback: on_stats(dict) — called with the server's raw
         # {"type":"stats","infer_ms":...,"block_ms":...} payload (minus "type").
@@ -101,6 +127,22 @@ class RVCStreamingConverter(VoiceConverter):
         self._out_queue: Optional[asyncio.Queue] = None
         self._pump_task: Optional[asyncio.Task] = None
         self._conn_task: Optional[asyncio.Task] = None
+        self._is_healthy = False
+        self._fatal_error: Optional[RuntimeError] = None
+
+    @property
+    def is_healthy(self) -> bool:
+        return self._is_healthy and not self._closed
+
+    def _mark_connection_lost(self, reason: str) -> None:
+        was_healthy = self._is_healthy
+        self._is_healthy = False
+        if was_healthy:
+            self.connection_failure_count += 1
+            logger.warning(
+                "[RVCStreamingConverter] active session became unhealthy: %s",
+                reason,
+            )
 
     def _config_payload(self) -> str:
         return json.dumps({
@@ -114,7 +156,12 @@ class RVCStreamingConverter(VoiceConverter):
         })
 
     def _connect_kwargs(self) -> dict:
-        kwargs = {"open_timeout": self.connect_timeout, "max_size": None}
+        kwargs = {
+            "open_timeout": self.connect_timeout,
+            "max_size": self.max_message_size,
+            "ping_interval": self.heartbeat_interval,
+            "ping_timeout": self.heartbeat_timeout,
+        }
         if self.api_key:
             kwargs["additional_headers"] = {"Authorization": f"Bearer {self.api_key}"}
         return kwargs
@@ -135,6 +182,9 @@ class RVCStreamingConverter(VoiceConverter):
                         data = json.loads(reply)
                         msg_type = data.get("type")
                         if msg_type == "ready":
+                            self.model_version = str(
+                                data.get("model_version") or self.model_version
+                            )
                             return True
                         if msg_type in ("busy", "error"):
                             return False
@@ -153,16 +203,24 @@ class RVCStreamingConverter(VoiceConverter):
         self._buffer_not_empty = asyncio.Event()
         self._input_exhausted = False
         self._closed = False
-        self._out_queue = asyncio.Queue()
+        self._out_queue = asyncio.Queue(maxsize=self.output_queue_max_chunks)
         self._sent_bytes_count = 0
         self._block_sent_timestamps = deque()
+        self._stats_sequence = 0
+        self.drop_count = 0
+        self.stale_input_drop_count = 0
+        self.input_overflow_drop_count = 0
+        self.output_drop_count = 0
+        self.connection_failure_count = 0
+        self._is_healthy = False
+        self._fatal_error = None
 
         self._pump_task = asyncio.create_task(self._pump_input(in_audio))
         self._conn_task = asyncio.create_task(self._connection_loop())
 
         try:
             while True:
-                item = await self._out_queue.get()
+                item = await self._next_output()
                 if item is _CLOSE_SENTINEL:
                     break
                 yield item
@@ -171,6 +229,7 @@ class RVCStreamingConverter(VoiceConverter):
 
     async def _teardown(self):
         self._closed = True
+        self._is_healthy = False
         for task in (self._pump_task, self._conn_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -190,9 +249,43 @@ class RVCStreamingConverter(VoiceConverter):
         convert_stream's generator is still being iterated elsewhere — that
         loop will observe the sentinel/cancellation and stop cleanly."""
         self._closed = True
+        self._is_healthy = False
         if self._out_queue is not None:
-            self._out_queue.put_nowait(_CLOSE_SENTINEL)
+            self._put_control(_CLOSE_SENTINEL)
         await self._teardown()
+
+    async def _next_output(self):
+        item = await self._out_queue.get()
+        if isinstance(item, FatalOutput):
+            raise item.error
+        return item
+
+    def _put_control(self, item) -> None:
+        if self._out_queue is None:
+            return
+        while self._out_queue.full():
+            self._out_queue.get_nowait()
+        self._out_queue.put_nowait(item)
+
+    async def _enqueue_output(self, chunk: bytes) -> None:
+        if self._out_queue is None or self._closed or self._fatal_error is not None:
+            return
+        if self._out_queue.full():
+            self._out_queue.get_nowait()
+            self.output_drop_count += 1
+            logger.warning(
+                "[RVCStreamingConverter] converted output queue full — "
+                "dropped oldest chunk"
+            )
+        self._out_queue.put_nowait(chunk)
+
+    async def _signal_fatal(self, message: str) -> None:
+        self._is_healthy = False
+        self._closed = True
+        self._fatal_error = RuntimeError(
+            f"RVC streaming converter fatal error: {message}"
+        )
+        self._put_control(FatalOutput(self._fatal_error))
 
     # ---- input pump: continuously drains in_audio into the bounded buffer ----
     async def _pump_input(self, in_audio: AsyncIterator[bytes]):
@@ -200,24 +293,37 @@ class RVCStreamingConverter(VoiceConverter):
             async for frame in in_audio:
                 if self._closed:
                     break
-                async with self._buffer_lock:
-                    self._buffer.append(frame)
-                    self._buffered_bytes += len(frame)
-                    while self._buffered_bytes > _MAX_BUFFER_BYTES and self._buffer:
-                        dropped = self._buffer.popleft()
-                        self._buffered_bytes -= len(dropped)
-                        self.drop_count += 1
-                        logger.warning(
-                            "[RVCStreamingConverter] reconnect buffer full (500ms cap) — "
-                            "dropped oldest input frame (%d bytes)",
-                            len(dropped),
-                        )
-                self._buffer_not_empty.set()
+                await self._buffer_input(frame)
         except asyncio.CancelledError:
             raise
         finally:
             self._input_exhausted = True
             self._buffer_not_empty.set()
+
+    async def _buffer_input(
+        self,
+        frame: bytes,
+        *,
+        enqueued_at: Optional[float] = None,
+    ) -> None:
+        buffered = BufferedInput(
+            enqueued_at=time.monotonic() if enqueued_at is None else enqueued_at,
+            payload=bytes(frame),
+        )
+        async with self._buffer_lock:
+            self._buffer.append(buffered)
+            self._buffered_bytes += len(buffered.payload)
+            while self._buffered_bytes > _MAX_BUFFER_BYTES and self._buffer:
+                dropped = self._buffer.popleft()
+                self._buffered_bytes -= len(dropped.payload)
+                self.drop_count += 1
+                self.input_overflow_drop_count += 1
+                logger.warning(
+                    "[RVCStreamingConverter] reconnect buffer full (500ms cap) — "
+                    "dropped oldest input frame (%d bytes)",
+                    len(dropped.payload),
+                )
+        self._buffer_not_empty.set()
 
     # ---- connection manager: connect/handshake, reconnect with backoff, and
     # run the send/receive loop for as long as the socket stays up ----
@@ -234,16 +340,26 @@ class RVCStreamingConverter(VoiceConverter):
                         data = json.loads(handshake)
                         if data.get("type") == "busy":
                             raise WebSocketException("server session busy")
+                        if data.get("type") == "error" and data.get("fatal"):
+                            await self._signal_fatal(
+                                str(data.get("message") or "server rejected session")
+                            )
+                            return
                         if data.get("type") != "ready":
                             raise WebSocketException(f"unexpected handshake reply: {data}")
 
                         backoff = _BACKOFF_INITIAL_S  # reset after a successful handshake
+                        self._is_healthy = True
+                        self.model_version = str(
+                            data.get("model_version") or self.model_version
+                        )
 
                         writer_task = asyncio.create_task(self._writer_loop(ws))
                         try:
                             async for message in ws:
                                 await self._handle_incoming(ws, message)
                         finally:
+                            self._mark_connection_lost("reader or writer stopped")
                             writer_task.cancel()
                             try:
                                 await writer_task
@@ -256,6 +372,7 @@ class RVCStreamingConverter(VoiceConverter):
                 except asyncio.CancelledError:
                     raise
                 except (ConnectionClosed, WebSocketException, OSError, asyncio.TimeoutError, ValueError) as e:
+                    self._mark_connection_lost(str(e))
                     logger.warning("[RVCStreamingConverter] WS connection lost/failed: %s", e)
 
                 if self._closed:
@@ -268,8 +385,10 @@ class RVCStreamingConverter(VoiceConverter):
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, _BACKOFF_MAX_S)
         finally:
+            self._is_healthy = False
             if self._out_queue is not None:
-                self._out_queue.put_nowait(_CLOSE_SENTINEL)
+                if self._fatal_error is None:
+                    self._put_control(_CLOSE_SENTINEL)
 
     async def _writer_loop(self, ws):
         """Drains the shared buffer to the currently-connected socket. Stops
@@ -279,29 +398,37 @@ class RVCStreamingConverter(VoiceConverter):
         front of the buffer so the next connection's writer resumes it —
         never silently lost."""
         while True:
-            frame = None
+            buffered = None
             async with self._buffer_lock:
                 if self._buffer:
-                    frame = self._buffer.popleft()
-                    self._buffered_bytes -= len(frame)
+                    buffered = self._buffer.popleft()
+                    self._buffered_bytes -= len(buffered.payload)
                     if not self._buffer:
                         self._buffer_not_empty.clear()
-            if frame is None:
+            if buffered is None:
                 if self._input_exhausted:
                     return
                 await self._buffer_not_empty.wait()
                 continue
+            if time.monotonic() - buffered.enqueued_at > LIVE_EDGE_MAX_AGE_S:
+                self.drop_count += 1
+                self.stale_input_drop_count += 1
+                logger.warning(
+                    "[RVCStreamingConverter] dropped stale input frame at send "
+                    "(older than 500ms live edge)"
+                )
+                continue
             try:
-                await ws.send(frame)
-                self._sent_bytes_count += len(frame)
+                await ws.send(buffered.payload)
+                self._sent_bytes_count += len(buffered.payload)
                 bytes_per_block = int(16000 * 2 * 0.32) # 320ms block = 10240 bytes
                 if self._sent_bytes_count >= bytes_per_block:
                     self._block_sent_timestamps.append(time.monotonic())
                     self._sent_bytes_count -= bytes_per_block
             except asyncio.CancelledError:
                 async with self._buffer_lock:
-                    self._buffer.appendleft(frame)
-                    self._buffered_bytes += len(frame)
+                    self._buffer.appendleft(buffered)
+                    self._buffered_bytes += len(buffered.payload)
                     self._buffer_not_empty.set()
                 raise
             except Exception as e:
@@ -310,8 +437,8 @@ class RVCStreamingConverter(VoiceConverter):
                 # reconnect. Log so a flapping socket is diagnosable.
                 logger.warning("[RVCStreamingConverter] WS send failed — requeuing frame, will reconnect: %r", e)
                 async with self._buffer_lock:
-                    self._buffer.appendleft(frame)
-                    self._buffered_bytes += len(frame)
+                    self._buffer.appendleft(buffered)
+                    self._buffered_bytes += len(buffered.payload)
                     self._buffer_not_empty.set()
                 return
 
@@ -319,7 +446,7 @@ class RVCStreamingConverter(VoiceConverter):
         if isinstance(message, (bytes, bytearray)):
             # The only bytes this converter ever yields: converted 48kHz PCM
             # received straight from the server.
-            await self._out_queue.put(bytes(message))
+            await self._enqueue_output(bytes(message))
             return
 
         try:
@@ -329,6 +456,11 @@ class RVCStreamingConverter(VoiceConverter):
 
         msg_type = data.get("type")
         if msg_type == "stats":
+            self._stats_sequence += 1
+            data.setdefault("sequence_id", self._stats_sequence)
+            if data.get("model_version"):
+                self.model_version = str(data["model_version"])
+            data.setdefault("model_version", self.model_version)
             locked = data.get("locked_pitch")
             if locked is not None and self.adaptive_pitch:
                 # Adopt the server's per-call locked shift so any WS reconnect
@@ -363,6 +495,10 @@ class RVCStreamingConverter(VoiceConverter):
             # Inference failed server-side: it already emitted no audio for
             # that block. Never synthesize/forward raw audio to compensate.
             logger.warning("[RVCStreamingConverter] server error: %s", data.get("message"))
+            if data.get("fatal"):
+                await self._signal_fatal(str(data.get("message") or "server error"))
+                if ws is not None:
+                    await ws.close(code=1011, reason="fatal converter error")
         elif msg_type == "ping":
             try:
                 await ws.send(json.dumps({"type": "pong"}))

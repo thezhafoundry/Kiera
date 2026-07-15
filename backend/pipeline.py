@@ -731,6 +731,19 @@ class VoiceConversionWorker:
         except Exception as e:
             print(f"[Worker Error in conversion stream] {e}")
             traceback.print_exc()
+            if self.effective_engine == "llvc" and self.on_llvc_fatal_failure:
+                try:
+                    # A protocol-level fatal error ends the converter generator,
+                    # so the polling watchdog below is about to be cancelled in
+                    # `finally`. Propagate cleanup here and await it before
+                    # teardown; otherwise the PSTN call could remain connected
+                    # indefinitely with only fail-closed silence.
+                    await self.on_llvc_fatal_failure()
+                except Exception as cleanup_error:
+                    print(
+                        "[Worker] LLVC fatal cleanup callback failed: "
+                        f"{type(cleanup_error).__name__}"
+                    )
         finally:
             consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
