@@ -49,5 +49,13 @@ services:
         sync: false
       - key: MODAL_TOKEN_SECRET
         sync: false
+      - key: LLVC_PILOT_ENABLED
+        sync: false
+      - key: LLVC_ENDPOINT_URL
+        sync: false
+      - key: LLVC_WS_URL
+        sync: false
+      - key: LLVC_API_KEY
+        sync: false
       - key: PYTHONUNBUFFERED
         value: "1"          # show print() logs in real time

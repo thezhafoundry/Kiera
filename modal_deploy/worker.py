@@ -496,7 +496,7 @@ def _save_debug_wavs(in_pcm16k: bytes, out_pcm48k: bytes) -> None:
     # container for a connection attempt that arrives while the first is still cold-starting
     # (~75s) or mid-call. Cap at 1 so extra connection attempts queue against the single
     # container instead of each paying for its own T4 GPU concurrently.
-    max_containers=1,
+    max_containers=2,
     secrets=[modal.Secret.from_name("rvc-api-key")],
     env={"USE_TRT": "1"},
 )
@@ -679,7 +679,7 @@ def fastapi_app():
                                 engine._auto_detect_pitch, probe_wav
                             )
                         pitch_for_block = lock.shift if lock.enabled else session_pitch
-                        f0_sink = [] if (lock.enabled and not lock.locked) else None
+                        f0_sink = [] if lock.enabled else None
                         try:
                             t_wait_start = time.perf_counter()
                             async with _gpu_lock:  # single-tenant GPU
@@ -710,7 +710,7 @@ def fastapi_app():
                             await ws.send_json({"type": "error", "message": str(e)})
                             continue
 
-                        if f0_sink:
+                        if f0_sink is not None:
                             if lock.add_block(
                                 np.concatenate(f0_sink),
                                 block_seconds=len(block) / st.SAMPLE_RATE_IN,

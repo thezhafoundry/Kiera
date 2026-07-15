@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import deque
 from typing import AsyncIterator, Callable, Optional
 
@@ -14,10 +15,10 @@ logger = logging.getLogger(__name__)
 
 # Bytes/second of raw 16kHz mono 16-bit PCM input (client -> server direction).
 _INPUT_BYTES_PER_SECOND = 16000 * 2
-# Hold-don't-leak reconnect buffer cap: 5s of buffered *input* audio. Beyond this,
+# Hold-don't-leak reconnect buffer cap: 500ms of buffered *input* audio. Beyond this,
 # oldest frames are dropped (never raw audio to the lead — this only affects what
 # gets converted once the socket reconnects).
-_MAX_BUFFER_BYTES = _INPUT_BYTES_PER_SECOND * 5
+_MAX_BUFFER_BYTES = int(_INPUT_BYTES_PER_SECOND * 0.5)
 
 _BACKOFF_INITIAL_S = 0.5
 _BACKOFF_MAX_S = 5.0
@@ -82,6 +83,9 @@ class RVCStreamingConverter(VoiceConverter):
         self.rms_mix_rate = rms_mix_rate
         self.protect = protect
         self.connect_timeout = connect_timeout
+        self.drop_count = 0
+        self._block_sent_timestamps = deque()
+        self._sent_bytes_count = 0
 
         # Optional callback: on_stats(dict) — called with the server's raw
         # {"type":"stats","infer_ms":...,"block_ms":...} payload (minus "type").
@@ -150,6 +154,8 @@ class RVCStreamingConverter(VoiceConverter):
         self._input_exhausted = False
         self._closed = False
         self._out_queue = asyncio.Queue()
+        self._sent_bytes_count = 0
+        self._block_sent_timestamps = deque()
 
         self._pump_task = asyncio.create_task(self._pump_input(in_audio))
         self._conn_task = asyncio.create_task(self._connection_loop())
@@ -200,10 +206,11 @@ class RVCStreamingConverter(VoiceConverter):
                     while self._buffered_bytes > _MAX_BUFFER_BYTES and self._buffer:
                         dropped = self._buffer.popleft()
                         self._buffered_bytes -= len(dropped)
+                        self.drop_count += 1
                         logger.warning(
-                            "[RVCStreamingConverter] reconnect buffer full (%ds cap) — "
+                            "[RVCStreamingConverter] reconnect buffer full (500ms cap) — "
                             "dropped oldest input frame (%d bytes)",
-                            _MAX_BUFFER_BYTES // _INPUT_BYTES_PER_SECOND, len(dropped),
+                            len(dropped),
                         )
                 self._buffer_not_empty.set()
         except asyncio.CancelledError:
@@ -286,17 +293,22 @@ class RVCStreamingConverter(VoiceConverter):
                 continue
             try:
                 await ws.send(frame)
+                self._sent_bytes_count += len(frame)
+                bytes_per_block = int(16000 * 2 * 0.32) # 320ms block = 10240 bytes
+                if self._sent_bytes_count >= bytes_per_block:
+                    self._block_sent_timestamps.append(time.monotonic())
+                    self._sent_bytes_count -= bytes_per_block
             except asyncio.CancelledError:
                 async with self._buffer_lock:
                     self._buffer.appendleft(frame)
                     self._buffered_bytes += len(frame)
                     self._buffer_not_empty.set()
                 raise
-            except Exception:
+            except Exception as e:
                 # Send failed on a still-"open" socket (mirror the reader-side
                 # log): requeue the un-acked frame and let the connection loop
                 # reconnect. Log so a flapping socket is diagnosable.
-                logger.warning("[RVCStreamingConverter] WS send failed — requeuing frame, will reconnect")
+                logger.warning("[RVCStreamingConverter] WS send failed — requeuing frame, will reconnect: %r", e)
                 async with self._buffer_lock:
                     self._buffer.appendleft(frame)
                     self._buffered_bytes += len(frame)
@@ -336,6 +348,12 @@ class RVCStreamingConverter(VoiceConverter):
                         "[RVCStreamingConverter] adaptive pitch locked at %+.2f st — "
                         "reconnects will resume this value", self.pitch_shift,
                     )
+            if self._block_sent_timestamps:
+                send_time = self._block_sent_timestamps.popleft()
+                rtt_and_wait = (time.monotonic() - send_time) * 1000.0
+                data["converter_wait_ms"] = rtt_and_wait
+                infer_ms = data.get("total_ms") or data.get("infer_ms") or 0.0
+                data["network_rtt_ms"] = max(0.0, rtt_and_wait - infer_ms)
             if self.on_stats is not None:
                 try:
                     self.on_stats({k: v for k, v in data.items() if k != "type"})

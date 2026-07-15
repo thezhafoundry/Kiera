@@ -8,15 +8,9 @@
   [[active-backlog]] is done, not pending — see [[subsystem-notes]]).
 - **Media/Telephony**: LiveKit Cloud (WebRTC room + SIP), Twilio (Elastic SIP Trunk + PSTN
   phone number). Twilio webhook points at the Render server's `/api/call/inbound`.
-- **Voice conversion**: RVC v2 model served from a serverless **Modal** GPU worker
-  (`modal_deploy/worker.py`, **L4** as of 2026-07-03 (was T4), pinned `region="ap-southeast"`,
-  with an optional TensorRT path — see [[subsystem-notes]] TRT section), now driven as a persistent
-  streaming session over a `/ws` FastAPI/Modal ASGI endpoint (alongside the pre-existing
-  `/health`/`/convert` HTTP endpoints) — MVP is single-tenant (1 concurrent session, a
-  module-level busy flag). `RVCStreamingConverter` (`backend/converters/rvc_stream.py`) is the
-  WS client actually selected in `_do_start_bot`; it holds one long-lived duplex connection for
-  the whole call. `RVCVoiceConverter` (`backend/converters/rvc.py`, HTTP-per-call) still exists
-  but is offline-test-only now, not wired into the running bot.
+- **Voice conversion**: Dual-Track implementation.
+  - **RVC v2 (Stable Default)**: Served from a serverless **Modal** GPU worker (`modal_deploy/worker.py`, **L4** as of 2026-07-03, pinned `region="ap-southeast"`), driven as a persistent streaming session over a `/ws` endpoint. `RVCStreamingConverter` (`backend/converters/rvc_stream.py`) holds one long-lived duplex connection for the whole call.
+  - **LLVC (Low Latency Pilot)**: Opt-in (`LLVC_PILOT_ENABLED=true`) low latency voice conversion pilot. Runs on 20 ms blocks over a persistent WebSocket connection to the LLVC model server. `LLVCStreamingConverter` (`backend/converters/llvc_stream.py`) handles communication. A 2.0-second silence watchdog initiates fail-closed call termination if the stream fails mid-call. Fallback to RVC is automatic if LLVC is unavailable/unready before dialing. RVC HTTP `RVCVoiceConverter` (`backend/converters/rvc.py`) still exists but is offline-test-only.
 - **Noise suppression**: `WebRTCNoiseSuppressor` / `RNNoiseSuppressor`
   (`backend/noise/noise_suppressor.py`), both degrade to passthrough if native libs are
   missing (notably on Windows — see [[subsystem-notes]]).
@@ -53,6 +47,7 @@
   `async for ... break` will not reliably stop the converter's backend session.
 - **Readiness polling must stay cheap.** `VoiceConversionWorker.is_ready` is a cached property,
   never a live network probe, because Twilio polls `/api/call/wait` roughly every 3s.
+- **LLVC 2.0-second Watchdog**: If LLVC is the active voice engine, the pipeline monitors the stream's output. If no chunks are received for 2.0 seconds, the fatal watchdog triggers to terminate the call programmatically (hanging up Twilio and deleting the LiveKit room) to prevent any raw voice leakage.
 - **Don't push to `main` mid-call during manual testing.** Render's `autoDeploy: commit`
   redeploys on every push, killing the LiveKit worker and any in-flight
   `VoiceConversionWorker`, forcing a Modal cold-start on the next call. This has been
@@ -67,6 +62,8 @@
 | `backend/converters/base.py` | `VoiceConverter` ABC — pluggability seam #1. |
 | `backend/converters/rvc.py` | `RVCVoiceConverter` — HTTP client to the Modal RVC `/convert` endpoint. Offline-test-only now; not selected by `_do_start_bot`. |
 | `backend/converters/rvc_stream.py` | `RVCStreamingConverter` — WS client to the Modal RVC `/ws` endpoint; one persistent duplex session per call, bounded reconnect buffer + backoff. What `_do_start_bot` actually selects when `RVC_ENDPOINT_URL` is set. |
+| `backend/converters/llvc_stream.py` | `LLVCStreamingConverter` — WS client to the LLVC model server `/ws` endpoint; one persistent duplex session per call, bounded reconnect buffer + backoff. |
+| `backend/converters/llvc_fake_server.py` | `llvc_fake_ws_handler` — Local mock LLVC server used for pipeline integration testing and concurrency limit validation. |
 | `backend/converters/dummy.py` | `DummyVoiceConverter` — ring-mod effect, no external API (local test). |
 | `backend/noise/noise_suppressor.py` | `NoiseSuppressor` ABC + WebRTC/RNNoise implementations — pluggability seam #2. |
 | `backend/test_pipeline.py` | Offline pipeline smoke tests, incl. `RVCStreamingConverter` reconnect/backoff/buffer-cap tests. |

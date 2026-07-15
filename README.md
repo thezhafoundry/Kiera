@@ -84,6 +84,12 @@ TWILIO_SIP_PASSWORD=your_sip_password
 SERVER_URL=https://your-deployed-server.example.com
 MODAL_TOKEN_ID=your_modal_token_id
 MODAL_TOKEN_SECRET=your_modal_token_secret
+
+# LLVC Pilot Configuration
+LLVC_PILOT_ENABLED=false # set to true to enable the Low Latency Voice Conversion pilot
+LLVC_ENDPOINT_URL= # optional HTTP LLVC endpoint url
+LLVC_WS_URL=ws://localhost:18000 # WebSocket URL of the LLVC model server
+LLVC_API_KEY=your_llvc_secret_api_key
 ```
 
 ---

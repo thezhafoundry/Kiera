@@ -52,6 +52,7 @@ class PitchLock:
         self.locked_median_f0 = None
         self._locked_shift = None
         self._voiced_f0 = []
+        self.lock_transition_elapsed = 0.0
 
     @property
     def locked(self) -> bool:
@@ -59,7 +60,12 @@ class PitchLock:
 
     @property
     def shift(self) -> float:
-        return self._locked_shift if self._locked_shift is not None else self.prior_shift
+        if self._locked_shift is None:
+            return self.prior_shift
+        if self.lock_transition_elapsed < 1.0:
+            progress = self.lock_transition_elapsed / 1.0
+            return (1.0 - progress) * self.prior_shift + progress * self._locked_shift
+        return self._locked_shift
 
     def add_block(self, f0_values, block_seconds: float) -> bool:
         """Feed one block's raw (pre-shift) F0 track (Hz; unvoiced frames == 0).
@@ -70,7 +76,10 @@ class PitchLock:
         though consecutive infer windows re-analyze overlapping context audio.
         Returns True iff this call caused the lock.
         """
-        if not self.enabled or self.locked:
+        if not self.enabled:
+            return False
+        if self.locked:
+            self.lock_transition_elapsed += float(block_seconds)
             return False
         arr = np.asarray(f0_values, dtype=np.float64).reshape(-1)
         if arr.size == 0:
@@ -89,4 +98,5 @@ class PitchLock:
         )
         self.locked_median_f0 = median_f0
         self._voiced_f0 = []  # lock is final; free the accumulator
+        self.lock_transition_elapsed = 0.0  # start transition
         return True

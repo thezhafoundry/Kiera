@@ -4,7 +4,7 @@ import json
 import logging
 import numpy as np
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -397,7 +397,24 @@ async def test_rvc_streaming_converter_reconnect():
 async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
     print("\n--- Testing RVCStreamingConverter reconnect buffer cap (bounded, drop-oldest) ---")
 
-    server = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", 0)
+    active_websockets = []
+    async def custom_handler(websocket):
+        active_websockets.append(websocket)
+        try:
+            await websocket.recv()  # config handshake
+            await websocket.send(json.dumps({"type": "ready"}))
+            async for message in websocket:
+                if isinstance(message, (bytes, bytearray)):
+                    samples = np.frombuffer(message, dtype=np.int16)
+                    upsampled = np.repeat(samples, 3).astype(np.int16)
+                    await websocket.send(upsampled.tobytes())
+        except ConnectionClosed:
+            pass
+        finally:
+            if websocket in active_websockets:
+                active_websockets.remove(websocket)
+
+    server = await websockets.serve(custom_handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
 
     converter = RVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
@@ -426,6 +443,12 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
         server.close()
         await server.wait_closed()
         server1_closed = True
+        
+        # Explicitly close any active connections to trigger client-side ConnectionClosed immediately
+        for ws in list(active_websockets):
+            await ws.close()
+            
+        await asyncio.sleep(0.6)  # Ensure connection is fully closed on client side before feeding
 
         # 3. Feed well over 5s worth of 16kHz PCM (each frame is 320 bytes =
         # 10ms; _MAX_BUFFER_BYTES caps at 500 such frames = 5s). Each frame's
@@ -482,6 +505,10 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
         reconnect_deadline = time.monotonic() + 10.0
         while len(output_chunks) < expected_count and time.monotonic() < reconnect_deadline:
             await asyncio.sleep(0.05)
+
+        print(f"DEBUG: len(output_chunks)={len(output_chunks)}, expected_count={expected_count}")
+        print(f"DEBUG: output values = {[_decode_frame_value(c) for c in output_chunks]}")
+        print(f"DEBUG: expected survivors = {expected_survivors}")
 
         assert len(output_chunks) == expected_count, (
             f"expected reconnect to replay exactly the {cap_frames} surviving buffered frames: "
@@ -1054,8 +1081,360 @@ async def test_worker_applies_presence_eq():
     print("Worker Presence EQ Wiring Test: SUCCESS")
 
 
+async def test_bounded_audio_queue():
+    print("\n--- Testing Bounded Audio Queue ---")
+    from backend.pipeline import BoundedAudioQueue
+    
+    q = BoundedAudioQueue(maxsize=3)
+    assert q.empty()
+    assert q.qsize() == 0
+    
+    await q.put(1)
+    await q.put(2)
+    await q.put(3)
+    assert q.qsize() == 3
+    assert not q.empty()
+    
+    # Put another item, which should trigger a drop of the oldest (1)
+    await q.put(4)
+    assert q.qsize() == 3
+    assert q.drop_count == 1
+    
+    val1 = await q.get()
+    q.task_done()
+    assert val1 == 2, f"Expected 2 (oldest item 1 should be dropped), got {val1}"
+    
+    val2 = await q.get()
+    q.task_done()
+    assert val2 == 3, f"Expected 3, got {val2}"
+    
+    val3 = await q.get()
+    q.task_done()
+    assert val3 == 4, f"Expected 4, got {val3}"
+    assert q.empty()
+    print("Bounded Audio Queue Test: SUCCESS")
+
+
+async def test_worker_telemetry_publish():
+    print("\n--- Testing VoiceConversionWorker Telemetry & Shared Contracts ---")
+    
+    class _DummyConverterWithStats:
+        on_stats = None
+
+    converter = _DummyConverterWithStats()
+    worker = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=converter,
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+        call_id="test-call-123",
+        requested_engine="llvc",
+        effective_engine="rvc",
+        fallback_reason="LLVC unready",
+    )
+    
+    assert worker.call_id == "test-call-123"
+    assert worker.requested_engine == "llvc"
+    assert worker.effective_engine == "rvc"
+    assert worker.fallback_reason == "LLVC unready"
+    
+    # Mock room and local participant for data publishing
+    mock_participant = AsyncMock()
+    mock_room = MagicMock()
+    mock_room.isconnected.return_value = True
+    mock_room.local_participant = mock_participant
+    worker.room = mock_room
+    
+    # Trigger stats message and verify stats updates the values
+    worker._playout_buffer = bytearray(b"\x00" * 960) # 10 ms at 48kHz mono 16-bit
+    worker._on_converter_stats({
+        "infer_ms": 35.0,
+        "block_ms": 320,
+        "converter_wait_ms": 50.0,
+        "network_rtt_ms": 15.0,
+    })
+    
+    # Wait a bit for the async task in _publish_latency_metric to run
+    await asyncio.sleep(0.05)
+    
+    assert mock_participant.publish_data.called
+    payload_bytes = mock_participant.publish_data.call_args[0][0]
+    payload = json.loads(payload_bytes.decode())
+    
+    assert payload["call_id"] == "test-call-123"
+    assert payload["requested_engine"] == "llvc"
+    assert payload["effective_engine"] == "rvc"
+    assert payload["fallback_reason"] == "LLVC unready"
+    assert payload["converter_wait_ms"] == 50.0
+    assert payload["network_rtt_ms"] == 15.0
+    assert payload["inference_ms"] == 35.0
+    assert payload["playout_buffer_latency_ms"] == 10.0
+    
+    print("VoiceConversionWorker Telemetry & Shared Contracts: SUCCESS")
+
+
+def test_llvc_stateful_upsampler():
+    print("\n--- Testing LLVC Stateful Upsampler ---")
+    from backend.converters.llvc_fake_server import StatefulUpsampler
+    
+    upsampler = StatefulUpsampler()
+    # Feed frame 1: [10, 20]
+    frame1 = np.array([10, 20], dtype=np.int16).tobytes()
+    res1 = upsampler.process(frame1)
+    samples1 = np.frombuffer(res1, dtype=np.int16)
+    # Expected: prev was 0, next is [10, 20]
+    # out[0] = 0
+    # out[1] = (2*0 + 10)//3 = 3
+    # out[2] = (0 + 2*10)//3 = 6
+    # out[3] = 10
+    # out[4] = (2*10 + 20)//3 = 13
+    # out[5] = (10 + 2*20)//3 = 16
+    assert np.array_equal(samples1, [0, 3, 6, 10, 13, 16])
+    
+    # Feed frame 2: [30, 40]
+    frame2 = np.array([30, 40], dtype=np.int16).tobytes()
+    res2 = upsampler.process(frame2)
+    samples2 = np.frombuffer(res2, dtype=np.int16)
+    # Expected: prev was 20, next is [30, 40]
+    # out[0] = 20
+    # out[1] = (2*20 + 30)//3 = 23
+    # out[2] = (20 + 2*30)//3 = 26
+    # out[3] = 30
+    # out[4] = (2*30 + 40)//3 = 33
+    # out[5] = (30 + 2*40)//3 = 36
+    assert np.array_equal(samples2, [20, 23, 26, 30, 33, 36])
+    print("LLVC Stateful Upsampler Test: SUCCESS")
+
+
+def test_llvc_stateful_causal_model():
+    print("\n--- Testing LLVC Stateful Causal Model (Ring Modulator) ---")
+    from backend.converters.llvc_fake_server import StatefulCausalModel
+    
+    model = StatefulCausalModel(carrier_freq=250.0, sample_rate=48000.0)
+    assert model.phase == 0.0
+    
+    # Process block 1
+    samples1 = np.full(100, 1000, dtype=np.int16).tobytes()
+    res1 = model.process(samples1)
+    
+    # Process block 2 - phase should carry over
+    res2 = model.process(samples1)
+    
+    # Verify phase is within 0..2*pi
+    assert 0.0 <= model.phase < 2.0 * np.pi
+    
+    # Check that output is not just zeros or unmodulated
+    samples_out1 = np.frombuffer(res1, dtype=np.int16)
+    samples_out2 = np.frombuffer(res2, dtype=np.int16)
+    assert not np.array_equal(samples_out1, np.full(100, 1000, dtype=np.int16))
+    assert not np.array_equal(samples_out2, np.full(100, 1000, dtype=np.int16))
+    
+    print("LLVC Stateful Causal Model Test: SUCCESS")
+
+
+async def test_llvc_streaming_converter_basic():
+    print("\n--- Testing LLVCStreamingConverter handshake, echo, and close() ---")
+    from backend.converters.llvc_fake_server import llvc_fake_ws_handler
+    from backend.converters.llvc_stream import LLVCStreamingConverter
+    
+    server = await websockets.serve(llvc_fake_ws_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    
+    converter = LLVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws", api_key="secret-key")
+    in_gen, in_queue = _make_fed_input()
+    output_chunks = []
+    
+    async def collect():
+        async for chunk in converter.convert_stream(in_gen):
+            output_chunks.append(chunk)
+            
+    collect_task = asyncio.create_task(collect())
+    
+    # Feed 1 frame (320 bytes = 160 samples of 1000)
+    in_queue.put_nowait(np.full(160, 1000, dtype=np.int16).tobytes())
+    
+    deadline = time.monotonic() + 3.0
+    while len(output_chunks) < 1 and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+        
+    assert len(output_chunks) >= 1
+    out_samples = np.frombuffer(output_chunks[0], dtype=np.int16)
+    assert len(out_samples) == 480 # 3x upsampling of 160
+    
+    await converter.close()
+    await asyncio.wait_for(collect_task, timeout=2.0)
+    server.close()
+    await server.wait_closed()
+    print("LLVCStreamingConverter basic test: SUCCESS")
+
+
+async def test_llvc_streaming_converter_reconnect():
+    print("\n--- Testing LLVCStreamingConverter reconnect and buffer cap ---")
+    from backend.converters.llvc_fake_server import llvc_fake_ws_handler
+    from backend.converters.llvc_stream import LLVCStreamingConverter
+    
+    active_websockets = []
+    async def custom_handler(websocket):
+        active_websockets.append(websocket)
+        try:
+            await llvc_fake_ws_handler(websocket)
+        finally:
+            if websocket in active_websockets:
+                active_websockets.remove(websocket)
+                
+    server = await websockets.serve(custom_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    
+    converter = LLVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+    in_gen, in_queue = _make_fed_input()
+    output_chunks = []
+    
+    async def collect():
+        async for chunk in converter.convert_stream(in_gen):
+            output_chunks.append(chunk)
+            
+    collect_task = asyncio.create_task(collect())
+    
+    # First connection works
+    in_queue.put_nowait(_make_frame(10))
+    deadline = time.monotonic() + 3.0
+    while len(output_chunks) < 1 and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    assert len(output_chunks) == 1
+    
+    # Outage
+    server.close()
+    await server.wait_closed()
+    for ws in list(active_websockets):
+        await ws.close()
+        
+    await asyncio.sleep(0.6)
+    
+    # Feed 100 frames (above 50 cap)
+    for i in range(100):
+        in_queue.put_nowait(_make_frame(i))
+        
+    # Wait for drain
+    await asyncio.sleep(0.5)
+    
+    assert converter.drop_count == 50
+    assert len(converter._buffer) == 50
+    
+    # Reconnect
+    server2 = await websockets.serve(llvc_fake_ws_handler, "127.0.0.1", port)
+    
+    expected_count = 1 + 50
+    deadline = time.monotonic() + 10.0
+    while len(output_chunks) < expected_count and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+        
+    assert len(output_chunks) == expected_count
+    
+    await converter.close()
+    await asyncio.wait_for(collect_task, timeout=2.0)
+    server2.close()
+    await server2.wait_closed()
+    print("LLVCStreamingConverter reconnect and buffer cap test: SUCCESS")
+
+
+async def test_llvc_concurrency_limit():
+    print("\n--- Testing LLVC Fake Server Concurrency Limit (max 2) ---")
+    from backend.converters.llvc_fake_server import llvc_fake_ws_handler
+    from backend.converters.llvc_stream import LLVCStreamingConverter
+    
+    server = await websockets.serve(llvc_fake_ws_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    
+    # Client 1
+    c1 = LLVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+    g1, q1 = _make_fed_input()
+    task1 = asyncio.create_task(anext(c1.convert_stream(g1)))
+    q1.put_nowait(_make_frame(1))
+    
+    # Client 2
+    c2 = LLVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+    g2, q2 = _make_fed_input()
+    task2 = asyncio.create_task(anext(c2.convert_stream(g2)))
+    q2.put_nowait(_make_frame(2))
+    
+    # Give them a moment to connect
+    await asyncio.sleep(0.2)
+    
+    # Client 3 should be rejected with busy
+    c3 = LLVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+    g3, q3 = _make_fed_input()
+    
+    # We capture logs to verify warning
+    with _capture_logs("backend.converters.llvc_stream") as log_capture:
+        task3 = asyncio.create_task(anext(c3.convert_stream(g3)))
+        q3.put_nowait(_make_frame(3))
+        await asyncio.sleep(0.5)
+        
+        # Check logs for "busy"
+        busy_logged = any("server busy" in r.getMessage() for r in log_capture.records)
+        assert busy_logged, "Expected server busy warning in logs"
+        
+    await c1.close()
+    await c2.close()
+    await c3.close()
+    
+    # Cleanup task exceptions
+    for t in [task1, task2, task3]:
+        with contextlib.suppress(Exception):
+            await t
+            
+    server.close()
+    await server.wait_closed()
+    print("LLVC Concurrency Limit Test: SUCCESS")
+
+
+async def test_llvc_pre_call_fallback():
+    print("\n--- Testing LLVC Pre-Call Fallback to RVC ---")
+    from backend.converters.llvc_stream import LLVCStreamingConverter
+    converter = LLVCStreamingConverter(ws_url="ws://127.0.0.1:9999/ws")
+    res = await converter.wait_ready(0.1)
+    assert res is False, "wait_ready should fail on closed port"
+    print("LLVC Pre-Call Fallback test: SUCCESS")
+
+
+async def test_llvc_mid_call_watchdog():
+    print("\n--- Testing LLVC Mid-Call Watchdog (2.0s outage) ---")
+    class DummyConverter:
+        async def convert_stream(self, in_audio):
+            while True:
+                await asyncio.sleep(10.0)
+                yield b""
+                
+    worker = VoiceConversionWorker(
+        room_url="ws://localhost",
+        token="token",
+        converter=DummyConverter(),
+        suppressor=None,
+        requested_engine="llvc",
+        effective_engine="llvc",
+    )
+    
+    fatal_called = asyncio.Event()
+    async def on_fatal():
+        fatal_called.set()
+        
+    worker.on_llvc_fatal_failure = on_fatal
+    worker._last_chunk_at = time.monotonic()
+    
+    watchdog = asyncio.create_task(worker._holding_watchdog())
+    try:
+        await asyncio.wait_for(fatal_called.wait(), timeout=3.0)
+    finally:
+        watchdog.cancel()
+        
+    assert fatal_called.is_set()
+    print("LLVC Mid-Call Watchdog test: SUCCESS")
+
+
 async def main():
     print("Running automated pipeline verification tests...")
+    await test_bounded_audio_queue()
+    await test_worker_telemetry_publish()
     await test_noise_suppressor()
     await test_dummy_converter()
     await test_rvc_converter_mocked()
@@ -1073,6 +1452,15 @@ async def main():
     await test_playout_buffer_drops_oldest_over_cap()
     await test_presence_eq()
     await test_worker_applies_presence_eq()
+    
+    # LLVC tests
+    test_llvc_stateful_upsampler()
+    test_llvc_stateful_causal_model()
+    await test_llvc_streaming_converter_basic()
+    await test_llvc_streaming_converter_reconnect()
+    await test_llvc_concurrency_limit()
+    await test_llvc_pre_call_fallback()
+    await test_llvc_mid_call_watchdog()
     print("\nAll automated verification tests completed successfully!")
 
 if __name__ == "__main__":

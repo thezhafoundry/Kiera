@@ -6,12 +6,42 @@ import os
 import statistics
 import time
 import traceback
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Callable
 from livekit import rtc
 
 from .audio_eq import PresenceEQ
 from .converters.base import VoiceConverter
 from .noise.noise_suppressor import NoiseSuppressor
+
+
+class BoundedAudioQueue(asyncio.Queue):
+    """
+    An asyncio.Queue subclass that bounds queue size and drops the oldest
+    elements rather than blocking when full.
+    """
+    def __init__(self, maxsize: int = 0):
+        super().__init__(maxsize=maxsize)
+        self.drop_count = 0
+
+    async def put(self, item):
+        while self.full() and self.maxsize > 0:
+            try:
+                self.get_nowait()
+                self.task_done()
+                self.drop_count += 1
+            except asyncio.QueueEmpty:
+                break
+        await super().put(item)
+
+    def put_nowait(self, item):
+        while self.full() and self.maxsize > 0:
+            try:
+                self.get_nowait()
+                self.task_done()
+                self.drop_count += 1
+            except asyncio.QueueEmpty:
+                break
+        super().put_nowait(item)
 
 
 class VoiceConversionWorker:
@@ -69,11 +99,28 @@ class VoiceConversionWorker:
         token: str,
         converter: VoiceConverter,
         suppressor: NoiseSuppressor,
+        call_id: str = "",
+        requested_engine: str = "rvc",
+        effective_engine: str = "rvc",
+        fallback_reason: Optional[str] = None,
     ):
         self.room_url = room_url
         self.token = token
         self.converter = converter
         self.suppressor = suppressor
+        self.call_id = call_id
+        self.requested_engine = requested_engine
+        self.effective_engine = effective_engine
+        self.fallback_reason = fallback_reason
+        self.on_llvc_fatal_failure: Optional[Callable[[], None]] = None
+
+        self._current_ingress_queue_latency_ms = 0.0
+        self._current_converter_wait_ms = 0.0
+        self._current_network_rtt_ms = 0.0
+        self._current_inference_ms = 0.0
+        self._current_processing_latency_ms = 0.0
+        self._current_mouth_to_ear_ms = 0.0
+        self.dropped_playout_bytes = 0
 
         self.room = rtc.Room()
         self.audio_source: Optional[rtc.AudioSource] = None
@@ -134,7 +181,7 @@ class VoiceConversionWorker:
     async def start(self):
         """Starts the worker, connects to the LiveKit room, and publishes the output track."""
         self.running = True
-        self._audio_queue = asyncio.Queue()
+        self._audio_queue = BoundedAudioQueue(maxsize=50)
 
         # Define event handlers
         @self.room.on("track_subscribed")
@@ -377,6 +424,7 @@ class VoiceConversionWorker:
             # Record the send timestamp (of the earlier of the two frames) for the
             # local fallback latency estimate — see _estimate_fallback_latency_ms.
             self._frame_sent_at.append(t1)
+            self._current_ingress_queue_latency_ms = (time.time() - t1) * 1000.0
             yield first + second
 
     def _on_converter_stats(self, stats: dict):
@@ -387,12 +435,32 @@ class VoiceConversionWorker:
         infer_ms = stats.get("infer_ms") or 0.0
         block_ms = stats.get("block_ms") or 0.0
         self._latest_latency_ms = float(infer_ms) + float(block_ms)
+
+        self._current_inference_ms = float(infer_ms)
+        self._current_converter_wait_ms = float(stats.get("converter_wait_ms", 0.0))
+        self._current_network_rtt_ms = float(stats.get("network_rtt_ms", 0.0))
+
+        playout_buffer_latency_ms = 0.0
+        playout_buffer = getattr(self, "_playout_buffer", None)
+        if playout_buffer is not None:
+            playout_buffer_latency_ms = len(playout_buffer) / 96.0
+
+        self._current_processing_latency_ms = (
+            self._current_ingress_queue_latency_ms +
+            self._current_inference_ms +
+            playout_buffer_latency_ms
+        )
+        self._current_mouth_to_ear_ms = (
+            self._current_ingress_queue_latency_ms +
+            self._current_converter_wait_ms +
+            playout_buffer_latency_ms
+        )
+
         self._publish_latency_metric()
 
         # _playout_buffer only exists once _run_conversion_stream has started
         # (see its class docstring) -- degrade to None rather than raising if a
         # stats message somehow arrives before that.
-        playout_buffer = getattr(self, "_playout_buffer", None)
         self._call_block_stats.append({
             **stats,
             "playout_buffer_bytes": len(playout_buffer) if playout_buffer is not None else None,
@@ -456,7 +524,18 @@ class VoiceConversionWorker:
             self._pending_output_bytes -= self._OUTPUT_BYTES_PER_INPUT_FRAME
         if latest_ts is None:
             return None
-        return (time.time() - latest_ts) * 1000.0
+        elapsed_ms = (time.time() - latest_ts) * 1000.0
+
+        self._current_inference_ms = 0.0
+        self._current_converter_wait_ms = elapsed_ms
+        self._current_network_rtt_ms = 0.0
+
+        playout_buffer = getattr(self, "_playout_buffer", None)
+        playout_latency = len(playout_buffer) / 96.0 if playout_buffer is not None else 0.0
+        self._current_processing_latency_ms = elapsed_ms + playout_latency
+        self._current_mouth_to_ear_ms = elapsed_ms + playout_latency
+
+        return elapsed_ms
 
     def _publish_latency_metric(self, force: bool = False):
         """Fire-and-forget publish of the latency/fallback badge JSON to the room
@@ -470,9 +549,26 @@ class VoiceConversionWorker:
 
         if not (self.room and self.room.isconnected()):
             return
+
+        playout_latency = len(self._playout_buffer) / 96.0 if getattr(self, "_playout_buffer", None) is not None else 0.0
+
         payload = json.dumps({
             "pipeline_latency_ms": self._latest_latency_ms,
             "is_fallback": self._is_holding,
+            "call_id": self.call_id,
+            "requested_engine": self.requested_engine,
+            "effective_engine": self.effective_engine,
+            "fallback_reason": self.fallback_reason or "",
+            "ingress_queue_latency_ms": self._current_ingress_queue_latency_ms,
+            "converter_wait_ms": self._current_converter_wait_ms,
+            "network_rtt_ms": self._current_network_rtt_ms,
+            "inference_ms": self._current_inference_ms,
+            "playout_buffer_latency_ms": playout_latency,
+            "processing_latency_ms": self._current_processing_latency_ms,
+            "estimated_mouth_to_ear_ms": self._current_mouth_to_ear_ms,
+            "dropped_input_frames": self._audio_queue.drop_count if self._audio_queue else 0,
+            "dropped_reconnect_frames": getattr(self.converter, "drop_count", 0),
+            "dropped_playout_frames": self.dropped_playout_bytes // 960,
         }).encode()
 
         async def safe_publish():
@@ -489,9 +585,20 @@ class VoiceConversionWorker:
         dropped and is reconnecting. Purely observational: never touches the
         converter or the audio path itself."""
         try:
+            llvc_fatal_triggered = False
             while True:
                 await asyncio.sleep(0.2)
-                if not self._is_holding and (time.monotonic() - self._last_chunk_at) > self._HOLD_TIMEOUT_S:
+                now = time.monotonic()
+                idle_duration = now - self._last_chunk_at
+                
+                # Check for fatal LLVC conversion outage (2.0 seconds)
+                if self.effective_engine == "llvc" and idle_duration > 2.0 and not llvc_fatal_triggered:
+                    llvc_fatal_triggered = True
+                    print("[Worker] LLVC conversion stream outage detected (2.0s watchdog expired) — triggering fatal failure callback")
+                    if self.on_llvc_fatal_failure:
+                        asyncio.create_task(self.on_llvc_fatal_failure())
+
+                if not self._is_holding and idle_duration > self._HOLD_TIMEOUT_S:
                     self._is_holding = True
                     self._publish_latency_metric(force=True)
         except asyncio.CancelledError:
@@ -551,6 +658,7 @@ class VoiceConversionWorker:
                             # / GPU tier genuinely can't sustain this call's real-
                             # time factor, not something a bigger buffer fixes.
                             del self._playout_buffer[:overflow]
+                            self.dropped_playout_bytes += overflow
                             print(
                                 f"[Worker] Playout buffer over {self._PLAYOUT_BUFFER_MAX_BYTES}-byte "
                                 f"cap — dropped {overflow} oldest bytes"

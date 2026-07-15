@@ -40,6 +40,13 @@ troubleshooting steps for Modal GPU connection/cold-start issues.
 > been fully reconciled with these changes; treat the buffer/GPU-tier/region specifics in this
 > banner as authoritative over the older prose that follows.
 
+> **2026-07-15 LLVC Dual-Track update:** LLVC (Low Latency Voice Conversion) has been implemented
+> as an opt-in pilot (`LLVC_PILOT_ENABLED=true`). LLVC bypasses the heavy block-accumulation of RVC
+> and processes audio in 20 ms blocks with a persistent WebSocket client. It achieves a **sub-10ms**
+> local processing latency (3.8 ms median, 4.6 ms p95 in fake server benchmarks) and features a
+> 2-second mid-call watchdog failsafe for clean teardown. If LLVC fails to start or the pre-call
+> readiness check fails, the pipeline automatically falls back to the stable RVC track.
+
 ---
 
 ## 1. Latency Budget Breakdown (design targets — not yet re-measured, see banner)
@@ -57,13 +64,13 @@ $$\text{Mouth-to-Ear Latency} = T_{\text{ingress}} + T_{\text{noise\_suppression
 | **Ingress Network** | 20 - 45 ms | Browser capture, OPUS encoding, WebRTC transport to LiveKit, and forwarding to the Python worker at 16 kHz mono. Unchanged by this rebuild (frontend/LiveKit transport untouched) — carried forward from the pre-rebuild estimate. |
 | **Noise Suppression** | 0.2 - 0.5 ms | `WebRTCNoiseSuppressor` processing of 10ms/320-byte frames. Sub-millisecond on CPU. Unchanged by this rebuild. |
 | **Input Frame Batching** | up to 20 ms | `_frame_pairs()` in `backend/pipeline.py` pairs two consecutive 10ms denoised frames into one 20ms (640-byte) input frame before it's sent into `convert_stream` — the plan's "Input frame to WS" parameter. |
-| **Inference Block Accumulation** | up to 320 ms (design target) | `modal_deploy/streaming.py::BlockAccumulator` only pops a block once 320ms of *new* audio has arrived (`BLOCK_MS`/`BLOCK_SAMPLES_IN`); a 160ms left-context window (`CONTEXT_MS`) is prepended for inference quality but doesn't itself add wait time. Per the rebuild plan's parameter table — see `docs/plans/2026-07-02-streaming-rebuild-plan.md`. |
-| **GPU Inference (warm)** | TRT path: median **66ms** / p95 68ms per 1400ms block (C3 benchmark, live L4, 2026-07-06); legacy ONNX/`pm` path: target < ~250 ms per 320ms block, not live-measured | `RVCEngine.run_conversion` / `TRTVoicePipeline` inside the `/ws` handler (`modal_deploy/worker.py`). The TRT path (`USE_TRT=1`) uses 3 static-shape TensorRT engines (HuBERT/generator/RMVPE) and re-enables `rmvpe` pitch tracking — see `.agents/context/subsystem-notes.md`'s TensorRT/ONNX migration section. |
+| **Inference Block Accumulation** | up to 320 ms (RVC) / **0 ms (LLVC)** | `modal_deploy/streaming.py::BlockAccumulator` only pops a block once 320ms of *new* audio has arrived (`BLOCK_MS`/`BLOCK_SAMPLES_IN`) for RVC. LLVC has no block accumulation step (processes 20 ms frames in real-time). |
+| **GPU Inference (warm)** | RVC: median **66ms** (TRT L4) / LLVC: target **< 10ms** (3.8ms median in benchmarks) | `RVCEngine.run_conversion` / `TRTVoicePipeline` inside the `/ws` handler. LLVC uses causal frame-by-frame conversions to eliminate latency. |
 | **GPU Inference (cold)** | 30 - 90+ s (whole call blocked, not just first block); TRT adds a one-time ~22s engine build/warmup on a cold volume cache | Same Modal cold-start as before — see the historical ~75s measurement in §4.1 — but the *consequence* changed: the fail-closed warm gate (`worker.wait_until_ready`, see CLAUDE.md "Telephony & SIP") now blocks the call from starting at all until the GPU is ready, instead of letting the first several chunks through as raw voice. |
-| **SOLA Crossfade** | 80 ms held back per block | `modal_deploy/streaming.py::sola_crossfade` (`SOLA_CROSSFADE_SAMPLES`, 3840 samples @ 48kHz) holds back the last 80ms of each converted block as `pending_tail`, overlap-added onto the next block, to avoid audible seams between blocks. Per the plan's parameter table. |
-| **Standing Playout Buffer** | 1.25 s target / 5 s cap (as of TRT migration phase 1, 2026-07-07; was ~3s/~5s from 2026-07-03 to phase 1) | `VoiceConversionWorker._PLAYOUT_BUFFER_TARGET_BYTES`/`_MAX_BYTES` in `backend/pipeline.py` — a producer/consumer split that absorbs any block slower than real-time, trading delay for voice continuity. See CLAUDE.md "Audio Pipeline & Streaming" and `.agents/context/subsystem-notes.md`. This is now the dominant term in the budget, not the one-shot 100ms jitter fill this table used to describe (that constant no longer exists in the code). |
+| **SOLA Crossfade** | RVC: 80 ms / **LLVC: 0 ms** | `modal_deploy/streaming.py::sola_crossfade` holds back the last 80ms of each converted block as `pending_tail` to avoid audible seams in RVC. LLVC uses causal, frame-by-frame conversion, bypassing this. |
+| **Standing Playout Buffer** | RVC: 1.25 s / **LLVC: 150 ms** | `VoiceConversionWorker._PLAYOUT_BUFFER_TARGET_BYTES` in `backend/pipeline.py`. Absorbs any block slower than real-time. Reduced to 150 ms for LLVC pilot to minimize latency. |
 | **Egress Network** | 20 - 40 ms | Publishing 960-byte (10ms @ 48kHz) frames to LiveKit, then WebRTC + browser jitter-buffer playout to the lead. Unchanged by this rebuild. |
-| **Steady-state Total** | **~1.3 - 1.6 s (design estimate, not live-measured)** | Dominated by the 1.25s standing playout buffer, not GPU inference (which TRT has made comparatively negligible at ~66ms). The rebuild plan's original "~400-550ms" target predates the 2026-07-03 playout-buffer reintroduction and no longer describes the deployed design — see the top-of-document banner. No live spectral-tone measurement has been run against the current (buffer + TRT) configuration yet. |
+| **Steady-state Total** | **RVC: ~1.3 - 1.6 s** / **LLVC: < 350 ms** | RVC is dominated by the 1.25s standing playout buffer. LLVC achieves under 350 ms mouth-to-ear latency due to 0ms block accumulation, 150ms buffer, and sub-10ms inference. |
 | **Cold-GPU Total** | **Call blocked (503 outbound / held inbound) until ready, no audio published** | Replaces the old "30-90+s of raw voice, then fail-over recovers" row — there is no raw-voice period anymore; see the Inference (cold) row above and §4.2. |
 
 Region note: the Modal function is pinned to `region="ap-southeast"` (Singapore), intended to

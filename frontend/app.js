@@ -34,7 +34,31 @@ async function apiFetch(url, options = {}) {
 document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     initWebSocket();
+    checkLLVCPilotStatus();
 });
+
+async function checkLLVCPilotStatus() {
+    try {
+        const resp = await fetch(`${API_BASE}/api/health`);
+        if (resp.ok) {
+            const health = await resp.json();
+            const optionLLVC = document.getElementById('option-llvc');
+            if (health.llvc_pilot_enabled) {
+                if (optionLLVC) {
+                    optionLLVC.disabled = false;
+                    optionLLVC.innerText = "LLVC — Pilot (Low Latency)";
+                }
+            } else {
+                if (optionLLVC) {
+                    optionLLVC.disabled = true;
+                    optionLLVC.innerText = "LLVC — Pilot (Disabled)";
+                }
+            }
+        }
+    } catch (e) {
+        console.error("Error checking LLVC pilot status:", e);
+    }
+}
 
 function setupEventListeners() {
     // Deploy GPU Button
@@ -91,6 +115,15 @@ function initWebSocket() {
                     console.log("[WebSocket] Call ended by remote side");
                     resetCallUI();
                     leaveRoom();
+                    if (data.reason === "llvc_outage") {
+                        const alertEl = document.getElementById('llvc-outage-alert');
+                        if (alertEl) {
+                            alertEl.style.display = 'flex';
+                            setTimeout(() => {
+                                alertEl.style.display = 'none';
+                            }, 10000);
+                        }
+                    }
                 }
             }
         } catch (e) {
@@ -225,10 +258,16 @@ async function acceptIncomingCall() {
     setupCallUI();
 
     try {
+        const voiceEngine = document.getElementById('voice-engine')?.value || 'rvc';
         const resp = await apiFetch(`${API_BASE}/api/call/accept`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ roomName, agentIdentity, agentGender: selectedAgentGender() })
+            body: JSON.stringify({ 
+                roomName, 
+                agentIdentity, 
+                agentGender: selectedAgentGender(),
+                voiceEngine: voiceEngine
+            })
         });
         
         if (!resp.ok) throw new Error("Accept endpoint failed");
@@ -267,10 +306,16 @@ async function startOutboundCall(phone, name) {
 
     let preparedRoom = null;
     try {
+        const voiceEngine = document.getElementById('voice-engine')?.value || 'rvc';
         const resp = await apiFetch(`${API_BASE}/api/call/outbound`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ phoneNumber: phone, agentIdentity, agentGender: selectedAgentGender() })
+            body: JSON.stringify({ 
+                phoneNumber: phone, 
+                agentIdentity, 
+                agentGender: selectedAgentGender(),
+                voiceEngine: voiceEngine
+            })
         });
         
         if (!resp.ok) {
@@ -444,6 +489,56 @@ function setupRoomEvents(room) {
                 } else {
                     failsafeBadge.style.display = 'none';
                 }
+
+                // Update telemetry panel
+                if (data.requested_engine !== undefined) {
+                    document.getElementById('telemetry-requested').innerText = data.requested_engine.toUpperCase();
+                }
+                if (data.effective_engine !== undefined) {
+                    const badge = document.getElementById('effective-engine-badge');
+                    badge.innerText = data.effective_engine.toUpperCase();
+                    if (data.effective_engine === 'llvc') {
+                        badge.style.background = 'rgba(52, 152, 219, 0.2)';
+                        badge.style.color = '#3498db';
+                        badge.style.borderColor = 'rgba(52, 152, 219, 0.3)';
+                    } else {
+                        badge.style.background = 'rgba(46, 204, 113, 0.2)';
+                        badge.style.color = '#2ecc71';
+                        badge.style.borderColor = 'rgba(46, 204, 113, 0.3)';
+                    }
+                }
+                if (data.fallback_reason !== undefined) {
+                    const fallbackEl = document.getElementById('telemetry-fallback-reason');
+                    fallbackEl.innerText = data.fallback_reason || 'None';
+                    fallbackEl.style.color = data.fallback_reason ? '#e74c3c' : '#2ecc71';
+                }
+                if (data.ingress_queue_latency_ms !== undefined) {
+                    document.getElementById('telemetry-ingress-queue').innerText = `${data.ingress_queue_latency_ms.toFixed(1)} ms`;
+                }
+                if (data.converter_wait_ms !== undefined) {
+                    document.getElementById('telemetry-converter-wait').innerText = `${data.converter_wait_ms.toFixed(1)} ms`;
+                }
+                if (data.network_rtt_ms !== undefined) {
+                    document.getElementById('telemetry-network-rtt').innerText = `${data.network_rtt_ms.toFixed(1)} ms`;
+                }
+                if (data.playout_buffer_latency_ms !== undefined) {
+                    document.getElementById('telemetry-playout-buffer').innerText = `${data.playout_buffer_latency_ms.toFixed(1)} ms`;
+                }
+                if (data.inference_ms !== undefined) {
+                    document.getElementById('telemetry-processing-time').innerText = `${data.inference_ms.toFixed(1)} ms`;
+                }
+                if (data.estimated_mouth_to_ear_ms !== undefined) {
+                    document.getElementById('telemetry-mouth-to-ear').innerText = `${data.estimated_mouth_to_ear_ms.toFixed(0)} ms`;
+                }
+                if (data.dropped_input_frames !== undefined) {
+                    document.getElementById('drops-input').innerText = data.dropped_input_frames;
+                }
+                if (data.dropped_reconnect_frames !== undefined) {
+                    document.getElementById('drops-reconnect').innerText = data.dropped_reconnect_frames;
+                }
+                if (data.dropped_playout_frames !== undefined) {
+                    document.getElementById('drops-playout').innerText = data.dropped_playout_frames;
+                }
             }
         } catch (e) {
             console.error("Error parsing data channel message:", e);
@@ -545,6 +640,9 @@ function leaveRoom() {
 
 // UI State Toggles
 function setupCallUI() {
+    const alertEl = document.getElementById('llvc-outage-alert');
+    if (alertEl) alertEl.style.display = 'none';
+
     document.getElementById('console-idle-view').style.display = 'none';
     document.getElementById('console-active-view').style.display = 'block';
     
@@ -571,6 +669,26 @@ function resetCallUI() {
     document.getElementById('latency-val-badge').innerText = "-- ms";
     document.getElementById('latency-progress-fill').style.width = "0%";
     document.getElementById('failsafe-active-badge').style.display = "none";
+
+    // Reset telemetry
+    document.getElementById('effective-engine-badge').innerText = "RVC";
+    document.getElementById('effective-engine-badge').style.background = "rgba(46, 204, 113, 0.2)";
+    document.getElementById('effective-engine-badge').style.color = "#2ecc71";
+    document.getElementById('effective-engine-badge').style.borderColor = "rgba(46, 204, 113, 0.3)";
+
+    document.getElementById('telemetry-requested').innerText = "RVC";
+    document.getElementById('telemetry-fallback-reason').innerText = "None";
+    document.getElementById('telemetry-fallback-reason').style.color = "#2ecc71";
+    document.getElementById('telemetry-ingress-queue').innerText = "-- ms";
+    document.getElementById('telemetry-converter-wait').innerText = "-- ms";
+    document.getElementById('telemetry-network-rtt').innerText = "-- ms";
+    document.getElementById('telemetry-playout-buffer').innerText = "-- ms";
+    document.getElementById('telemetry-processing-time').innerText = "-- ms";
+    document.getElementById('telemetry-mouth-to-ear').innerText = "-- ms";
+    document.getElementById('telemetry-mouth-to-ear').style.color = "#3498db";
+    document.getElementById('drops-input').innerText = "0";
+    document.getElementById('drops-reconnect').innerText = "0";
+    document.getElementById('drops-playout').innerText = "0";
 }
 
 function updateBotUI(online) {
