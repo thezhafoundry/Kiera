@@ -1400,6 +1400,8 @@ async def test_llvc_pre_call_fallback():
 async def test_llvc_mid_call_watchdog():
     print("\n--- Testing LLVC Mid-Call Watchdog (2.0s outage) ---")
     class DummyConverter:
+        is_healthy = False
+
         async def convert_stream(self, in_audio):
             while True:
                 await asyncio.sleep(10.0)
@@ -1420,6 +1422,8 @@ async def test_llvc_mid_call_watchdog():
         
     worker.on_llvc_fatal_failure = on_fatal
     worker._last_chunk_at = time.monotonic()
+    worker._last_submitted_input_at = time.monotonic()
+    worker._last_converted_output_at = 0.0
     
     watchdog = asyncio.create_task(worker._holding_watchdog())
     try:

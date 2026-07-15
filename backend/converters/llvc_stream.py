@@ -56,6 +56,13 @@ class LLVCStreamingConverter(VoiceConverter):
         self._out_queue: Optional[asyncio.Queue] = None
         self._pump_task: Optional[asyncio.Task] = None
         self._conn_task: Optional[asyncio.Task] = None
+        self._session_ready = asyncio.Event()
+        self._is_healthy = False
+
+    @property
+    def is_healthy(self) -> bool:
+        """True only while the call's actual conversion socket is handshaken."""
+        return self._is_healthy and not self._closed
 
     def _config_payload(self) -> str:
         return json.dumps({
@@ -73,6 +80,8 @@ class LLVCStreamingConverter(VoiceConverter):
         self._out_queue = asyncio.Queue()
         self._sent_bytes_count = 0
         self._block_sent_timestamps = deque()
+        self._session_ready.clear()
+        self._is_healthy = False
 
         self._pump_task = asyncio.create_task(self._pump_input(in_audio))
         self._conn_task = asyncio.create_task(self._connection_loop())
@@ -88,6 +97,8 @@ class LLVCStreamingConverter(VoiceConverter):
 
     async def close(self):
         self._closed = True
+        self._is_healthy = False
+        self._session_ready.clear()
         if self._conn_task:
             self._conn_task.cancel()
         if self._pump_task:
@@ -172,27 +183,36 @@ class LLVCStreamingConverter(VoiceConverter):
 
                         # Reset backoff on successful connection
                         backoff = _BACKOFF_INITIAL_S
+                        self._is_healthy = True
+                        self._session_ready.set()
                         logger.info("[LLVCStreamingConverter] connected to LLVC server and handshake succeeded")
 
                         writer_task = asyncio.create_task(self._writer_loop(ws))
                         reader_task = asyncio.create_task(self._reader_loop(ws))
-
-                        done, pending = await asyncio.wait(
-                            [writer_task, reader_task],
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        for t in pending:
-                            t.cancel()
+                        try:
+                            done, pending = await asyncio.wait(
+                                [writer_task, reader_task],
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            for t in pending:
+                                t.cancel()
+                        finally:
+                            self._is_healthy = False
+                            self._session_ready.clear()
 
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    self._is_healthy = False
+                    self._session_ready.clear()
                     logger.warning("[LLVCStreamingConverter] WS connection lost/failed: %s", e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2.0, _BACKOFF_MAX_S)
         except asyncio.CancelledError:
             pass
         finally:
+            self._is_healthy = False
+            self._session_ready.clear()
             if self._out_queue:
                 await self._out_queue.put(_CLOSE_SENTINEL)
 
@@ -262,6 +282,8 @@ class LLVCStreamingConverter(VoiceConverter):
                 except Exception:
                     logger.exception("[LLVCStreamingConverter] on_stats callback raised")
         elif msg_type == "error":
+            self._is_healthy = False
+            self._session_ready.clear()
             logger.warning("[LLVCStreamingConverter] server error: %s", data.get("message"))
         elif msg_type == "ping":
             try:
@@ -270,27 +292,16 @@ class LLVCStreamingConverter(VoiceConverter):
                 pass
 
     async def wait_ready(self, timeout: float) -> bool:
-        try:
-            async with asyncio.timeout(timeout):
-                connect_kwargs = {
-                    "open_timeout": timeout,
-                    "max_size": None,
-                }
-                if self.api_key:
-                    connect_kwargs["additional_headers"] = {"Authorization": f"Bearer {self.api_key}"}
+        """Wait for the call's real conversion session to finish its handshake.
 
-                async with websockets.connect(self.ws_url, **connect_kwargs) as ws:
-                    await ws.send(self._config_payload())
-                    while True:
-                        reply = await ws.recv()
-                        if isinstance(reply, (bytes, bytearray)):
-                            continue
-                        data = json.loads(reply)
-                        msg_type = data.get("type")
-                        if msg_type == "ready":
-                            return True
-                        if msg_type in ("busy", "error"):
-                            return False
+        A standalone probe would be a different socket and creates a TOCTOU race:
+        it can succeed even if the session that will carry call audio is rejected.
+        """
+        if self._conn_task is None or self._conn_task.done() or self._closed:
+            return False
+        try:
+            await asyncio.wait_for(self._session_ready.wait(), timeout=timeout)
+            return self.is_healthy
         except Exception as e:
             logger.warning("[LLVCStreamingConverter] wait_ready failed: %s", e)
             return False

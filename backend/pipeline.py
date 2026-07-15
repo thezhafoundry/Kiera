@@ -86,6 +86,8 @@ class VoiceConversionWorker:
     # reflects an outage/reconnect. Purely observational — never affects the
     # actual audio path.
     _HOLD_TIMEOUT_S = 0.75
+    _WATCHDOG_POLL_S = 0.2
+    _LLVC_OUTAGE_TIMEOUT_S = 2.0
 
     # Bytes of 48kHz 16-bit mono PCM equivalent to one 20ms (640-byte, 16kHz)
     # input frame, used to align the local timestamp-based latency estimate (the
@@ -103,6 +105,7 @@ class VoiceConversionWorker:
         requested_engine: str = "rvc",
         effective_engine: str = "rvc",
         fallback_reason: Optional[str] = None,
+        model_version: str = "unknown",
     ):
         self.room_url = room_url
         self.token = token
@@ -112,6 +115,7 @@ class VoiceConversionWorker:
         self.requested_engine = requested_engine
         self.effective_engine = effective_engine
         self.fallback_reason = fallback_reason
+        self.model_version = model_version
         self.on_llvc_fatal_failure: Optional[Callable[[], None]] = None
 
         self._current_ingress_queue_latency_ms = 0.0
@@ -152,6 +156,9 @@ class VoiceConversionWorker:
         self._is_holding: bool = True          # True until real converted audio has flowed
         self._last_chunk_at: float = 0.0        # monotonic time of the last output chunk
         self._last_metric_publish_at: float = 0.0
+        self._last_submitted_input_at: float = 0.0
+        self._last_converted_output_at: float = 0.0
+        self._llvc_unhealthy_since: Optional[float] = None
 
         # Every stats dict the converter has reported this call, in arrival order,
         # each annotated with playout-buffer occupancy at receipt time. Printed in
@@ -425,6 +432,7 @@ class VoiceConversionWorker:
             # local fallback latency estimate — see _estimate_fallback_latency_ms.
             self._frame_sent_at.append(t1)
             self._current_ingress_queue_latency_ms = (time.time() - t1) * 1000.0
+            self._last_submitted_input_at = time.monotonic()
             yield first + second
 
     def _on_converter_stats(self, stats: dict):
@@ -559,6 +567,7 @@ class VoiceConversionWorker:
             "requested_engine": self.requested_engine,
             "effective_engine": self.effective_engine,
             "fallback_reason": self.fallback_reason or "",
+            "model_version": self.model_version,
             "ingress_queue_latency_ms": self._current_ingress_queue_latency_ms,
             "converter_wait_ms": self._current_converter_wait_ms,
             "network_rtt_ms": self._current_network_rtt_ms,
@@ -581,22 +590,61 @@ class VoiceConversionWorker:
     async def _holding_watchdog(self):
         """Runs alongside the conversion stream. Flips is_holding back to True (and
         republishes the latency metric so the frontend badge reacts promptly) if no
-        converted audio has arrived for _HOLD_TIMEOUT_S — e.g. the converter's WS
-        dropped and is reconnecting. Purely observational: never touches the
-        converter or the audio path itself."""
+        converted audio has arrived for _HOLD_TIMEOUT_S. LLVC termination is a
+        separate fail-closed decision: it requires input newer than the last
+        converted output and a continuously unhealthy real converter session for
+        _LLVC_OUTAGE_TIMEOUT_S. Idle calls, muted tracks, and healthy speech pauses
+        therefore cannot be mistaken for converter outages."""
         try:
             llvc_fatal_triggered = False
             while True:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(self._WATCHDOG_POLL_S)
                 now = time.monotonic()
                 idle_duration = now - self._last_chunk_at
-                
-                # Check for fatal LLVC conversion outage (2.0 seconds)
-                if self.effective_engine == "llvc" and idle_duration > 2.0 and not llvc_fatal_triggered:
+
+                pending_input = (
+                    self._last_submitted_input_at > self._last_converted_output_at
+                )
+                converter_healthy = bool(
+                    getattr(self.converter, "is_healthy", False)
+                )
+                if self.effective_engine == "llvc" and pending_input and not converter_healthy:
+                    if self._llvc_unhealthy_since is None:
+                        self._llvc_unhealthy_since = now
+                else:
+                    self._llvc_unhealthy_since = None
+
+                if (
+                    self._llvc_unhealthy_since is not None
+                    and now - self._llvc_unhealthy_since >= self._LLVC_OUTAGE_TIMEOUT_S
+                    and not llvc_fatal_triggered
+                ):
                     llvc_fatal_triggered = True
-                    print("[Worker] LLVC conversion stream outage detected (2.0s watchdog expired) — triggering fatal failure callback")
+                    print(
+                        "[Worker] LLVC conversion stream outage detected "
+                        f"({self._LLVC_OUTAGE_TIMEOUT_S:.1f}s unhealthy with pending input) "
+                        "— triggering fatal failure callback"
+                    )
                     if self.on_llvc_fatal_failure:
-                        asyncio.create_task(self.on_llvc_fatal_failure())
+                        cleanup_task = asyncio.create_task(
+                            self.on_llvc_fatal_failure(),
+                            name=f"keira-llvc-fatal-cleanup-{self.call_id}",
+                        )
+
+                        def observe_cleanup(done: asyncio.Task) -> None:
+                            if done.cancelled():
+                                return
+                            try:
+                                error = done.exception()
+                            except asyncio.CancelledError:
+                                return
+                            if error is not None:
+                                print(
+                                    "[Worker] LLVC fatal cleanup callback failed: "
+                                    f"{type(error).__name__}"
+                                )
+
+                        cleanup_task.add_done_callback(observe_cleanup)
 
                 if not self._is_holding and idle_duration > self._HOLD_TIMEOUT_S:
                     self._is_holding = True
@@ -644,6 +692,8 @@ class VoiceConversionWorker:
 
                     if not converted_chunk:
                         continue
+
+                    self._last_converted_output_at = self._last_chunk_at
 
                     if self._presence_eq is not None:
                         converted_chunk = self._presence_eq.process(converted_chunk)
