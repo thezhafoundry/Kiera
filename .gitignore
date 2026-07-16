@@ -29,3 +29,6 @@ debug
 
 # Auto-generated graphify codemap — regenerate on demand, do not track
 graphify-out/
+
+# Kilo Code VSCode extension local agent config — IDE tooling, not project code
+.kilo/

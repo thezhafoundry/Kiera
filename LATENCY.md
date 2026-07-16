@@ -14,7 +14,8 @@ troubleshooting steps for Modal GPU connection/cold-start issues.
 > benchmark originated from a developer laptop, so it is not a production Render or PSTN
 > mouth-to-ear result. The legacy Modal function is still the Render-selected stable path;
 > a parallel `fastapi_app_ap` function (Mumbai input routing, broad AP placement) is deployed
-> but must be benchmarked from Render Singapore before any switch. LLVC is paused and disabled.
+> but must be benchmarked from Render Singapore before any switch. LLVC is paused and its code
+> was removed from this tree on 2026-07-16 (preserved on branch `codex/llvc-pilot`).
 
 > **2026-07-02 update:** Pulled live Render logs (`Kiera`, `srv-d92lh7navr4c738i03a0`) and
 > pinged the Modal endpoint directly while diagnosing a "Modal not connecting / GPU not
@@ -51,10 +52,11 @@ troubleshooting steps for Modal GPU connection/cold-start issues.
 
 > **2026-07-16 LLVC decision:** the LLVC service/training path is paused because Keira is a
 > multi-client SaaS where each client supplies a target voice; training a separate causal LLVC
-> model from scratch per voice is not the desired onboarding model. Keep
-> `LLVC_PILOT_ENABLED=false`. The converter, fake service, watchdog, and dataset/benchmark tools
-> remain test scaffolding, not a deployed performance claim. Optimize RVC first, then evaluate a
-> zero-shot or lightweight voice-conditioning streaming model.
+> model from scratch per voice is not the desired onboarding model. Its converter, fake service,
+> watchdog, and dataset/benchmark tools were removed from `main` the same day and set aside on
+> branch `codex/llvc-pilot` — re-derive scope from that branch, not this document, if the work
+> resumes. Optimize RVC first, then evaluate a zero-shot or lightweight voice-conditioning
+> streaming model.
 
 ---
 

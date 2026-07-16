@@ -39,8 +39,9 @@ graph TD
 - Render is in Singapore and has **not** been switched to the experimental endpoint.
   Benchmark the WebSocket from the Render service before changing `RVC_ENDPOINT_URL`;
   results from a developer laptop measure a different network path.
-- LLVC training/deployment is paused. Keep `LLVC_PILOT_ENABLED=false`; the LLVC safety and
-  benchmarking scaffolding is retained for a later zero-shot/streaming-model evaluation.
+- LLVC training/deployment is paused. Its converter, safety, and benchmarking scaffolding
+  was removed from `main` on 2026-07-16 and set aside on branch `codex/llvc-pilot` for a
+  later zero-shot/streaming-model evaluation — it is not part of this tree.
 
 ---
 
@@ -98,12 +99,6 @@ TWILIO_SIP_PASSWORD=your_sip_password
 SERVER_URL=https://your-deployed-server.example.com
 MODAL_TOKEN_ID=your_modal_token_id
 MODAL_TOKEN_SECRET=your_modal_token_secret
-
-# LLVC Pilot Configuration (paused; leave disabled for production)
-LLVC_PILOT_ENABLED=false
-LLVC_ENDPOINT_URL= # optional HTTP LLVC endpoint url
-LLVC_WS_URL=ws://localhost:18000 # WebSocket URL of the LLVC model server
-LLVC_API_KEY=your_llvc_secret_api_key
 ```
 
 ---
