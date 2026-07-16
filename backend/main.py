@@ -24,7 +24,6 @@ from dotenv import load_dotenv
 
 from livekit import api
 from .converters.rvc_stream import RVCStreamingConverter
-from .converters.llvc_stream import LLVCStreamingConverter
 from .converters.dummy import DummyVoiceConverter
 from .noise.noise_suppressor import WebRTCNoiseSuppressor
 from .pipeline import VoiceConversionWorker
@@ -231,11 +230,6 @@ RVC_ADAPTIVE_PITCH = os.getenv("RVC_ADAPTIVE_PITCH", "1") == "1"
 # (mi-test: ~208, measured 2026-07-08 from a known-good output).
 RVC_TARGET_F0 = float(os.getenv("RVC_TARGET_F0", "208"))
 
-# LLVC pilot configuration
-LLVC_PILOT_ENABLED = os.getenv("LLVC_PILOT_ENABLED", "false").lower() == "true"
-LLVC_WS_URL = os.getenv("LLVC_WS_URL", "ws://localhost:8001/ws")
-LLVC_API_KEY = os.getenv("LLVC_API_KEY", "")
-LLVC_MODEL_VERSION = os.getenv("LLVC_MODEL_VERSION", "llvc-pilot")
 DUMMY_MODEL_VERSION = "dummy-development"
 # WebRTC noise-suppression aggressiveness [0..4]. Level 3 was gutting high-frequency
 # voice detail (sibilance/consonants HuBERT needs) BEFORE the model saw it —
@@ -273,8 +267,6 @@ if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
 # Global tracking
 active_workers = {}
 active_calls = {}
-_LLVC_PILOT_MAX_SESSIONS = 2
-_llvc_pilot_rooms: set[str] = set()
 
 # Background keep-warm task handle
 _rvc_keepwarm_task: Optional[asyncio.Task] = None
@@ -533,15 +525,12 @@ async def _cleanup_room_state(
     worker_start_states.pop(room_name, None)
     isolation_events.pop(room_name, None)
 
-    try:
-        if task and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        if worker:
-            await worker.stop()
-    finally:
-        _release_llvc_pilot_admission(room_name)
+    if task and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    if worker:
+        await worker.stop()
 
     if delete_room and LIVEKIT_API_KEY and LIVEKIT_API_SECRET:
         lk = None
@@ -557,45 +546,12 @@ async def _cleanup_room_state(
         active_calls.pop(room_name, None)
 
 
-def _select_engine_with_llvc_admission(
-    room_name: str,
-    requested_engine: str,
-    effective_engine_override: Optional[str],
-    fallback_reason_override: Optional[str],
-) -> tuple[str, Optional[str]]:
-    """Select an engine and atomically reserve one of two LLVC pilot slots."""
-    effective_engine = effective_engine_override or requested_engine
-    fallback_reason = fallback_reason_override
-
-    if requested_engine == "llvc" and effective_engine_override is None:
-        if not LLVC_PILOT_ENABLED:
-            effective_engine = "rvc"
-            fallback_reason = "LLVC pilot is disabled"
-
-    if effective_engine == "llvc" and room_name not in _llvc_pilot_rooms:
-        if len(_llvc_pilot_rooms) >= _LLVC_PILOT_MAX_SESSIONS:
-            effective_engine = "rvc"
-            fallback_reason = "LLVC pilot capacity reached (max 2 calls)"
-        else:
-            # No await occurs between capacity check and add, so this section is
-            # atomic with respect to concurrent asyncio request handlers.
-            _llvc_pilot_rooms.add(room_name)
-
-    return effective_engine, fallback_reason
-
-
-def _release_llvc_pilot_admission(room_name: str) -> None:
-    _llvc_pilot_rooms.discard(room_name)
-
-
 # Shared logic to spawn a converter bot for a room
 async def _do_start_bot(
     room_name: str,
     agent_gender: str = "male",
     requested_engine: str = "rvc",
     *,
-    effective_engine_override: Optional[str] = None,
-    fallback_reason_override: Optional[str] = None,
     require_real_engine: bool = False,
 ):
     _validate_room_name(room_name)
@@ -618,12 +574,8 @@ async def _do_start_bot(
         )) \
         .with_ttl(datetime.timedelta(seconds=3600))
     
-    effective_engine, fallback_reason = _select_engine_with_llvc_admission(
-        room_name,
-        requested_engine,
-        effective_engine_override,
-        fallback_reason_override,
-    )
+    effective_engine = requested_engine
+    fallback_reason: Optional[str] = None
 
     if effective_engine == "rvc" and not RVC_ENDPOINT_URL:
         if require_real_engine or not ALLOW_DUMMY_CONVERTER:
@@ -637,20 +589,7 @@ async def _do_start_bot(
     print(f"[Server] Requested engine: {requested_engine} -> Effective: {effective_engine} (Fallback reason: {fallback_reason})")
 
     # Choose voice conversion engine
-    if effective_engine == "llvc":
-        print(f"[Server] Spawning LLVC Streaming Voice Changer (URL: {LLVC_WS_URL})")
-        try:
-            converter = LLVCStreamingConverter(
-                ws_url=LLVC_WS_URL,
-                api_key=LLVC_API_KEY,
-                connect_timeout=5.0,
-                model_version=LLVC_MODEL_VERSION,
-            )
-        except Exception:
-            _release_llvc_pilot_admission(room_name)
-            raise
-        model_version = LLVC_MODEL_VERSION
-    elif effective_engine == "rvc":
+    if effective_engine == "rvc":
         pitch_shift = RVC_MALE_PITCH_SHIFT if agent_gender.lower() == "male" else 0
         print(f"[Server] Spawning RVC Streaming Voice Changer (Endpoint: {RVC_ENDPOINT_URL}, Pitch Prior: {pitch_shift})")
         converter = RVCStreamingConverter(
@@ -676,29 +615,19 @@ async def _do_start_bot(
     # Initialize noise suppression (WebRTC). Level via NS_LEVEL env — lowering it
     # preserves the high-frequency voice detail the RVC model needs for a clear,
     # on-identity conversion (see NS_LEVEL definition above).
-    try:
-        suppressor = WebRTCNoiseSuppressor(ns_level=NS_LEVEL)
+    suppressor = WebRTCNoiseSuppressor(ns_level=NS_LEVEL)
 
-        worker = VoiceConversionWorker(
-            room_url=LIVEKIT_URL,
-            token=bot_token.to_jwt(),
-            converter=converter,
-            suppressor=suppressor,
-            call_id=room_name,
-            requested_engine=requested_engine,
-            effective_engine=effective_engine,
-            fallback_reason=fallback_reason,
-            model_version=model_version,
-        )
-    except Exception:
-        _release_llvc_pilot_admission(room_name)
-        raise
-
-    async def handle_fatal_failure():
-        print(f"[Server] Watchdog: LLVC fatal stream outage in room={room_name}. Terminating call programmatically.")
-        await _do_end_call(room_name, reason="llvc_outage")
-
-    worker.on_llvc_fatal_failure = handle_fatal_failure
+    worker = VoiceConversionWorker(
+        room_url=LIVEKIT_URL,
+        token=bot_token.to_jwt(),
+        converter=converter,
+        suppressor=suppressor,
+        call_id=room_name,
+        requested_engine=requested_engine,
+        effective_engine=effective_engine,
+        fallback_reason=fallback_reason,
+        model_version=model_version,
+    )
 
     active_workers[room_name] = worker
 
@@ -707,8 +636,7 @@ async def _do_start_bot(
     # caller is on hold, so worker.is_ready must be a cheap property read — not a
     # fresh network probe per poll. This background task calls the (potentially
     # slow) wait_until_ready() exactly once and caches the result.
-    if effective_engine != "llvc":
-        worker.start_readiness_probe(150.0)
+    worker.start_readiness_probe(150.0)
 
     # Start bot in a managed task immediately. FastAPI BackgroundTasks begin only
     # after the HTTP response, which was too late for readiness-gated dialing.
@@ -718,8 +646,6 @@ async def _do_start_bot(
     async def run_worker_task():
         try:
             await worker.start()
-            if effective_engine == "llvc":
-                worker.start_readiness_probe(3.0)
             start_state.event.set()
             while worker.running:
                 await asyncio.sleep(1.0)
@@ -730,11 +656,8 @@ async def _do_start_bot(
         finally:
             active_workers.pop(room_name, None)
             worker_tasks.pop(room_name, None)
-            try:
-                if worker.running or worker.room.isconnected():
-                    await worker.stop()
-            finally:
-                _release_llvc_pilot_admission(room_name)
+            if worker.running or worker.room.isconnected():
+                await worker.stop()
             print(f"[Server] Bot cleaned up for room: {room_name}")
 
     # Kick off a GPU warm-up ping the instant the bot starts. Modal cold-starts the
@@ -768,48 +691,15 @@ async def _do_start_bot(
 
 
 async def _ensure_pstn_worker_ready(room_name: str, agent_gender: str):
-    """Return a ready worker, replacing an unready pre-call LLVC session with RVC."""
+    """Return a ready worker."""
     worker = active_workers.get(room_name)
     if worker is None:
         raise HTTPException(status_code=503, detail="Voice worker is unavailable.")
 
-    if worker.effective_engine == "llvc":
-        # The cached readiness probe only proves the session was healthy at some
-        # earlier instant. PSTN boundaries must inspect the socket that will carry
-        # this call's audio right now, after preparation and before bridge/dial.
-        if bool(getattr(worker.converter, "is_healthy", False)):
-            return worker
-        # LLVC wait_until_ready delegates to the same live converter session; it
-        # never opens a temporary probe socket. Give an in-flight handshake or
-        # reconnect its bounded pre-PSTN opportunity before selecting RVC.
-        if (
-            await worker.wait_until_ready(3.0)
-            and bool(getattr(worker.converter, "is_healthy", False))
-        ):
-            return worker
-    elif await worker.wait_for_readiness_probe(150.0):
+    if await worker.wait_for_readiness_probe(150.0):
         return worker
 
-    if worker.effective_engine != "llvc":
-        raise HTTPException(status_code=503, detail="Voice engine is not ready.")
-
-    requested_engine = worker.requested_engine
-    fallback_reason = "LLVC call session was not ready"
-    await _cleanup_room_state(room_name, remove_call=False)
-    await _do_start_bot(
-        room_name,
-        agent_gender,
-        requested_engine,
-        effective_engine_override="rvc",
-        fallback_reason_override=fallback_reason,
-        require_real_engine=True,
-    )
-    await _wait_for_worker_started(room_name)
-    fallback_worker = active_workers.get(room_name)
-    if not fallback_worker or not await fallback_worker.wait_for_readiness_probe(150.0):
-        await _cleanup_room_state(room_name, remove_call=False)
-        raise HTTPException(status_code=503, detail="Fallback RVC engine is not ready.")
-    return fallback_worker
+    raise HTTPException(status_code=503, detail="Voice engine is not ready.")
 
 
 def _persist_engine_state(call_info: dict, worker) -> None:
@@ -825,7 +715,7 @@ class TokenRequest(BaseModel):
     roomName: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
     identity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     agentGender: Literal["male", "female"] = "male"
-    voiceEngine: Literal["rvc", "llvc"] = "rvc"
+    voiceEngine: Literal["rvc"] = "rvc"
 
 @app.post("/api/token", dependencies=[Depends(require_control_token)])
 async def get_token(request: TokenRequest):
@@ -881,7 +771,7 @@ class OutboundCallRequest(BaseModel):
     phoneNumber: str = Field(pattern=r"^\+\d{8,15}$")
     agentIdentity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     agentGender: Literal["male", "female"] = "male"
-    voiceEngine: Literal["rvc", "llvc"] = "rvc"
+    voiceEngine: Literal["rvc"] = "rvc"
 
 
 class OutboundDialRequest(BaseModel):
@@ -1162,7 +1052,7 @@ async def call_wait(
         and worker
         and worker_started
         and isolation_confirmed
-        and (worker.effective_engine == "llvc" or worker.is_ready)
+        and worker.is_ready
     )
     if can_check_boundary:
         try:
@@ -1209,7 +1099,7 @@ class AcceptCallRequest(BaseModel):
     roomName: str = Field(min_length=1, max_length=128, pattern=r"^inbound_[A-Za-z0-9_.-]+$")
     agentIdentity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     agentGender: Literal["male", "female"] = "male"
-    voiceEngine: Literal["rvc", "llvc"] = "rvc"
+    voiceEngine: Literal["rvc"] = "rvc"
 
 @app.post("/api/call/accept", dependencies=[Depends(require_control_token)])
 async def call_accept(request: AcceptCallRequest):
@@ -1372,7 +1262,6 @@ async def health_check():
         "rvc": {
             "endpoint": RVC_ENDPOINT_URL or "not configured (PSTN calls fail closed)",
         },
-        "llvc_pilot_enabled": LLVC_PILOT_ENABLED,
         "server_url": SERVER_URL or "not set",
         "active_calls": len(active_calls),
         "active_bots": len(active_workers),

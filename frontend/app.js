@@ -34,31 +34,7 @@ async function apiFetch(url, options = {}) {
 document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     initWebSocket();
-    checkLLVCPilotStatus();
 });
-
-async function checkLLVCPilotStatus() {
-    try {
-        const resp = await fetch(`${API_BASE}/api/health`);
-        if (resp.ok) {
-            const health = await resp.json();
-            const optionLLVC = document.getElementById('option-llvc');
-            if (health.llvc_pilot_enabled) {
-                if (optionLLVC) {
-                    optionLLVC.disabled = false;
-                    optionLLVC.innerText = "LLVC — Pilot (Low Latency)";
-                }
-            } else {
-                if (optionLLVC) {
-                    optionLLVC.disabled = true;
-                    optionLLVC.innerText = "LLVC — Pilot (Disabled)";
-                }
-            }
-        }
-    } catch (e) {
-        console.error("Error checking LLVC pilot status:", e);
-    }
-}
 
 function setupEventListeners() {
     // Deploy GPU Button
@@ -115,15 +91,6 @@ function initWebSocket() {
                     console.log("[WebSocket] Call ended by remote side");
                     resetCallUI();
                     leaveRoom();
-                    if (data.reason === "llvc_outage") {
-                        const alertEl = document.getElementById('llvc-outage-alert');
-                        if (alertEl) {
-                            alertEl.style.display = 'flex';
-                            setTimeout(() => {
-                                alertEl.style.display = 'none';
-                            }, 10000);
-                        }
-                    }
                 }
             }
         } catch (e) {
@@ -497,15 +464,9 @@ function setupRoomEvents(room) {
                 if (data.effective_engine !== undefined) {
                     const badge = document.getElementById('effective-engine-badge');
                     badge.innerText = data.effective_engine.toUpperCase();
-                    if (data.effective_engine === 'llvc') {
-                        badge.style.background = 'rgba(52, 152, 219, 0.2)';
-                        badge.style.color = '#3498db';
-                        badge.style.borderColor = 'rgba(52, 152, 219, 0.3)';
-                    } else {
-                        badge.style.background = 'rgba(46, 204, 113, 0.2)';
-                        badge.style.color = '#2ecc71';
-                        badge.style.borderColor = 'rgba(46, 204, 113, 0.3)';
-                    }
+                    badge.style.background = 'rgba(46, 204, 113, 0.2)';
+                    badge.style.color = '#2ecc71';
+                    badge.style.borderColor = 'rgba(46, 204, 113, 0.3)';
                 }
                 if (data.fallback_reason !== undefined) {
                     const fallbackEl = document.getElementById('telemetry-fallback-reason');
@@ -640,9 +601,6 @@ function leaveRoom() {
 
 // UI State Toggles
 function setupCallUI() {
-    const alertEl = document.getElementById('llvc-outage-alert');
-    if (alertEl) alertEl.style.display = 'none';
-
     document.getElementById('console-idle-view').style.display = 'none';
     document.getElementById('console-active-view').style.display = 'block';
     

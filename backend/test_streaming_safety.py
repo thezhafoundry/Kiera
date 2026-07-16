@@ -2,11 +2,8 @@ import asyncio
 import json
 import time
 import unittest
-from unittest.mock import patch
 
-from backend.converters.llvc_stream import LLVCStreamingConverter
 from backend.converters.rvc_stream import RVCStreamingConverter
-from backend.pipeline import VoiceConversionWorker
 
 
 class _RecordingSocket:
@@ -37,11 +34,10 @@ class StreamingConverterSafetyTests(unittest.IsolatedAsyncioTestCase):
     def _converters(self, **kwargs):
         return (
             RVCStreamingConverter(ws_url="ws://127.0.0.1:1/ws", **kwargs),
-            LLVCStreamingConverter(ws_url="ws://127.0.0.1:1/ws", **kwargs),
         )
 
     def test_remote_plaintext_websocket_is_rejected(self):
-        for converter_type in (RVCStreamingConverter, LLVCStreamingConverter):
+        for converter_type in (RVCStreamingConverter,):
             with self.subTest(converter=converter_type.__name__):
                 with self.assertRaisesRegex(ValueError, "wss"):
                     converter_type(
@@ -50,7 +46,7 @@ class StreamingConverterSafetyTests(unittest.IsolatedAsyncioTestCase):
                     )
 
     def test_remote_websocket_requires_api_key_but_loopback_does_not(self):
-        for converter_type in (RVCStreamingConverter, LLVCStreamingConverter):
+        for converter_type in (RVCStreamingConverter,):
             with self.subTest(converter=converter_type.__name__):
                 with self.assertRaisesRegex(ValueError, "API key"):
                     converter_type(ws_url="wss://voice.example.com/ws")
@@ -58,7 +54,7 @@ class StreamingConverterSafetyTests(unittest.IsolatedAsyncioTestCase):
                 converter_type(ws_url="ws://[::1]:8765/ws")
 
     def test_authentication_uses_only_authorization_header(self):
-        for converter_type in (RVCStreamingConverter, LLVCStreamingConverter):
+        for converter_type in (RVCStreamingConverter,):
             with self.subTest(converter=converter_type.__name__):
                 converter = converter_type(
                     ws_url="wss://voice.example.com/ws",
@@ -210,62 +206,6 @@ class StreamingConverterSafetyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(converter._out_queue.qsize(), 0)
                 self.assertEqual(converter._buffered_bytes, 30)
 
-    async def test_llvc_fatal_reaches_call_cleanup_before_stream_teardown(self):
-        class FatalConverter:
-            is_healthy = False
-            on_stats = None
-
-            async def convert_stream(self, in_audio):
-                raise RuntimeError("LLVC streaming converter fatal error: dead peer")
-                yield b""  # pragma: no cover - makes this an async generator
-
-        worker = VoiceConversionWorker(
-            room_url="ws://unused",
-            token="unused",
-            converter=FatalConverter(),
-            suppressor=None,
-            requested_engine="llvc",
-            effective_engine="llvc",
-        )
-        cleanup_started = asyncio.Event()
-        allow_cleanup = asyncio.Event()
-        cleanup_completed = asyncio.Event()
-        cleanup_steps = []
-
-        async def on_fatal():
-            self.assertIsNot(
-                asyncio.current_task(),
-                worker._conversion_task,
-                "fatal cleanup must not run in the conversion task that teardown cancels",
-            )
-            cleanup_started.set()
-            await allow_cleanup.wait()
-            cleanup_steps.extend([
-                "livekit_room_deleted",
-                "twilio_call_completed",
-                "call_ended_broadcast",
-            ])
-            cleanup_completed.set()
-
-        worker.on_llvc_fatal_failure = on_fatal
-        worker._conversion_task = asyncio.create_task(
-            worker._run_conversion_stream(),
-            name="production-like-conversion-task",
-        )
-
-        await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
-        stop_task = asyncio.create_task(worker.stop())
-        await asyncio.sleep(0)
-        allow_cleanup.set()
-
-        await asyncio.wait_for(cleanup_completed.wait(), timeout=0.2)
-        await asyncio.wait_for(stop_task, timeout=0.2)
-        self.assertEqual(cleanup_steps, [
-            "livekit_room_deleted",
-            "twilio_call_completed",
-            "call_ended_broadcast",
-        ])
-
     async def test_close_cannot_evict_one_slot_fatal_output(self):
         for converter in self._converters(output_queue_max_chunks=1):
             with self.subTest(converter=type(converter).__name__):
@@ -289,73 +229,6 @@ class StreamingConverterSafetyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(converter._pump_task.done())
                 self.assertTrue(converter._conn_task.done())
                 self.assertFalse(converter.is_healthy)
-
-    async def test_llvc_awaits_all_connection_children_when_one_fails(self):
-        converter = LLVCStreamingConverter(ws_url="ws://127.0.0.1:1/ws")
-        sibling_finished = asyncio.Event()
-
-        async def failing_child():
-            raise RuntimeError("reader failed")
-
-        async def waiting_child():
-            try:
-                await asyncio.sleep(60)
-            finally:
-                sibling_finished.set()
-
-        reader = asyncio.create_task(failing_child())
-        writer = asyncio.create_task(waiting_child())
-        await asyncio.sleep(0)
-
-        with self.assertRaisesRegex(RuntimeError, "reader failed"):
-            await converter._cancel_and_await_connection_children(reader, writer)
-
-        self.assertTrue(reader.done())
-        self.assertTrue(writer.done())
-        self.assertTrue(sibling_finished.is_set())
-
-    async def test_control_plane_limits_llvc_admission_to_two_and_releases(self):
-        from backend import main
-
-        main._llvc_pilot_rooms.clear()
-        try:
-            with patch.object(main, "LLVC_PILOT_ENABLED", True):
-                first = main._select_engine_with_llvc_admission(
-                    "room-1", "llvc", None, None
-                )
-                second = main._select_engine_with_llvc_admission(
-                    "room-2", "llvc", None, None
-                )
-                third = main._select_engine_with_llvc_admission(
-                    "room-3", "llvc", None, None
-                )
-
-                self.assertEqual(first, ("llvc", None))
-                self.assertEqual(second, ("llvc", None))
-                self.assertEqual(third[0], "rvc")
-                self.assertIn("capacity", third[1].lower())
-                self.assertEqual(main._llvc_pilot_rooms, {"room-1", "room-2"})
-
-                stopped = asyncio.Event()
-                test_case = self
-
-                class AdmittedWorker:
-                    async def stop(self):
-                        test_case.assertIn("room-1", main._llvc_pilot_rooms)
-                        stopped.set()
-
-                main.active_workers["room-1"] = AdmittedWorker()
-                await main._cleanup_room_state("room-1", remove_call=False)
-                self.assertTrue(stopped.is_set())
-                retried = main._select_engine_with_llvc_admission(
-                    "room-3", "llvc", None, None
-                )
-                self.assertEqual(retried, ("llvc", None))
-                self.assertEqual(main._llvc_pilot_rooms, {"room-2", "room-3"})
-        finally:
-            main.active_workers.pop("room-1", None)
-            main._llvc_pilot_rooms.clear()
-
 
 if __name__ == "__main__":
     unittest.main()

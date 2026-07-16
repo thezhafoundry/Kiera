@@ -6,7 +6,7 @@ import os
 import statistics
 import time
 import traceback
-from typing import AsyncIterator, Awaitable, Callable, Optional
+from typing import AsyncIterator, Optional
 from livekit import rtc
 
 from .audio_eq import PresenceEQ
@@ -85,8 +85,6 @@ class VoiceConversionWorker:
     # actual audio path.
     _HOLD_TIMEOUT_S = 0.75
     _WATCHDOG_POLL_S = 0.2
-    _LLVC_OUTAGE_TIMEOUT_S = 2.0
-    _LLVC_PENDING_INPUT_RECENCY_S = 3.0
 
     # Bytes of 48kHz 16-bit mono PCM equivalent to one 20ms (640-byte, 16kHz)
     # input frame, used to align the local timestamp-based latency estimate (the
@@ -119,9 +117,6 @@ class VoiceConversionWorker:
         self._PLAYOUT_BUFFER_TARGET_BYTES = type(
             self
         )._PLAYOUT_BUFFER_TARGET_BYTES
-        self.on_llvc_fatal_failure: Optional[Callable[[], Awaitable[None]]] = None
-        self._fatal_cleanup_task: Optional[asyncio.Task] = None
-
         self._current_ingress_queue_latency_ms = 0.0
         self._current_converter_wait_ms = 0.0
         self._current_network_rtt_ms = 0.0
@@ -162,7 +157,6 @@ class VoiceConversionWorker:
         self._last_metric_publish_at: float = 0.0
         self._last_submitted_input_at: float = 0.0
         self._last_converted_output_at: float = 0.0
-        self._llvc_unhealthy_since: Optional[float] = None
 
         # Every stats dict the converter has reported this call, in arrival order,
         # each annotated with playout-buffer occupancy at receipt time. Printed in
@@ -621,54 +615,12 @@ class VoiceConversionWorker:
     async def _holding_watchdog(self):
         """Runs alongside the conversion stream. Flips is_holding back to True (and
         republishes the latency metric so the frontend badge reacts promptly) if no
-        converted audio has arrived for _HOLD_TIMEOUT_S. LLVC termination is a
-        separate fail-closed decision: it requires recent input newer than the
-        last converted output and a continuously unhealthy real converter session
-        for _LLVC_OUTAGE_TIMEOUT_S. Stale pending input expires after
-        _LLVC_PENDING_INPUT_RECENCY_S, so idle calls, muted tracks, and healthy
-        speech pauses cannot be mistaken for converter outages."""
+        converted audio has arrived for _HOLD_TIMEOUT_S."""
         try:
-            llvc_fatal_triggered = False
             while True:
                 await asyncio.sleep(self._WATCHDOG_POLL_S)
                 now = time.monotonic()
                 idle_duration = now - self._last_chunk_at
-
-                pending_input = (
-                    self._last_submitted_input_at > self._last_converted_output_at
-                )
-                recent_input = (
-                    self._last_submitted_input_at > 0.0
-                    and now - self._last_submitted_input_at
-                    <= self._LLVC_PENDING_INPUT_RECENCY_S
-                )
-                converter_healthy = bool(
-                    getattr(self.converter, "is_healthy", False)
-                )
-                if (
-                    self.effective_engine == "llvc"
-                    and pending_input
-                    and recent_input
-                    and not converter_healthy
-                ):
-                    if self._llvc_unhealthy_since is None:
-                        self._llvc_unhealthy_since = now
-                else:
-                    self._llvc_unhealthy_since = None
-
-                if (
-                    self._llvc_unhealthy_since is not None
-                    and now - self._llvc_unhealthy_since >= self._LLVC_OUTAGE_TIMEOUT_S
-                    and not llvc_fatal_triggered
-                ):
-                    llvc_fatal_triggered = True
-                    print(
-                        "[Worker] LLVC conversion stream outage detected "
-                        f"({self._LLVC_OUTAGE_TIMEOUT_S:.1f}s unhealthy with pending input) "
-                        "— triggering fatal failure callback"
-                    )
-                    if self.on_llvc_fatal_failure:
-                        self._start_llvc_fatal_cleanup()
 
                 if not self._is_holding and idle_duration > self._HOLD_TIMEOUT_S:
                     self._is_holding = True
@@ -743,13 +695,6 @@ class VoiceConversionWorker:
         except Exception as e:
             print(f"[Worker Error in conversion stream] {e}")
             traceback.print_exc()
-            if self.effective_engine == "llvc" and self.on_llvc_fatal_failure:
-                # Run cleanup outside this conversion task. The production
-                # callback cancels/awaits the managed worker lifecycle, whose
-                # teardown in turn cancels/awaits this conversion task. Awaiting
-                # the callback here creates an owner cycle and can cancel cleanup
-                # before LiveKit/Twilio/broadcast work completes.
-                self._start_llvc_fatal_cleanup()
         finally:
             consumer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -757,39 +702,6 @@ class VoiceConversionWorker:
             watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watchdog_task
-
-    def _start_llvc_fatal_cleanup(self) -> Optional[asyncio.Task]:
-        """Start at most one independent fatal-cleanup task for this call.
-
-        Worker teardown deliberately does not cancel this task: the callback owns
-        the production call shutdown and must be allowed to finish after it stops
-        the worker that detected the fatal converter error.
-        """
-        if self.on_llvc_fatal_failure is None:
-            return None
-        if self._fatal_cleanup_task is not None:
-            return self._fatal_cleanup_task
-
-        self._fatal_cleanup_task = asyncio.create_task(
-            self.on_llvc_fatal_failure(),
-            name=f"keira-llvc-fatal-cleanup-{self.call_id}",
-        )
-
-        def observe_cleanup(done: asyncio.Task) -> None:
-            if done.cancelled():
-                return
-            try:
-                error = done.exception()
-            except asyncio.CancelledError:
-                return
-            if error is not None:
-                print(
-                    "[Worker] LLVC fatal cleanup callback failed: "
-                    f"{type(error).__name__}"
-                )
-
-        self._fatal_cleanup_task.add_done_callback(observe_cleanup)
-        return self._fatal_cleanup_task
 
     async def _run_playout_consumer(self):
         """Drains _playout_buffer into LiveKit at a steady pace, decoupled from
