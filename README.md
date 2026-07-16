@@ -28,6 +28,20 @@ graph TD
 - **One-Way Conversion**: Voice conversion is applied only to the agent-to-lead stream. The lead-to-agent stream is bridged directly and unmodified so the agent hears the lead's raw voice.
 - **Fail-Closed, Never Raw**: There is no raw-voice fallback — it was removed structurally. If the GPU connection drops or errors, the bot publishes silence until real converted audio resumes; the lead never hears the agent's unconverted voice. A standing playout buffer (0.25s target/5s cap) absorbs jitter, then drains in bounded 100ms chunks to avoid gulping long utterances. See [CLAUDE.md](CLAUDE.md) and [LATENCY.md](LATENCY.md) for the full mechanism.
 
+### Current RVC rollout state (2026-07-16)
+
+- **Production default remains RVC baseline**: 320ms block, 400ms context, 80ms SOLA,
+  and 250ms playout target. Modal reports an L4, TensorRT, a hot engine cache, and an
+  artifact-derived model/index fingerprint.
+- The existing `fastapi_app` endpoint remains the stable rollback path. A separate
+  `fastapi_app_ap` endpoint was deployed for routing experiments; it uses Modal's
+  `ap-south` input edge and broad `ap` GPU placement.
+- Render is in Singapore and has **not** been switched to the experimental endpoint.
+  Benchmark the WebSocket from the Render service before changing `RVC_ENDPOINT_URL`;
+  results from a developer laptop measure a different network path.
+- LLVC training/deployment is paused. Keep `LLVC_PILOT_ENABLED=false`; the LLVC safety and
+  benchmarking scaffolding is retained for a later zero-shot/streaming-model evaluation.
+
 ---
 
 ## 2. Prerequisites & Setup
@@ -84,6 +98,12 @@ TWILIO_SIP_PASSWORD=your_sip_password
 SERVER_URL=https://your-deployed-server.example.com
 MODAL_TOKEN_ID=your_modal_token_id
 MODAL_TOKEN_SECRET=your_modal_token_secret
+
+# LLVC Pilot Configuration (paused; leave disabled for production)
+LLVC_PILOT_ENABLED=false
+LLVC_ENDPOINT_URL= # optional HTTP LLVC endpoint url
+LLVC_WS_URL=ws://localhost:18000 # WebSocket URL of the LLVC model server
+LLVC_API_KEY=your_llvc_secret_api_key
 ```
 
 ---
@@ -111,7 +131,7 @@ MODAL_TOKEN_SECRET=your_modal_token_secret
    Create a secret named `rvc-api-key` in your Modal dashboard containing `RVC_API_KEY`.
 4. Deploy the GPU worker:
    ```bash
-   modal deploy modal_deploy/worker.py
+   RVC_STREAM_PROFILE=baseline modal deploy modal_deploy/worker.py
    ```
    Copy the deployed `/convert` URL (e.g. `https://your-app--rvc-worker-fastapi-app.modal.run/convert`) and paste it as `RVC_ENDPOINT_URL` in your `.env`.
 
@@ -144,6 +164,35 @@ MODAL_TOKEN_SECRET=your_modal_token_secret
 ---
 
 ## 6. How to Test & Measure Latency
+
+### RVC WebSocket benchmark
+
+Run the same synthetic, call-long stream against the endpoint configured in `.env`:
+
+```bash
+python -m scripts.rvc_stream_benchmark --duration 9.6
+```
+
+The command reports active-session readiness, TensorRT inference, converter wait,
+estimated network time, duration delta, profile/model metadata, and all drop counters.
+It opens one conversion session and never uses customer audio.
+
+The first live baseline run on 2026-07-16 measured 30 blocks:
+
+| Metric | Result |
+|---|---:|
+| Active-session readiness from cold | 72,510.73ms |
+| TensorRT inference median / p95 | 50.75ms / 51.61ms |
+| Converter wait median / p95 | 1,207.11ms / 1,358.56ms |
+| Estimated network component median / p95 | 837.05ms / 988.91ms |
+| Output duration delta | -211.46ms over 9.6s |
+| Input/output/connection drops | 0 / 0 / 0 |
+
+These are **developer-laptop → Modal** measurements, not production mouth-to-ear
+measurements. The large network term exposed Modal's default Virginia routing on the
+legacy function; the parallel AP-routed endpoint exists to measure that variable from the
+actual Render Singapore origin. The duration loss is also an open quality gate. See
+[LATENCY.md](LATENCY.md) for interpretation and remaining tests.
 
 ### Automatic Spectral Latency Test
 The application includes a built-in digital latency analyzer that runs in the browser, eliminating acoustic feedback and measuring delay with millisecond precision:

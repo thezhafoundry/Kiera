@@ -3,7 +3,7 @@ title: Adaptive per-call pitch lock replaces the fixed shift constant
 type: issue
 status: open
 sources: [decisions-log, subsystem-notes, active-backlog]
-updated: 2026-07-14
+updated: 2026-07-16
 ---
 
 Follow-on to [[voice-identity-mismatch-investigation]]'s pitch-overshoot fix. That fix
@@ -42,11 +42,10 @@ confirming the mechanism works as designed.
 
 ## Open follow-ups (why this isn't fully closed)
 
-1. **The prior→locked transition is one audible pitch jump**, roughly 20-26 seconds into
-   the call, that was never listen-tested before shipping. The lock-once-per-call design
-   was a deliberate choice (continuous tracking would let the voice keep audibly drifting
-   through the whole call) but its one-time transition turns out to have a real cost too —
-   the user's field feedback after hearing it was "somewhat okay," not a clean pass.
+1. **The abrupt prior→locked jump has been replaced by a one-second interpolation** in
+   Modal v11 and is covered by pure pitch-lock tests. This reduces the discontinuity without
+   continuously chasing the speaker's pitch, but it still needs one live staff listen test;
+   unit tests cannot prove perceptual naturalness.
 2. **`RVC_TARGET_F0=208`** is a single 2026-07-08 reference-output measurement, not
    re-derived from the model's actual training data. If identity complaints persist once
    the separate input-muffling regression (see below) is ruled out, this value itself is

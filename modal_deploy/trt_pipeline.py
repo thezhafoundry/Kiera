@@ -9,21 +9,35 @@ auto-bundle sibling modules; confirmed incident 2026-07-03 with streaming.py).
 import numpy as np
 import time
 
-# ---- Canonical static shapes (MUST mirror export_onnx.py) ----
-# TRT Phase 2 (2026-07-07): BLOCK_MS 1000→320, CANONICAL_IN 22400→11520.
-# TRT_T_PAD stays at 16000 (x_pad=1 = 1s reflect pad, RVC convention, independent of block size).
-SR_IN = 16000
-SR_OUT = 48000
-CANONICAL_IN = 11520          # 720 ms: BLOCK_MS=320 + CONTEXT_MS=400  (was 22400)
-TRT_T_PAD = 16000             # fixed reflect pad each side (x_pad=1 equivalent, unchanged)
-PADDED_IN = CANONICAL_IN + 2 * TRT_T_PAD      # 43520  (was 54400)
-HUBERT_FRAMES = 135              # 135 (HuBERT convolutional boundary reduces 43520 // 320 = 136 to 135)
-GEN_FRAMES = HUBERT_FRAMES * 2                # 270 (post 2x interpolation)  (was 338)
-OUT_PADDED_48K = GEN_FRAMES * 480             # 129600  (was 162240)
-T_PAD_TGT = TRT_T_PAD * 3                     # 48000   (unchanged)
-OUT_48K = OUT_PADDED_48K - 2 * T_PAD_TGT      # 33600   (was 66240)
-MEL_FRAMES = PADDED_IN // 160 + 1             # 273     (was 341)
-MEL_FRAMES_PADDED = ((MEL_FRAMES + 31) // 32) * 32   # 288   (was 352)
+try:
+    from modal_deploy.rvc_profiles import (
+        SAMPLE_RATE_IN,
+        SAMPLE_RATE_OUT,
+        TRT_T_PAD,
+        get_active_profile,
+    )
+except ImportError:  # inside Modal container
+    from rvc_profiles import (
+        SAMPLE_RATE_IN,
+        SAMPLE_RATE_OUT,
+        TRT_T_PAD,
+        get_active_profile,
+    )
+
+# ---- Canonical static shapes (shared with export_onnx.py) ----
+PROFILE = get_active_profile()
+PROFILE_NAME = PROFILE.name
+SR_IN = SAMPLE_RATE_IN
+SR_OUT = SAMPLE_RATE_OUT
+CANONICAL_IN = PROFILE.canonical_in
+PADDED_IN = PROFILE.padded_in
+HUBERT_FRAMES = PROFILE.hubert_frames
+GEN_FRAMES = PROFILE.generator_frames
+OUT_PADDED_48K = GEN_FRAMES * 480
+T_PAD_TGT = TRT_T_PAD * 3
+OUT_48K = OUT_PADDED_48K - 2 * T_PAD_TGT
+MEL_FRAMES = PROFILE.mel_frames
+MEL_FRAMES_PADDED = PROFILE.mel_frames_padded
 
 # RVC f0 mapping constants (verbatim from RVC/infer/modules/vc/pipeline.py)
 F0_MIN, F0_MAX = 50.0, 1100.0
@@ -32,6 +46,22 @@ F0_MEL_MAX = 1127.0 * np.log(1.0 + F0_MAX / 700.0)
 
 # RMVPE cents mapping (verbatim from RVC/infer/lib/rmvpe.py)
 _CENTS_MAPPING = 20.0 * np.arange(360) + 1997.3794084376191
+
+
+def assert_static_input_shape(
+    session,
+    session_name: str,
+    input_name: str,
+    expected_shape: tuple,
+) -> None:
+    inputs = {item.name: tuple(item.shape) for item in session.get_inputs()}
+    actual_shape = inputs.get(input_name)
+    if actual_shape != expected_shape:
+        raise RuntimeError(
+            f"{session_name}.{input_name} static shape mismatch for RVC "
+            f"profile={PROFILE_NAME}: expected {expected_shape}, got "
+            f"{actual_shape}. Re-export and recompile this profile's artifacts."
+        )
 
 
 def pad_to_canonical(pcm_int16: np.ndarray) -> tuple:
@@ -152,6 +182,18 @@ class TRTVoicePipeline:
         self.s_hubert = ort.InferenceSession(f"{onnx_dir}/hubert.onnx", opts, providers=providers_fp16)
         self.s_gen = ort.InferenceSession(f"{onnx_dir}/generator.onnx", opts, providers=providers_fp32)
         self.s_rmvpe = ort.InferenceSession(f"{onnx_dir}/rmvpe.onnx", opts, providers=providers_fp16)
+        assert_static_input_shape(
+            self.s_hubert, "hubert", "audio", (1, PADDED_IN)
+        )
+        assert_static_input_shape(
+            self.s_gen, "generator", "phone", (1, GEN_FRAMES, 768)
+        )
+        assert_static_input_shape(
+            self.s_rmvpe,
+            "rmvpe",
+            "mel",
+            (1, 128, MEL_FRAMES_PADDED),
+        )
         # Verify all three sessions actually loaded TRT — ORT silently falls back to CPU
         # if TRT init fails; this surfaces that as a hard error rather than ~10x latency.
         for sess_name, sess in [("hubert", self.s_hubert), ("generator", self.s_gen), ("rmvpe", self.s_rmvpe)]:

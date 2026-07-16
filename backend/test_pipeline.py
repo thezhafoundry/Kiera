@@ -4,7 +4,7 @@ import json
 import logging
 import numpy as np
 import time
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -314,6 +314,84 @@ async def test_rvc_streaming_converter_basic():
     print("RVCStreamingConverter basic (handshake/echo/close) test: SUCCESS")
 
 
+async def test_rvc_ready_metadata_drives_dynamic_block_timing():
+    print("\n--- Testing RVC ready metadata + dynamic block timing ---")
+
+    async def profile_handler(websocket):
+        try:
+            await websocket.recv()
+            await websocket.send(json.dumps({
+                "type": "ready",
+                "model_version": "rvc-test-v1",
+                "profile": "candidate_b",
+                "block_ms": 160,
+                "context_ms": 240,
+                "sola_ms": 40,
+                "sample_rate_in": 16000,
+                "sample_rate_out": 48000,
+                "use_trt": True,
+            }))
+            received_bytes = 0
+            sequence_id = 0
+            async for message in websocket:
+                if not isinstance(message, (bytes, bytearray)):
+                    continue
+                received_bytes += len(message)
+                while received_bytes >= 5120:  # 160 ms of 16 kHz PCM16
+                    received_bytes -= 5120
+                    sequence_id += 1
+                    await websocket.send(json.dumps({
+                        "type": "stats",
+                        "sequence_id": sequence_id,
+                        "infer_ms": 20.0,
+                        "block_ms": 160,
+                        "total_ms": 20.0,
+                    }))
+        except ConnectionClosed:
+            pass
+
+    async with websockets.serve(profile_handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        converter = RVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+        stats_rows = []
+        converter.on_stats = stats_rows.append
+        in_gen, in_queue = _make_fed_input()
+
+        async def collect():
+            async for _ in converter.convert_stream(in_gen):
+                pass
+
+        collect_task = asyncio.create_task(collect())
+        for value in range(32):
+            in_queue.put_nowait(_make_frame(value + 1))
+            await asyncio.sleep(0.01)
+
+        deadline = time.monotonic() + 5.0
+        while len(stats_rows) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        assert converter.model_version == "rvc-test-v1"
+        assert converter.profile == "candidate_b"
+        assert converter.block_ms == 160
+        assert converter.context_ms == 240
+        assert converter.sola_ms == 40
+        assert converter.sample_rate_in == 16000
+        assert converter.sample_rate_out == 48000
+        assert converter.use_trt is True
+        assert len(stats_rows) == 2
+        assert all(row.get("converter_wait_ms", 0) > 0 for row in stats_rows)
+        assert all("network_rtt_ms" in row for row in stats_rows)
+        assert all(row["network_rtt_ms"] < 50 for row in stats_rows), (
+            "block accumulation must not be mislabeled as network RTT"
+        )
+
+        await converter.close()
+        await asyncio.wait_for(collect_task, timeout=5.0)
+        await in_gen.aclose()
+
+    print("RVC ready metadata + dynamic block timing test: SUCCESS")
+
+
 async def test_rvc_streaming_converter_reconnect():
     print("\n--- Testing RVCStreamingConverter reconnect-with-backoff (never-raw during outage) ---")
 
@@ -346,8 +424,10 @@ async def test_rvc_streaming_converter_reconnect():
         await server.wait_closed()
         server1_closed = True
 
-        # Frames sent during the outage must be buffered (bounded, replayed
-        # on reconnect), never dropped silently and never leaked raw.
+        # Frames sent during the outage are buffered only while they remain
+        # within the 500ms live edge. These frames are deliberately left stale
+        # to prove they are discarded before reconnect send, never replayed or
+        # leaked raw.
         in_queue.put_nowait(_make_frame(2))
         in_queue.put_nowait(_make_frame(3))
 
@@ -362,24 +442,26 @@ async def test_rvc_streaming_converter_reconnect():
             )
             await asyncio.sleep(0.05)
 
-        # 4. Restart a fake server on the SAME port. The connection loop's
-        # backoff (0.5s -> 5s exponential, reset on each successful handshake)
-        # means the very next retry after this restart should succeed --
-        # only one reconnect cycle is needed to demonstrate the behavior.
+        # 4. Restart a fake server on the SAME port and wait for the live
+        # session handshake before submitting one fresh frame.
         server2 = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", port)
 
         reconnect_deadline = time.monotonic() + 4.0
-        expected_count = pre_outage_count + 2
+        while not converter.is_healthy and time.monotonic() < reconnect_deadline:
+            await asyncio.sleep(0.02)
+        assert converter.is_healthy, "converter did not establish its reconnect session"
+        in_queue.put_nowait(_make_frame(4))
+
+        expected_count = pre_outage_count + 1
         while len(output_chunks) < expected_count and time.monotonic() < reconnect_deadline:
             await asyncio.sleep(0.05)
 
         assert len(output_chunks) == expected_count, (
-            f"expected reconnect to replay buffered frames: got {len(output_chunks)}, wanted {expected_count}"
+            f"expected only fresh post-reconnect audio: got {len(output_chunks)}, wanted {expected_count}"
         )
-        # Buffered frames must be replayed in the order they were produced.
-        assert _decode_frame_value(output_chunks[pre_outage_count]) == 2
-        assert _decode_frame_value(output_chunks[pre_outage_count + 1]) == 3
-        print("Reconnect-with-backoff: silence during outage, buffered replay in order: OK")
+        assert _decode_frame_value(output_chunks[pre_outage_count]) == 4
+        assert converter.stale_input_drop_count == 2
+        print("Reconnect-with-backoff: stale outage audio dropped, fresh audio converted: OK")
     finally:
         if not server1_closed:
             server.close()
@@ -397,7 +479,24 @@ async def test_rvc_streaming_converter_reconnect():
 async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
     print("\n--- Testing RVCStreamingConverter reconnect buffer cap (bounded, drop-oldest) ---")
 
-    server = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", 0)
+    active_websockets = []
+    async def custom_handler(websocket):
+        active_websockets.append(websocket)
+        try:
+            await websocket.recv()  # config handshake
+            await websocket.send(json.dumps({"type": "ready"}))
+            async for message in websocket:
+                if isinstance(message, (bytes, bytearray)):
+                    samples = np.frombuffer(message, dtype=np.int16)
+                    upsampled = np.repeat(samples, 3).astype(np.int16)
+                    await websocket.send(upsampled.tobytes())
+        except ConnectionClosed:
+            pass
+        finally:
+            if websocket in active_websockets:
+                active_websockets.remove(websocket)
+
+    server = await websockets.serve(custom_handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
 
     converter = RVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
@@ -426,9 +525,15 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
         server.close()
         await server.wait_closed()
         server1_closed = True
+        
+        # Explicitly close any active connections to trigger client-side ConnectionClosed immediately
+        for ws in list(active_websockets):
+            await ws.close()
+            
+        await asyncio.sleep(0.6)  # Ensure connection is fully closed on client side before feeding
 
-        # 3. Feed well over 5s worth of 16kHz PCM (each frame is 320 bytes =
-        # 10ms; _MAX_BUFFER_BYTES caps at 500 such frames = 5s). Each frame's
+        # 3. Feed well over 500ms of 16kHz PCM (each frame is 320 bytes =
+        # 10ms; _MAX_BUFFER_BYTES caps at 50 such frames = 500ms). Each frame's
         # sample value encodes its own sequence index, so which frames survive
         # the drop-oldest policy is externally verifiable after reconnect.
         frame_len_bytes = 320
@@ -436,7 +541,7 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
         assert _MAX_BUFFER_BYTES % frame_len_bytes == 0, (
             "test assumes the cap is an exact multiple of the frame size"
         )
-        n_fed = cap_frames + 200  # ~7s worth fed against a 5s cap
+        n_fed = cap_frames + 200  # 2.5s fed against a 500ms cap
         for i in range(n_fed):
             in_queue.put_nowait(_make_frame(i))
 
@@ -462,7 +567,7 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
             f"expected exactly {cap_frames} surviving frames, got {len(converter._buffer)}"
         )
 
-        survivor_values = [_decode_frame_value(f) for f in converter._buffer]
+        survivor_values = [_decode_frame_value(f.payload) for f in converter._buffer]
         expected_survivors = list(range(n_fed - cap_frames, n_fed))
         assert survivor_values == expected_survivors, (
             "drop-oldest policy violated: surviving buffered frames are not exactly the "
@@ -474,26 +579,27 @@ async def test_rvc_streaming_converter_buffer_cap_drop_oldest():
             f"oldest {n_fed - cap_frames} of {n_fed} fed frames dropped, newest survive in order: OK"
         )
 
-        # 5. Reconnect and confirm the survivors (and only the survivors) get
-        # converted/yielded once the connection resumes.
+        # 5. Reconnect. By now the bounded survivors are all older than 500ms,
+        # so they must be discarded at the send boundary. Only audio submitted
+        # after the new session handshake may be converted.
         server2 = await websockets.serve(_fake_rvc_ws_handler, "127.0.0.1", port)
 
-        expected_count = pre_outage_count + cap_frames
         reconnect_deadline = time.monotonic() + 10.0
+        while not converter.is_healthy and time.monotonic() < reconnect_deadline:
+            await asyncio.sleep(0.02)
+        assert converter.is_healthy, "converter did not reconnect"
+        in_queue.put_nowait(_make_frame(3000))
+
+        expected_count = pre_outage_count + 1
         while len(output_chunks) < expected_count and time.monotonic() < reconnect_deadline:
             await asyncio.sleep(0.05)
 
         assert len(output_chunks) == expected_count, (
-            f"expected reconnect to replay exactly the {cap_frames} surviving buffered frames: "
-            f"got {len(output_chunks) - pre_outage_count}, wanted {cap_frames}"
+            "stale reconnect survivors must not be emitted as converted output"
         )
-        replayed_values = [
-            _decode_frame_value(c) for c in output_chunks[pre_outage_count:]
-        ]
-        assert replayed_values == expected_survivors, (
-            "replayed post-reconnect frames were not exactly the newest surviving frames, in order"
-        )
-        print("Reconnect replay after cap/trim matches surviving newest frames, in order: OK")
+        assert _decode_frame_value(output_chunks[-1]) == 3000
+        assert converter.stale_input_drop_count == cap_frames
+        print("Reconnect discarded all stale survivors and converted only fresh audio: OK")
     finally:
         if not server1_closed:
             server.close()
@@ -636,6 +742,8 @@ async def test_worker_readiness_probe_dedup():
 
         def __init__(self):
             self.call_count = 0
+            self.model_version = "rvc-ready-runtime-v1"
+            self.profile = "candidate_b"
 
         async def wait_ready(self, timeout):
             self.call_count += 1
@@ -663,6 +771,11 @@ async def test_worker_readiness_probe_dedup():
         f"background probe and the blocking waiter, got {converter.call_count}"
     )
     assert worker.is_ready is True, "is_ready should reflect the shared probe's result"
+    assert worker.model_version == "rvc-ready-runtime-v1", (
+        "the warm handshake's effective model version should replace the configured prior"
+    )
+    assert worker.rvc_profile == "candidate_b"
+    assert worker._PLAYOUT_BUFFER_TARGET_BYTES == 15_360
     print(f"wait_ready() probe calls for background+outbound paths: {converter.call_count} (expected 1) OK")
 
     # A worker with no background probe started (defensive/edge case, "shouldn't
@@ -1054,13 +1167,117 @@ async def test_worker_applies_presence_eq():
     print("Worker Presence EQ Wiring Test: SUCCESS")
 
 
+async def test_bounded_audio_queue():
+    print("\n--- Testing Bounded Audio Queue ---")
+    from backend.pipeline import BoundedAudioQueue
+    
+    q = BoundedAudioQueue(maxsize=3)
+    assert q.empty()
+    assert q.qsize() == 0
+    
+    await q.put(1)
+    await q.put(2)
+    await q.put(3)
+    assert q.qsize() == 3
+    assert not q.empty()
+    
+    # Put another item, which should trigger a drop of the oldest (1)
+    await q.put(4)
+    assert q.qsize() == 3
+    assert q.drop_count == 1
+    
+    val1 = await q.get()
+    q.task_done()
+    assert val1 == 2, f"Expected 2 (oldest item 1 should be dropped), got {val1}"
+    
+    val2 = await q.get()
+    q.task_done()
+    assert val2 == 3, f"Expected 3, got {val2}"
+    
+    val3 = await q.get()
+    q.task_done()
+    assert val3 == 4, f"Expected 4, got {val3}"
+    assert q.empty()
+    print("Bounded Audio Queue Test: SUCCESS")
+
+
+async def test_worker_telemetry_publish():
+    print("\n--- Testing VoiceConversionWorker Telemetry & Shared Contracts ---")
+    
+    class _DummyConverterWithStats:
+        on_stats = None
+
+    converter = _DummyConverterWithStats()
+    worker = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=converter,
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+        call_id="test-call-123",
+        requested_engine="rvc",
+        effective_engine="dummy",
+        fallback_reason="RVC endpoint unready",
+    )
+
+    assert worker.call_id == "test-call-123"
+    assert worker.requested_engine == "rvc"
+    assert worker.effective_engine == "dummy"
+    assert worker.fallback_reason == "RVC endpoint unready"
+    
+    # Mock room and local participant for data publishing
+    mock_participant = AsyncMock()
+    mock_room = MagicMock()
+    mock_room.isconnected.return_value = True
+    mock_room.local_participant = mock_participant
+    worker.room = mock_room
+    
+    # Trigger stats message and verify stats updates the values
+    worker._playout_buffer = bytearray(b"\x00" * 960) # 10 ms at 48kHz mono 16-bit
+    worker._on_converter_stats({
+        "model_version": "rvc-runtime-v2",
+        "profile": "baseline",
+        "infer_ms": 35.0,
+        "block_ms": 320,
+        "converter_wait_ms": 50.0,
+        "network_rtt_ms": 15.0,
+    })
+    
+    # Wait a bit for the async task in _publish_latency_metric to run
+    await asyncio.sleep(0.05)
+    
+    assert mock_participant.publish_data.called
+    payload_bytes = mock_participant.publish_data.call_args[0][0]
+    payload = json.loads(payload_bytes.decode())
+    
+    assert payload["call_id"] == "test-call-123"
+    assert payload["requested_engine"] == "rvc"
+    assert payload["effective_engine"] == "dummy"
+    assert payload["fallback_reason"] == "RVC endpoint unready"
+    assert payload["converter_wait_ms"] == 50.0
+    assert payload["network_rtt_ms"] == 15.0
+    assert payload["inference_ms"] == 35.0
+    assert payload["playout_buffer_latency_ms"] == 10.0
+    assert payload["model_version"] == "rvc-runtime-v2"
+
+    summary_row = worker._call_block_stats[-1]
+    assert summary_row["profile"] == "baseline"
+    assert summary_row["playout_buffer_latency_ms"] == 10.0
+    assert summary_row["processing_latency_ms"] == 45.0
+    assert summary_row["estimated_mouth_to_ear_ms"] == 60.0
+    
+    print("VoiceConversionWorker Telemetry & Shared Contracts: SUCCESS")
+
+
 async def main():
     print("Running automated pipeline verification tests...")
+    await test_bounded_audio_queue()
+    await test_worker_telemetry_publish()
     await test_noise_suppressor()
     await test_dummy_converter()
     await test_rvc_converter_mocked()
     await test_rvc_converter_empty_response()
     await test_rvc_streaming_converter_basic()
+    await test_rvc_ready_metadata_drives_dynamic_block_timing()
     await test_rvc_streaming_converter_reconnect()
     await test_rvc_streaming_converter_buffer_cap_drop_oldest()
     await test_rvc_streaming_adaptive_config_and_locked_pitch_resume()

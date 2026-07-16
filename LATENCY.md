@@ -5,6 +5,17 @@ This document presents the latency profile for the real-time voice conversion pi
 current RVC v2 / Modal GPU engine, guidelines for running latency verification, and
 troubleshooting steps for Modal GPU connection/cold-start issues.
 
+> **Authoritative 2026-07-16 RVC-first snapshot:** Modal v11 is deployed with the stable
+> baseline profile (320ms block / 400ms context / 80ms SOLA / 250ms playout), TensorRT on
+> an NVIDIA L4, hot TRT cache, and an artifact-derived model/index fingerprint. A 9.6s
+> synthetic persistent-WebSocket run produced 30 blocks with inference median/p95
+> **50.75/51.61ms**, converter-wait median/p95 **1207.11/1358.56ms**, estimated network
+> median/p95 **837.05/988.91ms**, no drops, and **-211.46ms** output-duration delta. The
+> benchmark originated from a developer laptop, so it is not a production Render or PSTN
+> mouth-to-ear result. The legacy Modal function is still the Render-selected stable path;
+> a parallel `fastapi_app_ap` function (Mumbai input routing, broad AP placement) is deployed
+> but must be benchmarked from Render Singapore before any switch. LLVC is paused and disabled.
+
 > **2026-07-02 update:** Pulled live Render logs (`Kiera`, `srv-d92lh7navr4c738i03a0`) and
 > pinged the Modal endpoint directly while diagnosing a "Modal not connecting / GPU not
 > starting" report — see §4 for the confirmed root causes (redeploys killing in-flight calls,
@@ -26,23 +37,28 @@ troubleshooting steps for Modal GPU connection/cold-start issues.
 > (the old ordered-playout-queue design) is retitled and kept as historical record — that
 > machinery no longer exists in the code.
 
-> **2026-07-03 / 2026-07-07 update:** the "no standing playout buffer" framing in §1 below is
-> now stale — a bounded standing playout buffer was reintroduced on 2026-07-03 as a deliberate
-> latency-for-quality tradeoff (see CLAUDE.md "Audio Pipeline & Streaming" and
-> `.agents/decisions/log.md`), and its target was reduced from ~3s to **1.25s** (cap still ~5s)
-> as TRT migration phase 1 (merged to `main` 2026-07-07). The Modal worker also moved from a
+> **Historical 2026-07-03 / 2026-07-07 update:** a bounded standing playout buffer was
+> reintroduced on 2026-07-03 and reduced from ~3s to 1.25s during TRT phase 1. Phase 2 then
+> reduced it to the **current 250ms baseline target** (5s cap, 100ms steady drain). The Modal
+> worker also moved from a
 > T4 to an **L4** GPU (2026-07-03) and now runs an optional **TensorRT** path
 > (`USE_TRT=1`) using RMVPE pitch tracking instead of `pm` — see
 > `.agents/context/subsystem-notes.md`'s TensorRT/ONNX migration section for the C3 benchmark
 > (median 66ms/p95 68ms inference on a live L4). The Render↔Modal region mismatch described in
 > §4.1/Region note below was **resolved 2026-07-03** — Render is now confirmed live in
-> Singapore, colocated with Modal's `ap-southeast` pin. Numbers in §1's table below have not
-> been fully reconciled with these changes; treat the buffer/GPU-tier/region specifics in this
-> banner as authoritative over the older prose that follows.
+> Singapore. The current dual-edge routing experiment and 2026-07-16 measurements are recorded
+> in the authoritative snapshot above and §1; older region/buffer prose is historical.
+
+> **2026-07-16 LLVC decision:** the LLVC service/training path is paused because Keira is a
+> multi-client SaaS where each client supplies a target voice; training a separate causal LLVC
+> model from scratch per voice is not the desired onboarding model. Keep
+> `LLVC_PILOT_ENABLED=false`. The converter, fake service, watchdog, and dataset/benchmark tools
+> remain test scaffolding, not a deployed performance claim. Optimize RVC first, then evaluate a
+> zero-shot or lightweight voice-conditioning streaming model.
 
 ---
 
-## 1. Latency Budget Breakdown (design targets — not yet re-measured, see banner)
+## 1. Current RVC latency budget and measured converter baseline
 
 In a real-time voice call, total mouth-to-ear latency is composed of multiple steps in the
 media transport and conversion pipeline. The stages below reflect the streaming pipeline
@@ -57,20 +73,27 @@ $$\text{Mouth-to-Ear Latency} = T_{\text{ingress}} + T_{\text{noise\_suppression
 | **Ingress Network** | 20 - 45 ms | Browser capture, OPUS encoding, WebRTC transport to LiveKit, and forwarding to the Python worker at 16 kHz mono. Unchanged by this rebuild (frontend/LiveKit transport untouched) — carried forward from the pre-rebuild estimate. |
 | **Noise Suppression** | 0.2 - 0.5 ms | `WebRTCNoiseSuppressor` processing of 10ms/320-byte frames. Sub-millisecond on CPU. Unchanged by this rebuild. |
 | **Input Frame Batching** | up to 20 ms | `_frame_pairs()` in `backend/pipeline.py` pairs two consecutive 10ms denoised frames into one 20ms (640-byte) input frame before it's sent into `convert_stream` — the plan's "Input frame to WS" parameter. |
-| **Inference Block Accumulation** | up to 320 ms (design target) | `modal_deploy/streaming.py::BlockAccumulator` only pops a block once 320ms of *new* audio has arrived (`BLOCK_MS`/`BLOCK_SAMPLES_IN`); a 160ms left-context window (`CONTEXT_MS`) is prepended for inference quality but doesn't itself add wait time. Per the rebuild plan's parameter table — see `docs/plans/2026-07-02-streaming-rebuild-plan.md`. |
-| **GPU Inference (warm)** | TRT path: median **66ms** / p95 68ms per 1400ms block (C3 benchmark, live L4, 2026-07-06); legacy ONNX/`pm` path: target < ~250 ms per 320ms block, not live-measured | `RVCEngine.run_conversion` / `TRTVoicePipeline` inside the `/ws` handler (`modal_deploy/worker.py`). The TRT path (`USE_TRT=1`) uses 3 static-shape TensorRT engines (HuBERT/generator/RMVPE) and re-enables `rmvpe` pitch tracking — see `.agents/context/subsystem-notes.md`'s TensorRT/ONNX migration section. |
-| **GPU Inference (cold)** | 30 - 90+ s (whole call blocked, not just first block); TRT adds a one-time ~22s engine build/warmup on a cold volume cache | Same Modal cold-start as before — see the historical ~75s measurement in §4.1 — but the *consequence* changed: the fail-closed warm gate (`worker.wait_until_ready`, see CLAUDE.md "Telephony & SIP") now blocks the call from starting at all until the GPU is ready, instead of letting the first several chunks through as raw voice. |
-| **SOLA Crossfade** | 80 ms held back per block | `modal_deploy/streaming.py::sola_crossfade` (`SOLA_CROSSFADE_SAMPLES`, 3840 samples @ 48kHz) holds back the last 80ms of each converted block as `pending_tail`, overlap-added onto the next block, to avoid audible seams between blocks. Per the plan's parameter table. |
-| **Standing Playout Buffer** | 1.25 s target / 5 s cap (as of TRT migration phase 1, 2026-07-07; was ~3s/~5s from 2026-07-03 to phase 1) | `VoiceConversionWorker._PLAYOUT_BUFFER_TARGET_BYTES`/`_MAX_BYTES` in `backend/pipeline.py` — a producer/consumer split that absorbs any block slower than real-time, trading delay for voice continuity. See CLAUDE.md "Audio Pipeline & Streaming" and `.agents/context/subsystem-notes.md`. This is now the dominant term in the budget, not the one-shot 100ms jitter fill this table used to describe (that constant no longer exists in the code). |
+| **Inference Block Accumulation** | up to 320 ms (RVC) / **0 ms (LLVC)** | `modal_deploy/streaming.py::BlockAccumulator` only pops a block once 320ms of *new* audio has arrived (`BLOCK_MS`/`BLOCK_SAMPLES_IN`) for RVC. LLVC has no block accumulation step (processes 20 ms frames in real-time). |
+| **GPU Inference (warm)** | RVC baseline median **50.75ms**, p95 **51.61ms** (30 live L4/TRT blocks, 2026-07-16) | `RVCEngine.convert_block` / `TRTVoicePipeline` inside the `/ws` handler. The earlier C3/Candidate-Phase measurements (66/68ms and 54/55ms) remain historical comparisons. |
+| **GPU Inference (cold)** | **72.51s active readiness** in the 2026-07-16 baseline run; scheduling varies | The fail-closed warm gate blocks call progression until the engine is ready. Modal logged delayed L4 acquisition for the narrow Singapore placement and recommended broader `ap` placement. Startup also logs a non-fatal `F0Predictor` import failure during its nominal warm-up, which remains open. |
+| **SOLA Crossfade** | 80ms baseline | `modal_deploy/streaming.py::sola_crossfade` holds a tail and aligns adjacent converted blocks. The finite benchmark returned 211.46ms less audio than its 9.6s input, more than the nominal 80ms held tail; duration preservation is an open gate. |
+| **Standing Playout Buffer** | **250ms baseline target**, 5s cap; 100ms steady drain | `VoiceConversionWorker` applies the profile's `playout_ms` after readiness metadata. This is no longer the stale 1.25s Phase-1 value. |
 | **Egress Network** | 20 - 40 ms | Publishing 960-byte (10ms @ 48kHz) frames to LiveKit, then WebRTC + browser jitter-buffer playout to the lead. Unchanged by this rebuild. |
-| **Steady-state Total** | **~1.3 - 1.6 s (design estimate, not live-measured)** | Dominated by the 1.25s standing playout buffer, not GPU inference (which TRT has made comparatively negligible at ~66ms). The rebuild plan's original "~400-550ms" target predates the 2026-07-03 playout-buffer reintroduction and no longer describes the deployed design — see the top-of-document banner. No live spectral-tone measurement has been run against the current (buffer + TRT) configuration yet. |
+| **Measured converter path** | Baseline converter-wait median **1207.11ms**, p95 **1358.56ms** from the developer-laptop run | This is not mouth-to-ear. Its estimated network component was 837.05ms median / 988.91ms p95 because the legacy web function uses Modal's default Virginia input routing. Re-measure from Render Singapore before using it for production decisions. |
+| **Steady-state mouth-to-ear** | **Not yet measured for the 2026-07-16 checkout** | Requires browser → LiveKit → Render → Modal → LiveKit SIP/Twilio → PSTN spectral/physical measurement. Do not add the converter benchmark to the 250ms playout target and label the sum as mouth-to-ear without that test. |
 | **Cold-GPU Total** | **Call blocked (503 outbound / held inbound) until ready, no audio published** | Replaces the old "30-90+s of raw voice, then fail-over recovers" row — there is no raw-voice period anymore; see the Inference (cold) row above and §4.2. |
 
-Region note: the Modal function is pinned to `region="ap-southeast"` (Singapore), intended to
-sit next to Render/Twilio infrastructure and avoid a transpacific round trip on every audio
-block. **Resolved 2026-07-03**: the deployed Render service is confirmed live in Singapore
-(colocated with Modal), so this pin is no longer working against itself — see
-`.agents/context/stack-and-rules.md`.
+Region note: Render is confirmed in Singapore. Modal v11 exposes two functions from the same
+worker code and model volume:
+
+- `fastapi_app` — stable/legacy endpoint, compute pinned `ap-southeast`, default Modal input
+  routing through `us-east`.
+- `fastapi_app_ap` — experimental endpoint, `routing_region="ap-south"` and broad
+  `region="ap"`; its first health request selected `ap-northeast-1` (Tokyo).
+
+The second endpoint improves scheduling options and changes the input route, but Tokyo is not
+colocated with Render Singapore. Keep Render on the stable endpoint until both are benchmarked
+from Render using identical input. Laptop geography is not a substitute.
 
 ---
 
@@ -78,7 +101,8 @@ block. **Resolved 2026-07-03**: the deployed Render service is confirmed live in
 
 Per-block latency varies with GPU warm/cold state and load, so treat the log lines below as
 **how to read the logs**, not as fixed benchmarks. Run your own pass (§3) after any pipeline or
-model change and capture fresh numbers — none of the numbers below are live measurements.
+model change and capture fresh numbers. The 2026-07-16 values in §1 are live converter-path
+measurements; transport estimates and historical examples elsewhere are labelled separately.
 
 These are the actual log lines/messages in the current streaming pipeline, not the old
 chunk/playout-buffer lines (which no longer exist in the code).
@@ -114,17 +138,18 @@ config surfaces `WARNING`-level output to see these:
 
 ```text
 [RVCStreamingConverter] WS connection lost/failed: <exception text>
-[RVCStreamingConverter] reconnect buffer full (5s cap) — dropped oldest input frame (1280 bytes)
+[RVCStreamingConverter] reconnect buffer full (500ms cap) — dropped oldest input frame (640 bytes)
 [RVCStreamingConverter] WS send failed — requeuing frame, will reconnect
 [RVCStreamingConverter] server error: <message>
 [RVCStreamingConverter] wait_ready failed: <exception text>
 ```
 
 - `WS connection lost/failed` — the persistent session's socket dropped; `_connection_loop`
-  will retry with exponential backoff (0.5s → 5s cap) while incoming audio buffers (bounded to
-  5s, oldest dropped first) — the lead hears silence for this duration, never raw voice.
+  will retry with exponential backoff (0.5s → 5s cap) while incoming audio buffers only the
+  newest 500ms (oldest dropped first) — the lead hears silence for the outage, never raw voice,
+  and stale speech is not replayed after reconnect.
 - `reconnect buffer full ... dropped oldest input frame` — the outage lasted long enough that
-  the 5s input buffer filled and started dropping the oldest buffered audio; that audio is lost
+  the 500ms input buffer filled and started dropping the oldest buffered audio; that audio is lost
   (never converted), but nothing raw is ever leaked to the lead.
 - `server error: <message>` — the server sent `{"type":"error",...}` for one inference block
   (see the worker-side messages below); that block emits no audio and the session stays open.

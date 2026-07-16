@@ -22,6 +22,17 @@ whether it's a regression of something already tried and reverted here before re
 a fix from scratch.
 
 ## Decisions
+- **RVC-first SaaS pivot; LLVC training paused (2026-07-16).** The product requirement is
+  multi-tenant: each client supplies an authorized target voice and should reach a usable
+  preview without training a new large model. That invalidates LLVC as the default product
+  engine because the current LLVC recipe distills a separate target-specific student for
+  every voice. Preserve the completed LLVC protocol/safety/benchmark work, keep
+  `LLVC_PILOT_ENABLED=false`, and do not generate the 360-hour corpus or deploy a real LLVC
+  service. First make the existing RVC path's profile telemetry truthful, measure a warm
+  staff PSTN baseline, and test only the 160/240/40/160 ms Candidate B geometry against
+  shared quality gates. Revisit a streaming zero-shot engine only after the RVC baseline is
+  stable; LLVC remains a possible future per-tenant compilation optimization for unusually
+  high-volume fixed voices, not the SaaS onboarding path.
 - **Adaptive per-call pitch lock replaces the fixed `RVC_MALE_PITCH_SHIFT` constant
   (2026-07-13/14, spec `docs/superpowers/specs/2026-07-13-adaptive-pitch-shift-design.md`,
   merged `88b3736`).** Why: the fixed shift (`+7`, calibrated 2026-07-08 against a ~137Hz
@@ -431,3 +442,39 @@ special-case check every time. Left the historical plan doc
 existing entry under their original name — they're records of what was true when written,
 not the current convention. Ran `make second-brain-close`: CHECKS PASSED (0 wiki-lint
 errors, 0 credential matches, 0 stale-claim matches).
+
+## 2026-07-16 — RVC-first optimization; LLVC paused; measured baseline before tuning
+
+**Changed the product assumption before spending more training effort.** Keira is intended
+as a SaaS where each client uploads a target voice, not a single fixed Keira brand voice.
+A separately trained causal LLVC model per client would make onboarding slow and expensive,
+so LLVC training/deployment is paused and `LLVC_PILOT_ENABLED=false`. Its verified streaming
+and fail-closed scaffolding stays in the tree. Decision: optimize the existing lightweight
+RVC onboarding path first, then investigate a zero-shot or lightweight-conditioned streaming
+VC engine. Rejected: generating a very large teacher corpus or treating fake-server LLVC
+latency as model performance.
+
+**Made RVC measurements self-identifying before changing geometry** (commits `cfe7891`,
+`a379f59`, `d8e83c9`, `e90a1a1`). Modal readiness/stats now expose the effective named
+profile, block/context/SOLA/output geometry, TensorRT/cache state, and an artifact-derived
+model/index fingerprint. The backend no longer assumes 320ms when accounting for converter
+blocks. `scripts/rvc_stream_benchmark.py` drives one continuous authenticated WebSocket and
+reports readiness, inference, converter/network estimates, duration delta, and drops.
+Baseline and Candidate B profiles are defined; Candidate C is not implemented and Candidate
+B has no matching promoted TensorRT artifacts yet.
+
+**Deployed and verified Modal v10/v11 after the user rotated credentials and authenticated
+the `thezhafoundry` workspace.** The stable function remains `fastapi_app`, with Singapore
+compute and Modal's default US input routing. Commit `7a24200` added a parallel
+`fastapi_app_ap` only for measurement (`routing_region="ap-south"`, broad `region="ap"`);
+its first container landed in Tokyo. Render remains on the stable endpoint. Rejected:
+switching Render based on a laptop benchmark or assuming broad AP placement means Singapore.
+
+**First live baseline (developer laptop → stable Modal edge):** 9.6s input, 30 blocks,
+72,510.73ms cold active readiness; TensorRT inference median/p95 50.75/51.61ms;
+converter wait 1207.11/1358.56ms; estimated network 837.05/988.91ms; zero drops;
+9388.54ms output, delta -211.46ms. The result verifies the model/profile/TRT path, but is
+not a Render-origin or PSTN mouth-to-ear result. The duration loss, Render-origin stable/AP
+A/B, non-fatal `F0Predictor` startup-warm-up import failure, and a warm staff PSTN test are
+hard gates before lowering block/buffer sizes. The one-second adaptive-pitch interpolation
+is implemented/tested in v11 but still needs that live listen test.

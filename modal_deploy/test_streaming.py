@@ -118,12 +118,55 @@ def test_sola_crossfade_seamless_at_boundary():
     print("SOLA crossfade seam continuity test: SUCCESS")
 
 
+def test_pitch_lock_interpolation():
+    print("\n--- Testing Pitch Lock Interpolation ---")
+    from modal_deploy.pitch_lock import PitchLock
+    
+    lock = PitchLock(prior_shift=7.0, target_f0=208.0, enabled=True, min_voiced_seconds=1.0)
+    assert lock.shift == 7.0
+    
+    # Feed 1.0s of voiced frames (median F0 = 208Hz, so locked shift = 0.0)
+    block_seconds = 0.2
+    for i in range(4):
+        triggered = lock.add_block(np.full(100, 208.0), block_seconds)
+        assert not triggered
+        assert not lock.locked
+        assert lock.shift == 7.0
+        
+    # The 5th block reaches 1.0s, triggers lock
+    triggered = lock.add_block(np.full(100, 208.0), block_seconds)
+    assert triggered
+    assert lock.locked
+    
+    # Right at locking, transition time is 0.0, shift is still 7.0 (the prior)
+    assert lock.shift == 7.0
+    
+    # Process blocks after lock to interpolate:
+    # After 0.2s (block 1 after lock)
+    lock.add_block(np.full(100, 208.0), block_seconds)
+    assert abs(lock.shift - 5.6) < 1e-6
+    
+    # After another 0.4s (total 0.6s after lock)
+    lock.add_block(np.full(100, 208.0), 0.4)
+    assert abs(lock.shift - 2.8) < 1e-6
+    
+    # After another 0.4s (total 1.0s after lock)
+    lock.add_block(np.full(100, 208.0), 0.4)
+    assert lock.shift == 0.0
+    
+    # After further blocks, shift stays 0.0
+    lock.add_block(np.full(100, 208.0), 0.5)
+    assert lock.shift == 0.0
+    
+    print("Pitch Lock Interpolation Test: SUCCESS")
+
+
 def main():
     print("Running modal_deploy/streaming.py DSP verification tests...")
     test_sola_crossfade_first_block_holds_tail_only()
     test_sola_crossfade_seamless_at_boundary()
+    test_pitch_lock_interpolation()
     print("\nAll modal_deploy streaming tests completed successfully!")
-
 
 if __name__ == "__main__":
     main()

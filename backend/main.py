@@ -2,6 +2,7 @@ import os
 import asyncio
 import contextlib
 import datetime
+import secrets
 import time
 from typing import Literal, Optional
 from fastapi import (
@@ -136,10 +137,31 @@ worker_start_states: dict[str, _WorkerStartState] = {}
 isolation_events: dict[str, asyncio.Event] = {}
 
 
+def _spawn_observed_task(coro, *, name: str) -> asyncio.Task:
+    """Create a background task and always retrieve/log its terminal exception."""
+    task = asyncio.create_task(coro, name=name)
+
+    def observe_result(done: asyncio.Task) -> None:
+        if done.cancelled():
+            return
+        try:
+            error = done.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            print(f"[Server] Background task {name} failed: {type(error).__name__}")
+
+    task.add_done_callback(observe_result)
+    return task
+
+
 @app.on_event("startup")
 async def _on_startup():
     global _rvc_keepwarm_task
-    _rvc_keepwarm_task = asyncio.create_task(_rvc_keepwarm_loop())
+    _rvc_keepwarm_task = _spawn_observed_task(
+        _rvc_keepwarm_loop(),
+        name="keira-rvc-keepwarm",
+    )
     print("[Server] RVC keep-warm loop started (pings every 90s).")
 
 
@@ -166,6 +188,8 @@ LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 # RVC serverless GPU configuration
 RVC_ENDPOINT_URL = os.getenv("RVC_ENDPOINT_URL")
 RVC_API_KEY = os.getenv("RVC_API_KEY", "")
+ALLOW_DUMMY_CONVERTER = os.getenv("ALLOW_DUMMY_CONVERTER", "false").lower() == "true"
+RVC_MODEL_VERSION = os.getenv("RVC_MODEL_VERSION", "mi-test")
 RVC_PITCH_SHIFT = int(os.getenv("RVC_PITCH_SHIFT", "0"))
 # Blend between FAISS-retrieved target-voice timbre (1.0) and raw HuBERT content
 # features (0.0), which still carry some of the original speaker's own vocal-tract
@@ -205,12 +229,14 @@ RVC_ADAPTIVE_PITCH = os.getenv("RVC_ADAPTIVE_PITCH", "1") == "1"
 # The trained model's F0 center in Hz that the adaptive lock targets
 # (mi-test: ~208, measured 2026-07-08 from a known-good output).
 RVC_TARGET_F0 = float(os.getenv("RVC_TARGET_F0", "208"))
+
+DUMMY_MODEL_VERSION = "dummy-development"
 # WebRTC noise-suppression aggressiveness [0..4]. Level 3 was gutting high-frequency
 # voice detail (sibilance/consonants HuBERT needs) BEFORE the model saw it —
 # measured 2026-07-08: live input centroid 413Hz vs 720Hz clean, -9dB at 6-8kHz —
-# the dominant cause of the "muffled" converted output. Env-tunable so it can be
-# lowered without a code change; default keeps the legacy Level 3.
-NS_LEVEL = int(os.getenv("NS_LEVEL", "3"))
+# the dominant cause of the "muffled" converted output. Level 1 is the validated
+# clarity-preserving default; NS_LEVEL retains the deployment override.
+NS_LEVEL = int(os.getenv("NS_LEVEL", "1"))
 
 # Twilio Configuration
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
@@ -391,7 +417,10 @@ def _log_config():
     print(f"  Twilio SIP URI:       {TWILIO_SIP_URI or 'not set (needed for /api/setup)'}")
     print(f"  LiveKit SIP Trunk ID: {TWILIO_SIP_TRUNK_ID or 'MISSING ⚠️  → run POST /api/setup to create'}")
     print(f"  Server URL:           {SERVER_URL or 'not set (needed for /api/setup webhook config)'}")
-    print(f"  RVC Endpoint:         {RVC_ENDPOINT_URL or 'not set (using dummy converter)'}")
+    print(
+        "  RVC Endpoint:         "
+        f"{RVC_ENDPOINT_URL or 'not set (PSTN calls fail closed)'}"
+    )
     print("==================================")
 
 _log_config()
@@ -485,7 +514,12 @@ async def _wait_for_worker_started(room_name: str, timeout: float = 30.0) -> Non
         raise HTTPException(status_code=503, detail="Voice bot failed to join LiveKit.")
 
 
-async def _cleanup_room_state(room_name: str, *, delete_room: bool = False) -> None:
+async def _cleanup_room_state(
+    room_name: str,
+    *,
+    delete_room: bool = False,
+    remove_call: bool = True,
+) -> None:
     worker = active_workers.pop(room_name, None)
     task = worker_tasks.pop(room_name, None)
     worker_start_states.pop(room_name, None)
@@ -508,11 +542,18 @@ async def _cleanup_room_state(room_name: str, *, delete_room: bool = False) -> N
         finally:
             if lk:
                 await lk.aclose()
-    active_calls.pop(room_name, None)
+    if remove_call:
+        active_calls.pop(room_name, None)
 
 
 # Shared logic to spawn a converter bot for a room
-async def _do_start_bot(room_name: str, agent_gender: str = "male"):
+async def _do_start_bot(
+    room_name: str,
+    agent_gender: str = "male",
+    requested_engine: str = "rvc",
+    *,
+    require_real_engine: bool = False,
+):
     _validate_room_name(room_name)
     if room_name in active_workers:
         return {"status": "already_running", "message": f"Voice conversion bot is already active in room {room_name}."}
@@ -533,23 +574,24 @@ async def _do_start_bot(room_name: str, agent_gender: str = "male"):
         )) \
         .with_ttl(datetime.timedelta(seconds=3600))
     
-    # Choose voice conversion engine (priority: RVC > Dummy)
-    # Pitch shift: male agent -> female Keira = +12, female agent -> female Keira = 0.
-    # Previously this was handed off to the GPU's auto-detect (pitch_shift=-1,
-    # autocorrelation F0 vs. a 145Hz threshold in worker.py's _auto_detect_pitch).
-    # That's unreliable in practice (confirmed 2026-07-03: a known-male agent was
-    # twice misdetected as female, F0=222Hz/167Hz — autocorrelation locking onto a
-    # harmonic instead of the true fundamental) and re-runs from scratch on every
-    # WS reconnect since the detected value is never reported back to/persisted by
-    # the client, so a single call could even change identity mid-call. The UI
-    # gender toggle is the ground truth the agent already knows about themselves,
-    # so drive pitch_shift from it directly instead of trusting a live guess.
-    pitch_shift = RVC_MALE_PITCH_SHIFT if agent_gender.lower() == "male" else 0
-    print(f"[Server] Agent gender: {agent_gender} → pitch prior={pitch_shift} "
-          f"(adaptive={'on' if RVC_ADAPTIVE_PITCH else 'off'}, target_f0={RVC_TARGET_F0:.0f}Hz)")
+    effective_engine = requested_engine
+    fallback_reason: Optional[str] = None
 
-    if RVC_ENDPOINT_URL:
-        print(f"[Server] Spawning RVC Streaming Voice Changer (Endpoint: {RVC_ENDPOINT_URL})")
+    if effective_engine == "rvc" and not RVC_ENDPOINT_URL:
+        if require_real_engine or not ALLOW_DUMMY_CONVERTER:
+            raise HTTPException(
+                status_code=503,
+                detail="A real RVC voice engine is not configured.",
+            )
+        effective_engine = "dummy"
+        fallback_reason = fallback_reason or "Development dummy converter explicitly enabled"
+
+    print(f"[Server] Requested engine: {requested_engine} -> Effective: {effective_engine} (Fallback reason: {fallback_reason})")
+
+    # Choose voice conversion engine
+    if effective_engine == "rvc":
+        pitch_shift = RVC_MALE_PITCH_SHIFT if agent_gender.lower() == "male" else 0
+        print(f"[Server] Spawning RVC Streaming Voice Changer (Endpoint: {RVC_ENDPOINT_URL}, Pitch Prior: {pitch_shift})")
         converter = RVCStreamingConverter(
             endpoint_url=RVC_ENDPOINT_URL,
             api_key=RVC_API_KEY,
@@ -560,10 +602,15 @@ async def _do_start_bot(room_name: str, agent_gender: str = "male"):
             adaptive_pitch=RVC_ADAPTIVE_PITCH,
             target_f0=RVC_TARGET_F0,
             connect_timeout=150.0,  # allow full Modal cold-start window (~60-90s)
+            model_version=RVC_MODEL_VERSION,
         )
-    else:
-        print("[Server] No RVC endpoint config found. Spawning Dummy Pitch Modulation Engine.")
+        model_version = RVC_MODEL_VERSION
+    elif effective_engine == "dummy":
+        print("[Server] Spawning explicitly enabled development Dummy Pitch Modulation Engine.")
         converter = DummyVoiceConverter()
+        model_version = DUMMY_MODEL_VERSION
+    else:
+        raise HTTPException(status_code=503, detail="No permitted voice engine is available.")
 
     # Initialize noise suppression (WebRTC). Level via NS_LEVEL env — lowering it
     # preserves the high-frequency voice detail the RVC model needs for a clear,
@@ -575,6 +622,11 @@ async def _do_start_bot(room_name: str, agent_gender: str = "male"):
         token=bot_token.to_jwt(),
         converter=converter,
         suppressor=suppressor,
+        call_id=room_name,
+        requested_engine=requested_engine,
+        effective_engine=effective_engine,
+        fallback_reason=fallback_reason,
+        model_version=model_version,
     )
 
     active_workers[room_name] = worker
@@ -626,18 +678,44 @@ async def _do_start_bot(room_name: str, agent_gender: str = "male"):
                 print("[Server] RVC pre-warm ping sent on bot start (overlaps GPU cold start with ringing)")
             except Exception as e:
                 print(f"[Server] RVC pre-warm ping failed (non-fatal): {e}")
-        asyncio.create_task(_prewarm_rvc())
+        _spawn_observed_task(
+            _prewarm_rvc(),
+            name=f"keira-rvc-prewarm-{room_name}",
+        )
 
-    worker_tasks[room_name] = asyncio.create_task(
+    worker_tasks[room_name] = _spawn_observed_task(
         run_worker_task(),
         name=f"keira-worker-{room_name}",
     )
     return {"status": "started", "botIdentity": bot_identity}
 
+
+async def _ensure_pstn_worker_ready(room_name: str, agent_gender: str):
+    """Return a ready worker."""
+    worker = active_workers.get(room_name)
+    if worker is None:
+        raise HTTPException(status_code=503, detail="Voice worker is unavailable.")
+
+    if await worker.wait_for_readiness_probe(150.0):
+        return worker
+
+    raise HTTPException(status_code=503, detail="Voice engine is not ready.")
+
+
+def _persist_engine_state(call_info: dict, worker) -> None:
+    call_info.update({
+        "requested_engine": worker.requested_engine,
+        "effective_engine": worker.effective_engine,
+        "fallback_reason": worker.fallback_reason or "",
+        "model_version": worker.model_version,
+    })
+
+
 class TokenRequest(BaseModel):
     roomName: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
     identity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     agentGender: Literal["male", "female"] = "male"
+    voiceEngine: Literal["rvc"] = "rvc"
 
 @app.post("/api/token", dependencies=[Depends(require_control_token)])
 async def get_token(request: TokenRequest):
@@ -673,7 +751,7 @@ async def start_bot(request: TokenRequest):
     Spawns the real-time audio pipeline bot and connects it to the specified LiveKit room.
     """
     _require_agent_identity(request.identity)
-    return await _do_start_bot(request.roomName, request.agentGender)
+    return await _do_start_bot(request.roomName, request.agentGender, request.voiceEngine)
 
 @app.post("/api/stop-bot", dependencies=[Depends(require_control_token)])
 async def stop_bot(request: TokenRequest):
@@ -693,11 +771,17 @@ class OutboundCallRequest(BaseModel):
     phoneNumber: str = Field(pattern=r"^\+\d{8,15}$")
     agentIdentity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     agentGender: Literal["male", "female"] = "male"
+    voiceEngine: Literal["rvc"] = "rvc"
 
 
 class OutboundDialRequest(BaseModel):
     roomName: str = Field(min_length=1, max_length=128, pattern=r"^outbound_[A-Za-z0-9_.-]+$")
     phoneNumber: str = Field(pattern=r"^\+\d{8,15}$")
+
+
+def _new_outbound_room_name(phone_number: str) -> str:
+    """Return a safe room ID with 96 bits of collision-resistant randomness."""
+    return f"outbound_{phone_number[1:]}_{secrets.token_hex(12)}"
 
 
 async def _find_outbound_trunk():
@@ -747,13 +831,16 @@ async def call_outbound(request: OutboundCallRequest):
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         raise HTTPException(status_code=500, detail="LiveKit API keys are not configured.")
 
-    room_name = f"outbound_{request.phoneNumber[1:]}_{int(time.time())}"
+    room_name = _new_outbound_room_name(request.phoneNumber)
     try:
-        await _do_start_bot(room_name, request.agentGender)
+        await _do_start_bot(
+            room_name,
+            request.agentGender,
+            request.voiceEngine,
+            require_real_engine=True,
+        )
         await _wait_for_worker_started(room_name)
-        worker = active_workers.get(room_name)
-        if not worker or not await worker.wait_for_readiness_probe(150.0):
-            raise HTTPException(status_code=503, detail="Voice engine is not ready.")
+        worker = await _ensure_pstn_worker_ready(room_name, request.agentGender)
         active_calls[room_name] = {
             "room_name": room_name,
             "from": redact_phone_number(TWILIO_PHONE_NUMBER),
@@ -761,8 +848,10 @@ async def call_outbound(request: OutboundCallRequest):
             "status": "ready-to-dial",
             "direction": "outbound",
             "agent_identity": request.agentIdentity,
+            "agent_gender": request.agentGender,
             "created_at": datetime.datetime.now().isoformat(),
         }
+        _persist_engine_state(active_calls[room_name], worker)
     except HTTPException:
         await _cleanup_room_state(room_name, delete_room=True)
         raise
@@ -780,6 +869,10 @@ async def call_outbound(request: OutboundCallRequest):
         "roomName": room_name,
         "token": agent_token.to_jwt(),
         "serverUrl": LIVEKIT_URL,
+        "requested_engine": worker.requested_engine,
+        "effective_engine": worker.effective_engine,
+        "fallback_reason": worker.fallback_reason or "",
+        "model_version": worker.model_version,
     }
 
 
@@ -794,6 +887,16 @@ async def dial_outbound(request: OutboundDialRequest):
     if not await _agent_has_audio_track(request.roomName):
         await _cleanup_room_state(request.roomName, delete_room=True)
         raise HTTPException(status_code=503, detail="Agent audio track was not ready.")
+
+    try:
+        worker = await _ensure_pstn_worker_ready(
+            request.roomName,
+            call_info.get("agent_gender", "male"),
+        )
+    except HTTPException:
+        await _cleanup_room_state(request.roomName, delete_room=True)
+        raise
+    _persist_engine_state(call_info, worker)
 
     sip_trunk_id = await _find_outbound_trunk()
     if not sip_trunk_id:
@@ -943,23 +1046,39 @@ async def call_wait(
     if call_info and call_info.get("isolation_failed"):
         return Response(content="""<?xml version="1.0" encoding="UTF-8"?>
 <Response><Hangup/></Response>""", media_type="application/xml")
-    if call_info and call_info.get("status") == "accepted" and worker and worker_started and worker.is_ready and isolation_confirmed:
-        # Agent has accepted AND the voice engine is confirmed ready — bridge to
-        # LiveKit SIP. Fail-closed: if the worker isn't ready yet, this falls
-        # through to the hold-TwiML branch below and re-polls in 3s rather than
-        # bridging a call that would only publish silence (never raw audio).
-        sip_domain = get_livekit_sip_domain()
-        status_callback = f"{SERVER_URL.rstrip('/') if SERVER_URL else ''}/api/call/status-event"
-        print(f"[Twilio Wait] Agent accepted! Bridging to LiveKit SIP: {room_name}@{sip_domain}")
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    can_check_boundary = bool(
+        call_info
+        and call_info.get("status") == "accepted"
+        and worker
+        and worker_started
+        and isolation_confirmed
+        and worker.is_ready
+    )
+    if can_check_boundary:
+        try:
+            worker = await _ensure_pstn_worker_ready(
+                room_name,
+                call_info.get("agent_gender", "male"),
+            )
+        except HTTPException as exc:
+            print(
+                f"[Twilio Wait] Voice session not ready at bridge boundary "
+                f"for {room_name}: {exc.status_code}; holding"
+            )
+        else:
+            _persist_engine_state(call_info, worker)
+            sip_domain = get_livekit_sip_domain()
+            status_callback = f"{SERVER_URL.rstrip('/') if SERVER_URL else ''}/api/call/status-event"
+            print(f"[Twilio Wait] Agent accepted! Bridging to LiveKit SIP: {room_name}@{sip_domain}")
+            twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial timeout="60" action="{status_callback}" method="POST">
         <Sip>sip:{room_name}@{sip_domain};transport=tcp</Sip>
     </Dial>
 </Response>"""
-        return Response(content=twiml, media_type="application/xml")
+            return Response(content=twiml, media_type="application/xml")
 
-    elif call_info is None:
+    if call_info is None:
         # Call was ended/rejected
         print(f"[Twilio Wait] Call {sid} not found — hanging up")
         return Response(content="""<?xml version="1.0" encoding="UTF-8"?>
@@ -980,6 +1099,7 @@ class AcceptCallRequest(BaseModel):
     roomName: str = Field(min_length=1, max_length=128, pattern=r"^inbound_[A-Za-z0-9_.-]+$")
     agentIdentity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     agentGender: Literal["male", "female"] = "male"
+    voiceEngine: Literal["rvc"] = "rvc"
 
 @app.post("/api/call/accept", dependencies=[Depends(require_control_token)])
 async def call_accept(request: AcceptCallRequest):
@@ -995,7 +1115,14 @@ async def call_accept(request: AcceptCallRequest):
     if room_name not in active_calls:
         raise HTTPException(status_code=404, detail="Incoming call not found.")
     try:
-        await _do_start_bot(room_name, request.agentGender)
+        await _do_start_bot(
+            room_name,
+            request.agentGender,
+            request.voiceEngine,
+            require_real_engine=True,
+        )
+        await _wait_for_worker_started(room_name)
+        worker = await _ensure_pstn_worker_ready(room_name, request.agentGender)
     except Exception as exc:
         await _cleanup_room_state(room_name, delete_room=True)
         raise HTTPException(status_code=503, detail="Unable to start the voice bot.") from exc
@@ -1003,6 +1130,7 @@ async def call_accept(request: AcceptCallRequest):
     # Mark as 'accepted' — /api/call/wait polls this and will then bridge the SIP call
     active_calls[room_name]["status"] = "accepted"
     active_calls[room_name]["agent_gender"] = request.agentGender
+    _persist_engine_state(active_calls[room_name], worker)
     print(f"[Call Accept] Status set to 'accepted' for room={room_name}")
 
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
@@ -1021,7 +1149,10 @@ async def call_accept(request: AcceptCallRequest):
             active_calls[room_name]["isolation_failed"] = True
             print(f"[SIP Isolation] Inbound isolation failed closed for room {room_name}")
 
-    asyncio.create_task(isolate_inbound_sip(), name=f"keira-sip-isolation-{room_name}")
+    _spawn_observed_task(
+        isolate_inbound_sip(),
+        name=f"keira-sip-isolation-{room_name}",
+    )
 
     # Generate access token for the agent
     agent_token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
@@ -1039,19 +1170,17 @@ async def call_accept(request: AcceptCallRequest):
         "status": "accepted",
         "roomName": room_name,
         "token": agent_token.to_jwt(),
-        "serverUrl": LIVEKIT_URL
+        "serverUrl": LIVEKIT_URL,
+        "requested_engine": worker.requested_engine,
+        "effective_engine": worker.effective_engine,
+        "fallback_reason": worker.fallback_reason or "",
+        "model_version": worker.model_version,
     }
 
 class EndCallRequest(BaseModel):
     roomName: str
 
-@app.post("/api/call/end", dependencies=[Depends(require_control_token)])
-async def call_end(request: EndCallRequest):
-    """
-    Disconnects the bot, deletes the LiveKit room, and broadcasts the disconnect event.
-    """
-    room_name = request.roomName
-
+async def _do_end_call(room_name: str, reason: str = "") -> None:
     call_info = active_calls.get(room_name)
     # 1. Stop the voice conversion bot and cancel managed lifecycle state.
     await _cleanup_room_state(room_name)
@@ -1072,18 +1201,26 @@ async def call_end(request: EndCallRequest):
     if twilio_client and call_info:
         if call_info.get("direction") == "inbound" and "call_sid" in call_info:
             try:
-                twilio_client.calls(call_info["call_sid"]).update(status="completed")
+                call_handle = twilio_client.calls(call_info["call_sid"])
+                await asyncio.to_thread(call_handle.update, status="completed")
                 print(f"[Server] Twilio CallSid {call_info['call_sid']} hung up programmatically")
             except Exception as e:
                 print(f"[Server Error hanging up Twilio call] {e}")
 
-    # 4. Broadcast end call to agents
+    # 4. Broadcast end call to agents (include optional reason)
     await manager.broadcast({
         "event": "call_ended",
-        "roomName": room_name
+        "roomName": room_name,
+        "reason": reason
     })
 
-    return {"status": "ended", "roomName": room_name}
+@app.post("/api/call/end", dependencies=[Depends(require_control_token)])
+async def call_end(request: EndCallRequest):
+    """
+    Disconnects the bot, deletes the LiveKit room, and broadcasts the disconnect event.
+    """
+    await _do_end_call(request.roomName)
+    return {"status": "ended", "roomName": request.roomName}
 
 @app.get("/api/call/status", dependencies=[Depends(require_control_token)])
 async def call_status(roomName: str = None):
@@ -1123,7 +1260,7 @@ async def health_check():
             "sip_domain": get_livekit_sip_domain(),
         },
         "rvc": {
-            "endpoint": RVC_ENDPOINT_URL or "not configured (using dummy converter)",
+            "endpoint": RVC_ENDPOINT_URL or "not configured (PSTN calls fail closed)",
         },
         "server_url": SERVER_URL or "not set",
         "active_calls": len(active_calls),

@@ -19,8 +19,11 @@ try:
     from modal_deploy import pitch_lock as pl
 except ImportError:   # inside container: modal_deploy package not present
     import pitch_lock as pl
+try:
+    from modal_deploy import rvc_profiles as rp
+except ImportError:  # inside container: modal_deploy package not present
+    import rvc_profiles as rp
 
-import faiss
 from functools import lru_cache
 
 # RVC/infer/modules/vc/pipeline.py calls faiss.read_index(file_index) then
@@ -31,11 +34,14 @@ from functools import lru_cache
 # latency in production [Timing] logs). Cache the loaded index and its full
 # reconstruction so only the first call (the GPU warm-up pass in
 # RVCEngine.startup(), before any real caller connects) pays that cost.
-_real_faiss_read_index = faiss.read_index
+_real_faiss_read_index = None
 
 
 @lru_cache(maxsize=4)
-def _cached_read_index(path: str) -> "faiss.Index":
+def _cached_read_index(path: str):
+    global _real_faiss_read_index
+    if _real_faiss_read_index is None:
+        _install_faiss_index_cache()
     index = _real_faiss_read_index(path)
     cached_npy = index.reconstruct_n(0, index.ntotal)
     index.reconstruct_n = lambda *args, **kwargs: cached_npy
@@ -43,13 +49,16 @@ def _cached_read_index(path: str) -> "faiss.Index":
 
 
 def _install_faiss_index_cache():
+    global _real_faiss_read_index
+    import faiss
+
     if getattr(faiss.read_index, "_kiera_cached", False):
         return  # already installed (e.g. re-imported in a test)
+    _real_faiss_read_index = faiss.read_index
     faiss.read_index = _cached_read_index
 
 
 _cached_read_index._kiera_cached = True
-_install_faiss_index_cache()
 
 
 app = modal.App("rvc-worker")
@@ -106,11 +115,14 @@ class RVCEngine:
         self.trt_pipe = None
         self.engine_kind = "onnx-cuda"   # "onnx-cuda" (fallback) or "trt"
         self._trt_cache_hot = False
+        self.model_version = "unknown"
 
     def startup(self):
         import glob
         import faiss
         import onnxruntime as ort
+
+        _install_faiss_index_cache()
 
         print("=" * 80)
         print("Starting RVC ONNX GPU Worker")
@@ -209,12 +221,24 @@ class RVCEngine:
                     is_half=False, n_mel_channels=128, sampling_rate=16000,
                     win_length=1024, hop_length=160, mel_fmin=30, mel_fmax=8000,
                 ).to("cuda" if _torch.cuda.is_available() else "cpu")
-                cache_dir = "/root/rvc-models/trt_cache"
+                profile = rp.get_active_profile()
+                if st.PROFILE_NAME != profile.name or tp.PROFILE_NAME != profile.name:
+                    raise RuntimeError(
+                        "RVC profile mismatch across worker modules: "
+                        f"worker={profile.name}, streaming={st.PROFILE_NAME}, "
+                        f"trt={tp.PROFILE_NAME}"
+                    )
+                onnx_dir = rp.profile_onnx_dir(profile)
+                cache_dir = rp.profile_trt_cache_dir(profile)
                 self._trt_cache_hot = bool(_glob.glob(f"{cache_dir}/*.engine"))
                 print(f"[TRT] engine cache {'HOT' if self._trt_cache_hot else 'COLD -- building now (slow first boot)'}")
+                print(
+                    f"[TRT] profile={profile.name} "
+                    f"canonical_in={profile.canonical_in} onnx_dir={onnx_dir}"
+                )
                 t0 = time.perf_counter()
                 self.trt_pipe = tp.TRTVoicePipeline(
-                    "/root/rvc-models/onnx", cache_dir, index, big_npy, mel,
+                    onnx_dir, cache_dir, index, big_npy, mel,
                 )
                 self.trt_pipe.warmup()
                 self.engine_kind = "trt"
@@ -234,6 +258,19 @@ class RVCEngine:
                 "No conversion engine available: TRT init failed/disabled AND base ONNX "
                 "artifacts are missing. Refusing to start (fail-closed, never raw)."
             )
+
+        if self.engine_kind == "trt":
+            active_model_path = os.path.join(
+                rp.profile_onnx_dir(rp.get_active_profile()),
+                "generator.onnx",
+            )
+        else:
+            active_model_path = rvc_path
+        self.model_version = rp.build_model_version(
+            active_model_path,
+            self.index_path,
+        )
+        print(f"[Model] version={self.model_version}")
 
         self.ready = True
         print("GPU Worker Ready")
@@ -479,29 +516,7 @@ def _save_debug_wavs(in_pcm16k: bytes, out_pcm48k: bytes) -> None:
     volume.commit()
 
 
-@app.function(
-    image=trt_image,   # includes ORT + TRT stack; required for USE_TRT to work at runtime
-    gpu="L4",
-    timeout=10800,
-    volumes={"/root/rvc-models": volume},
-    scaledown_window=120,   # keep container warm for 2 min between requests, then auto-shutdown
-    # Pin to Asia-Pacific so this GPU sits next to Render/Twilio in Singapore (Render moves
-    # there in Task 6), instead of Virginia (~13-19,000km / a full extra transpacific round
-    # trip per audio block on the persistent /ws stream). Narrow "ap-southeast" (Singapore)
-    # costs ~1.75x base GPU price vs ~1.5x for the broader "ap" — using the narrow pin here
-    # since this container talks to Render/Twilio in Singapore specifically, not elsewhere in APAC.
-    region="ap-southeast",
-    # _session_active (below) only enforces single-tenancy inside one already-running
-    # container — it does nothing to stop Modal's autoscaler from booting a second GPU
-    # container for a connection attempt that arrives while the first is still cold-starting
-    # (~75s) or mid-call. Cap at 1 so extra connection attempts queue against the single
-    # container instead of each paying for its own T4 GPU concurrently.
-    max_containers=1,
-    secrets=[modal.Secret.from_name("rvc-api-key")],
-    env={"USE_TRT": "1"},
-)
-@modal.asgi_app()
-def fastapi_app():
+def _build_web_app():
 
     @web_app.get("/health")
     def health():
@@ -516,6 +531,13 @@ def fastapi_app():
             "cuda_device": device_name,
             "rvc_device": "cuda" if torch.cuda.is_available() else "cpu",
             "engine": engine.engine_kind,
+            "model_version": engine.model_version,
+            "edge": os.getenv("RVC_EDGE_NAME", "unknown"),
+            "container_region": os.getenv("MODAL_REGION", "unknown"),
+            "profile": st.PROFILE_NAME,
+            "block_ms": st.BLOCK_MS,
+            "context_ms": st.CONTEXT_MS,
+            "sola_ms": st.PROFILE.sola_ms,
             "trt_cache": (
                 "hot" if getattr(engine, "_trt_cache_hot", False) else "cold"
             ) if engine.engine_kind == "trt" else "n/a",
@@ -614,7 +636,22 @@ def fastapi_app():
                 await ws.send_json({"type": "error", "message": "engine not ready"})
                 await ws.close()
                 return
-            await ws.send_json({"type": "ready"})
+            model_version = (
+                os.environ.get("RVC_MODEL_VERSION") or engine.model_version
+            )
+            sola_ms = st.SOLA_CROSSFADE_SAMPLES * 1000 // st.SAMPLE_RATE_OUT
+            profile_name = st.PROFILE_NAME
+            await ws.send_json({
+                "type": "ready",
+                "model_version": model_version,
+                "profile": profile_name,
+                "block_ms": st.BLOCK_MS,
+                "context_ms": st.CONTEXT_MS,
+                "sola_ms": sola_ms,
+                "sample_rate_in": st.SAMPLE_RATE_IN,
+                "sample_rate_out": st.SAMPLE_RATE_OUT,
+                "use_trt": engine.engine_kind == "trt",
+            })
 
             # ---- Per-session streaming state ----
             acc = st.BlockAccumulator()
@@ -653,7 +690,7 @@ def fastapi_app():
                     dbg_in.extend(payload)
                 acc.push(np.frombuffer(payload, dtype=np.int16))
 
-                # Drain every complete 1000 ms block currently buffered.
+                # Drain every complete profile-sized block currently buffered.
                 while True:
                     popped = acc.pop_block()
                     if popped is None:
@@ -679,7 +716,7 @@ def fastapi_app():
                                 engine._auto_detect_pitch, probe_wav
                             )
                         pitch_for_block = lock.shift if lock.enabled else session_pitch
-                        f0_sink = [] if (lock.enabled and not lock.locked) else None
+                        f0_sink = [] if lock.enabled else None
                         try:
                             t_wait_start = time.perf_counter()
                             async with _gpu_lock:  # single-tenant GPU
@@ -710,7 +747,7 @@ def fastapi_app():
                             await ws.send_json({"type": "error", "message": str(e)})
                             continue
 
-                        if f0_sink:
+                        if f0_sink is not None:
                             if lock.add_block(
                                 np.concatenate(f0_sink),
                                 block_seconds=len(block) / st.SAMPLE_RATE_IN,
@@ -741,8 +778,13 @@ def fastapi_app():
                             dbg_out.extend(emit_bytes)
                     stats_payload = {
                         "type": "stats",
+                        "model_version": model_version,
+                        "profile": profile_name,
                         "infer_ms": round(infer_ms, 2),
                         "block_ms": st.BLOCK_MS,
+                        "context_ms": st.CONTEXT_MS,
+                        "sola_ms": sola_ms,
+                        "use_trt": engine.engine_kind == "trt",
                         "lock_wait_ms": round(lock_wait_ms, 2),
                     }
                     if lock.locked:
@@ -770,6 +812,63 @@ def fastapi_app():
                     traceback.print_exc()
 
     return web_app
+
+
+def web_function_location(edge: str) -> dict:
+    """Return the immutable placement contract for a named RVC edge."""
+    locations = {
+        "legacy": {
+            "region": "ap-southeast",
+            "routing_region": None,
+            "edge_name": "legacy-us-east-route",
+        },
+        "ap": {
+            "region": "ap",
+            "routing_region": "ap-south",
+            "edge_name": "ap-south-route",
+        },
+    }
+    if edge not in locations:
+        raise ValueError(f"Unknown RVC web edge: {edge}")
+    return dict(locations[edge])
+
+
+def _web_function_options(edge: str) -> dict:
+    location = web_function_location(edge)
+    options = {
+        "image": trt_image,
+        "gpu": "L4",
+        "timeout": 10800,
+        "volumes": {"/root/rvc-models": volume},
+        "scaledown_window": 120,
+        "region": location["region"],
+        "max_containers": 2,
+        "secrets": [modal.Secret.from_name("rvc-api-key")],
+        "env": {
+            "USE_TRT": "1",
+            rp.PROFILE_ENV_VAR: st.PROFILE_NAME,
+            "RVC_EDGE_NAME": location["edge_name"],
+        },
+    }
+    if location["routing_region"] is not None:
+        options["routing_region"] = location["routing_region"]
+    return options
+
+
+# Keep the existing URL/function ID untouched as an immediate rollback path.
+@app.function(**_web_function_options("legacy"))
+@modal.asgi_app()
+def fastapi_app():
+    return _build_web_app()
+
+
+# New function name is required because Modal does not allow routing_region to
+# be changed on an already-deployed Function. Traffic reaches this edge through
+# Mumbai instead of Virginia, while broad AP placement improves L4 availability.
+@app.function(**_web_function_options("ap"))
+@modal.asgi_app()
+def fastapi_app_ap():
+    return _build_web_app()
 
 
 # ---- Local testing entrypoint (modal run) ----

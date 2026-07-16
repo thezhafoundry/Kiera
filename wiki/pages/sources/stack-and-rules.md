@@ -2,7 +2,7 @@
 title: .agents/context/stack-and-rules.md
 type: source
 sources: [../../../.agents/context/stack-and-rules.md]
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 [.agents/context/stack-and-rules.md](../../../.agents/context/stack-and-rules.md) —
@@ -11,9 +11,10 @@ tech stack inventory, hard invariants, and file map.
 ## Key claims
 - Stack: FastAPI backend on **Render** (service `Kiera`, `srv-d932m4cvikkc73belt1g`, now
   **Singapore** — colocated with Modal, verified live 2026-07-03); LiveKit Cloud (room + SIP)
-  + Twilio (Elastic SIP Trunk + PSTN number); RVC v2 on a serverless **Modal L4** GPU worker
-  (was T4 until 2026-07-03) pinned `region="ap-southeast"`, capped `max_containers=1`,
-  with an optional **TensorRT** path (`USE_TRT=1`) using 3 static-shape engines
+  + Twilio (Elastic SIP Trunk + PSTN number); RVC v2 on a **Modal L4/TensorRT** worker.
+  The stable edge pins `ap-southeast` compute; a separate AP-routed edge exists only for
+  benchmarking. Each edge caps at two containers with one active stream per container.
+  The TensorRT path uses 3 static-shape engines
   (HuBERT/generator/RMVPE) built on-gpu and cached to the `rvc-models` volume.
   Noise suppression via WebRTC (degrade to passthrough); vanilla HTML/ES6 frontend; RVC v2
   model trained externally via the vendored `RVC/` WebUI, weights uploaded to a Modal volume,
@@ -31,4 +32,7 @@ tech stack inventory, hard invariants, and file map.
 - File map updated 2026-07-07 with TRT-era `modal_deploy/` files: `modal_defs.py`,
   `trt_pipeline.py`, `export_onnx.py`, `compile_trt.py`, `test_trt_pipeline.py`.
 - Region mismatch — **resolved 2026-07-03**, Render confirmed colocated with Modal in
-  Singapore. See [[modal-render-region-mismatch]].
+  Singapore. The current input-routing experiment is tracked separately in
+  [[rvc-baseline-routing-and-duration]].
+- Product direction is RVC-first; LLVC deployment/training is paused and disabled for the
+  multi-client SaaS onboarding design.

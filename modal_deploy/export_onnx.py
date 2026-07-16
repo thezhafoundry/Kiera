@@ -17,30 +17,52 @@ try:
     from modal_deploy.modal_defs import trt_image, volume
 except ImportError:   # inside container
     from modal_defs import trt_image, volume
+try:
+    from modal_deploy.rvc_profiles import (
+        PROFILE_ENV_VAR,
+        SAMPLE_RATE_IN,
+        SAMPLE_RATE_OUT,
+        TRT_T_PAD,
+        get_active_profile,
+        profile_onnx_dir,
+    )
+except ImportError:  # inside container
+    from rvc_profiles import (
+        PROFILE_ENV_VAR,
+        SAMPLE_RATE_IN,
+        SAMPLE_RATE_OUT,
+        TRT_T_PAD,
+        get_active_profile,
+        profile_onnx_dir,
+    )
 
 app = modal.App("rvc-onnx-export")
 
-# ---- Canonical static shapes (single source of truth; trt_pipeline.py mirrors these) ----
-# TRT Phase 2 (2026-07-07): BLOCK_MS 1000→320, CANONICAL_IN 22400→11520.
-# TRT_T_PAD stays at 16000 (x_pad=1 = 1s reflect pad, RVC convention, independent of block size).
-SR_IN = 16000
-CANONICAL_IN = 11520          # 720 ms: BLOCK_MS=320 + CONTEXT_MS=400  (was 22400)
-TRT_T_PAD = 16000             # fixed reflect pad each side (x_pad=1 equivalent, unchanged)
-PADDED_IN = CANONICAL_IN + 2 * TRT_T_PAD   # 43520  (was 54400)
-HUBERT_FRAMES = 135           # 135 (HuBERT convolutional boundary reduces 43520 // 320 = 136 to 135)
-GEN_FRAMES = HUBERT_FRAMES * 2             # 270 (post 2x interpolation)  (was 338)
-SR_OUT = 48000
-OUT_PADDED_48K = GEN_FRAMES * 480          # 129600  (was 162240)
-T_PAD_TGT = TRT_T_PAD * 3                  # 48000   (unchanged)
-OUT_48K = OUT_PADDED_48K - 2 * T_PAD_TGT   # 33600   (was 66240)
+# ---- Canonical static shapes (shared with trt_pipeline.py) ----
+PROFILE = get_active_profile()
+PROFILE_NAME = PROFILE.name
+SR_IN = SAMPLE_RATE_IN
+SR_OUT = SAMPLE_RATE_OUT
+CANONICAL_IN = PROFILE.canonical_in
+PADDED_IN = PROFILE.padded_in
+HUBERT_FRAMES = PROFILE.hubert_frames
+GEN_FRAMES = PROFILE.generator_frames
+OUT_PADDED_48K = GEN_FRAMES * 480
+T_PAD_TGT = TRT_T_PAD * 3
+OUT_48K = OUT_PADDED_48K - 2 * T_PAD_TGT
+MEL_FRAMES = PROFILE.mel_frames
+MEL_FRAMES_PADDED = PROFILE.mel_frames_padded
 
-# RMVPE mel geometry for PADDED_IN samples: hop 160, center=True -> 273 frames,
-# then RMVPE.mel2hidden zero-pads frame count to a multiple of 32 -> 288.
-MEL_FRAMES = PADDED_IN // 160 + 1          # 273   (was 341)
-MEL_FRAMES_PADDED = ((MEL_FRAMES + 31) // 32) * 32   # 288   (was 352)
-
-ONNX_DIR = "/root/rvc-models/onnx"
+ONNX_DIR = profile_onnx_dir(PROFILE)
+FALLBACK_ONNX_DIR = "/root/rvc-models/onnx"
 OPSET = 17
+
+
+def _log_profile() -> None:
+    print(
+        f"[Export] RVC profile={PROFILE_NAME} "
+        f"canonical_in={CANONICAL_IN} onnx_dir={ONNX_DIR}"
+    )
 
 
 def _setup_rvc_path():
@@ -54,6 +76,7 @@ def _setup_rvc_path():
 
 
 @app.function(image=trt_image, gpu="L4", timeout=1800,
+              env={PROFILE_ENV_VAR: PROFILE_NAME},
               volumes={"/root/rvc-models": volume}, region="ap-southeast")
 def export_hubert():
     """Export HuBERT (hubert_base.pt) as a static-shape ONNX for Engine 1.
@@ -67,6 +90,7 @@ def export_hubert():
     import torch
     import onnxruntime as ort
     _setup_rvc_path()
+    _log_profile()
 
     # Monkeypatch fairseq's pad_to_multiple to be JIT tracing compatible.
     # The default fairseq code checks 'if m.is_integer():' where m is a Tensor during tracing,
@@ -151,6 +175,7 @@ def export_hubert():
 
 
 @app.function(image=trt_image, gpu="L4", timeout=1800,
+              env={PROFILE_ENV_VAR: PROFILE_NAME},
               volumes={"/root/rvc-models": volume}, region="ap-southeast")
 def export_generator():
     """Export the RVC SynthesizerTrnMs768NSFsid generator as static-shape ONNX (Engine 2)."""
@@ -159,6 +184,7 @@ def export_generator():
     import torch
     import onnxruntime as ort
     _setup_rvc_path()
+    _log_profile()
     from infer.lib.infer_pack.models_onnx import SynthesizerTrnMsNSFsidM
 
     cpt = torch.load("/root/rvc-models/weights/mi-test.pth", map_location="cpu")
@@ -228,6 +254,7 @@ def export_generator():
 
 
 @app.function(image=trt_image, gpu="L4", timeout=1800,
+              env={PROFILE_ENV_VAR: PROFILE_NAME},
               volumes={"/root/rvc-models": volume}, region="ap-southeast")
 def export_rmvpe():
     """Export the RMVPE E2E neural net as static-shape ONNX (Engine 3)."""
@@ -236,6 +263,7 @@ def export_rmvpe():
     import torch
     import onnxruntime as ort
     _setup_rvc_path()
+    _log_profile()
     from infer.lib.rmvpe import RMVPE
 
     # Check both locations (container assets dir + volume upload location)
@@ -275,6 +303,7 @@ def export_rmvpe():
 
 
 @app.function(image=trt_image, gpu="L4", timeout=3600,
+              env={PROFILE_ENV_VAR: PROFILE_NAME},
               volumes={"/root/rvc-models": volume}, region="ap-southeast")
 def export_all():
     """Export all three TRT-targeted ONNX models plus the dynamic fallback pair."""
@@ -297,6 +326,7 @@ def main():
 # path accept variable block sizes without a recompile.
 
 @app.function(image=trt_image, gpu="L4", timeout=1800,
+              env={PROFILE_ENV_VAR: PROFILE_NAME},
               volumes={"/root/rvc-models": volume}, region="ap-southeast")
 def export_fallback():
     """Download the ContentVec ONNX (pinned HF revision) and export mi-test.onnx
@@ -309,14 +339,14 @@ def export_fallback():
     _setup_rvc_path()
     from infer.lib.infer_pack.models_onnx import SynthesizerTrnMsNSFsidM
 
-    os.makedirs(ONNX_DIR, exist_ok=True)
+    os.makedirs(FALLBACK_ONNX_DIR, exist_ok=True)
 
     # -- 1. ContentVec ONNX (community model, pinned to a specific HF commit) --
     # NOTE: Pin this to a specific commit SHA for reproducibility, e.g.:
     #   .../resolve/a6b64b2ef76a7136a1c0ccc90645e7fa0fded7a4/vec-768-layer-12.onnx
     # Using /resolve/main/ is acceptable for initial setup but should be pinned
     # once the SHA is confirmed stable in your environment.
-    contentvec_path = f"{ONNX_DIR}/vec-768-layer-12.onnx"
+    contentvec_path = f"{FALLBACK_ONNX_DIR}/vec-768-layer-12.onnx"
     if not os.path.exists(contentvec_path):
         print("[Fallback] Downloading vec-768-layer-12.onnx from HuggingFace...")
         url = ("https://huggingface.co/NaruseMioShirakana/MoeSS-SUBModel"
@@ -328,7 +358,7 @@ def export_fallback():
 
     # -- 2. mi-test.onnx: dynamic-axis export reusing the same checkpoint/config --
     model_pth = "/root/rvc-models/weights/mi-test.pth"
-    out_path = f"{ONNX_DIR}/mi-test.onnx"
+    out_path = f"{FALLBACK_ONNX_DIR}/mi-test.onnx"
 
     cpt = torch.load(model_pth, map_location="cpu")
     cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]  # n_spk fixup

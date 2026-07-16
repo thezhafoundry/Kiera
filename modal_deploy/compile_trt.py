@@ -15,11 +15,28 @@ try:
     from modal_deploy.modal_defs import trt_image, volume
 except ImportError:   # inside container
     from modal_defs import trt_image, volume
+try:
+    from modal_deploy.rvc_profiles import (
+        PROFILE_ENV_VAR,
+        get_active_profile,
+        profile_onnx_dir,
+        profile_trt_cache_dir,
+    )
+except ImportError:  # inside container
+    from rvc_profiles import (
+        PROFILE_ENV_VAR,
+        get_active_profile,
+        profile_onnx_dir,
+        profile_trt_cache_dir,
+    )
 
 app = modal.App("rvc-trt-tools")
+PROFILE = get_active_profile()
+PROFILE_NAME = PROFILE.name
 
 
 @app.function(image=trt_image, gpu="L4", timeout=600,
+              env={PROFILE_ENV_VAR: PROFILE_NAME},
               volumes={"/root/rvc-models": volume}, region="ap-southeast")
 def probe() -> dict:
     """Task 1: verify TRT EP is available and locate library files."""
@@ -69,6 +86,7 @@ def probe() -> dict:
 
 
 @app.function(image=trt_image, gpu="L4", timeout=3600,
+              env={PROFILE_ENV_VAR: PROFILE_NAME},
               volumes={"/root/rvc-models": volume}, region="ap-southeast")
 def build_engines():
     """Task 7: Build/refresh the TRT engine caches and time warm-block throughput.
@@ -105,8 +123,20 @@ def build_engines():
                          win_length=1024, hop_length=160, mel_fmin=30,
                          mel_fmax=8000).to("cuda" if torch.cuda.is_available() else "cpu")
 
-    cache_dir = "/root/rvc-models/trt_cache"
+    onnx_dir = profile_onnx_dir(PROFILE)
+    cache_dir = profile_trt_cache_dir(PROFILE)
     os.makedirs(cache_dir, exist_ok=True)
+    print(
+        f"[TRT] RVC profile={PROFILE_NAME} "
+        f"canonical_in={tp.CANONICAL_IN} onnx_dir={onnx_dir} "
+        f"cache_dir={cache_dir}"
+    )
+    if tp.PROFILE_NAME != PROFILE_NAME or tp.CANONICAL_IN != PROFILE.canonical_in:
+        raise RuntimeError(
+            "RVC profile mismatch between compile_trt and trt_pipeline: "
+            f"tool={PROFILE_NAME}/{PROFILE.canonical_in}, "
+            f"pipeline={tp.PROFILE_NAME}/{tp.CANONICAL_IN}"
+        )
 
     # Purge stale engine files before building. TRT caches are keyed by ONNX
     # filename (not content hash), so a shape change (e.g. CANONICAL_IN change)
@@ -125,7 +155,7 @@ def build_engines():
 
     print(f"[TRT] Building TRT engine caches at {cache_dir}...")
     t0 = time.perf_counter()
-    pipe = tp.TRTVoicePipeline("/root/rvc-models/onnx", cache_dir, index, big_npy, mel)
+    pipe = tp.TRTVoicePipeline(onnx_dir, cache_dir, index, big_npy, mel)
     pipe.warmup()
     print(f"[TRT] engine build+warmup: {time.perf_counter()-t0:.1f}s")
 

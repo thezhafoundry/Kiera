@@ -88,6 +88,10 @@
                     <option value="male" selected>Male input voice</option>
                     <option value="female">Female input voice</option>
                 </select>
+                <label for="voice-engine" class="description" style="margin-top: 10px; display: block;">Voice Conversion Engine</label>
+                <select id="voice-engine" aria-label="Voice Conversion Engine">
+                    <option value="rvc" selected>RVC — Stable Default</option>
+                </select>
                 <div id="dial-error" class="dial-error" style="display: none;"></div>
             </div>
 
@@ -132,6 +136,53 @@
                         <div class="latency-footer">
                             <span id="latency-text-detail">Denoising + RVC Serverless GPU</span>
                             <span class="failsafe-badge" id="failsafe-active-badge" style="display: none;">FAILSAFE</span>
+                        </div>
+                    </div>
+
+                    <!-- Telemetry Panel -->
+                    <div class="telemetry-panel" id="telemetry-panel" style="margin-top: 15px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 12px; font-size: 0.85rem; color: #e4e6eb;">
+                        <h4 style="margin: 0 0 10px 0; font-size: 0.9rem; font-weight: 600; color: #fff; display: flex; justify-content: space-between; align-items: center;">
+                            <span>Engine Telemetry</span>
+                            <span id="effective-engine-badge" style="background: rgba(46, 204, 113, 0.2); color: #2ecc71; border: 1px solid rgba(46, 204, 113, 0.3); border-radius: 4px; padding: 2px 6px; font-size: 0.75rem; font-weight: bold; text-transform: uppercase;">RVC</span>
+                        </h4>
+                        <div class="telemetry-grid" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;">
+                            <div>
+                                <span style="opacity: 0.6; display: block; font-size: 0.75rem;">Requested Engine</span>
+                                <span id="telemetry-requested" style="font-weight: 500;">RVC</span>
+                            </div>
+                            <div>
+                                <span style="opacity: 0.6; display: block; font-size: 0.75rem;">Fallback Reason</span>
+                                <span id="telemetry-fallback-reason" style="color: #e74c3c; font-weight: 500;">None</span>
+                            </div>
+                            <div>
+                                <span style="opacity: 0.6; display: block; font-size: 0.75rem;">Ingress Queue</span>
+                                <span id="telemetry-ingress-queue">-- ms</span>
+                            </div>
+                            <div>
+                                <span style="opacity: 0.6; display: block; font-size: 0.75rem;">Converter Wait</span>
+                                <span id="telemetry-converter-wait">-- ms</span>
+                            </div>
+                            <div>
+                                <span style="opacity: 0.6; display: block; font-size: 0.75rem;">Network RTT</span>
+                                <span id="telemetry-network-rtt">-- ms</span>
+                            </div>
+                            <div>
+                                <span style="opacity: 0.6; display: block; font-size: 0.75rem;">Playout Buffer</span>
+                                <span id="telemetry-playout-buffer">-- ms</span>
+                            </div>
+                            <div>
+                                <span style="opacity: 0.6; display: block; font-size: 0.75rem;">Processing Time</span>
+                                <span id="telemetry-processing-time">-- ms</span>
+                            </div>
+                            <div>
+                                <span style="opacity: 0.6; display: block; font-size: 0.75rem;">Mouth-to-Ear (est)</span>
+                                <span id="telemetry-mouth-to-ear" style="color: #3498db; font-weight: bold;">-- ms</span>
+                            </div>
+                        </div>
+                        <div class="telemetry-drops" style="margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.05); font-size: 0.75rem; display: flex; justify-content: space-between; opacity: 0.8;">
+                            <span>Dropped In: <strong id="drops-input" style="color: #e67e22;">0</strong></span>
+                            <span>Reconn: <strong id="drops-reconnect" style="color: #e67e22;">0</strong></span>
+                            <span>Playout: <strong id="drops-playout" style="color: #e67e22;">0</strong></span>
                         </div>
                     </div>
                 </div>

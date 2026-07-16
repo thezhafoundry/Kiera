@@ -25,19 +25,24 @@ def test_prior_until_locked():
     print("prior-until-locked: SUCCESS")
 
 
-def test_locks_on_median_and_freezes():
-    print("\n--- PitchLock: locks 12*log2(target/median) once >=2s voiced, then freezes ---")
+def test_locks_on_median_interpolates_then_freezes():
+    print("\n--- PitchLock: locks, interpolates for 1s, then freezes ---")
     lock = PitchLock(prior_shift=7.0, target_f0=208.0)
     lock.add_block(_voiced_block(152.4), block_seconds=1.0)
     locked = lock.add_block(_voiced_block(152.4), block_seconds=1.0)
     assert locked and lock.locked
     # 12*log2(208/152.4) = +5.39 st (the 2026-07-13 call-2 numbers)
-    assert abs(lock.shift - 5.39) < 0.05, f"expected ~+5.39, got {lock.shift}"
+    # The lock must not create an abrupt pitch jump: transition starts at prior.
+    assert lock.shift == 7.0
     assert abs(lock.locked_median_f0 - 152.4) < 1e-6
-    # After lock: new (different) F0 must never move the shift again
+    lock.add_block(_voiced_block(300.0), block_seconds=0.5)
+    assert abs(lock.shift - ((7.0 + 5.39) / 2.0)) < 0.05
+    lock.add_block(_voiced_block(300.0), block_seconds=0.5)
+    assert abs(lock.shift - 5.39) < 0.05
+    # After transition: new (different) F0 must never move the shift again.
     lock.add_block(_voiced_block(300.0), block_seconds=5.0)
     assert abs(lock.shift - 5.39) < 0.05
-    print("median lock + freeze: SUCCESS")
+    print("median lock + interpolation + freeze: SUCCESS")
 
 
 def test_unvoiced_and_implausible_excluded():
@@ -58,7 +63,9 @@ def test_clamp():
     print("\n--- PitchLock: computed shift clamps to +/-12 st ---")
     lock = PitchLock(prior_shift=0.0, target_f0=208.0, min_voiced_seconds=0.5)
     lock.add_block(_voiced_block(60.0), block_seconds=1.0)  # 12*log2(208/60)=+21.5 -> clamp
-    assert lock.locked and lock.shift == MAX_ABS_SHIFT_SEMITONES
+    assert lock.locked and lock.shift == 0.0
+    lock.add_block(_voiced_block(60.0), block_seconds=1.0)
+    assert lock.shift == MAX_ABS_SHIFT_SEMITONES
     print("clamp: SUCCESS")
 
 
@@ -77,6 +84,8 @@ def test_invalid_target_f0_falls_back_to_default():
     locked = lock.add_block(_voiced_block(152.4), block_seconds=2.0)
     assert locked and lock.locked and math.isfinite(lock.shift)
     # Same math as test_locks_on_median_and_freezes, since target_f0 fell back to 208.
+    assert lock.shift == 7.0
+    lock.add_block(_voiced_block(152.4), block_seconds=1.0)
     assert abs(lock.shift - 5.39) < 0.05, f"expected ~+5.39, got {lock.shift}"
     print("invalid target_f0 fallback: SUCCESS")
 
@@ -84,7 +93,7 @@ def test_invalid_target_f0_falls_back_to_default():
 def main():
     print("Running modal_deploy/pitch_lock.py verification tests...")
     test_prior_until_locked()
-    test_locks_on_median_and_freezes()
+    test_locks_on_median_interpolates_then_freezes()
     test_unvoiced_and_implausible_excluded()
     test_clamp()
     test_disabled_is_inert()
