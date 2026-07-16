@@ -314,6 +314,84 @@ async def test_rvc_streaming_converter_basic():
     print("RVCStreamingConverter basic (handshake/echo/close) test: SUCCESS")
 
 
+async def test_rvc_ready_metadata_drives_dynamic_block_timing():
+    print("\n--- Testing RVC ready metadata + dynamic block timing ---")
+
+    async def profile_handler(websocket):
+        try:
+            await websocket.recv()
+            await websocket.send(json.dumps({
+                "type": "ready",
+                "model_version": "rvc-test-v1",
+                "profile": "candidate_b",
+                "block_ms": 160,
+                "context_ms": 240,
+                "sola_ms": 40,
+                "sample_rate_in": 16000,
+                "sample_rate_out": 48000,
+                "use_trt": True,
+            }))
+            received_bytes = 0
+            sequence_id = 0
+            async for message in websocket:
+                if not isinstance(message, (bytes, bytearray)):
+                    continue
+                received_bytes += len(message)
+                while received_bytes >= 5120:  # 160 ms of 16 kHz PCM16
+                    received_bytes -= 5120
+                    sequence_id += 1
+                    await websocket.send(json.dumps({
+                        "type": "stats",
+                        "sequence_id": sequence_id,
+                        "infer_ms": 20.0,
+                        "block_ms": 160,
+                        "total_ms": 20.0,
+                    }))
+        except ConnectionClosed:
+            pass
+
+    async with websockets.serve(profile_handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        converter = RVCStreamingConverter(ws_url=f"ws://127.0.0.1:{port}/ws")
+        stats_rows = []
+        converter.on_stats = stats_rows.append
+        in_gen, in_queue = _make_fed_input()
+
+        async def collect():
+            async for _ in converter.convert_stream(in_gen):
+                pass
+
+        collect_task = asyncio.create_task(collect())
+        for value in range(32):
+            in_queue.put_nowait(_make_frame(value + 1))
+            await asyncio.sleep(0.01)
+
+        deadline = time.monotonic() + 5.0
+        while len(stats_rows) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        assert converter.model_version == "rvc-test-v1"
+        assert converter.profile == "candidate_b"
+        assert converter.block_ms == 160
+        assert converter.context_ms == 240
+        assert converter.sola_ms == 40
+        assert converter.sample_rate_in == 16000
+        assert converter.sample_rate_out == 48000
+        assert converter.use_trt is True
+        assert len(stats_rows) == 2
+        assert all(row.get("converter_wait_ms", 0) > 0 for row in stats_rows)
+        assert all("network_rtt_ms" in row for row in stats_rows)
+        assert all(row["network_rtt_ms"] < 50 for row in stats_rows), (
+            "block accumulation must not be mislabeled as network RTT"
+        )
+
+        await converter.close()
+        await asyncio.wait_for(collect_task, timeout=5.0)
+        await in_gen.aclose()
+
+    print("RVC ready metadata + dynamic block timing test: SUCCESS")
+
+
 async def test_rvc_streaming_converter_reconnect():
     print("\n--- Testing RVCStreamingConverter reconnect-with-backoff (never-raw during outage) ---")
 
@@ -664,6 +742,7 @@ async def test_worker_readiness_probe_dedup():
 
         def __init__(self):
             self.call_count = 0
+            self.model_version = "rvc-ready-runtime-v1"
 
         async def wait_ready(self, timeout):
             self.call_count += 1
@@ -691,6 +770,9 @@ async def test_worker_readiness_probe_dedup():
         f"background probe and the blocking waiter, got {converter.call_count}"
     )
     assert worker.is_ready is True, "is_ready should reflect the shared probe's result"
+    assert worker.model_version == "rvc-ready-runtime-v1", (
+        "the warm handshake's effective model version should replace the configured prior"
+    )
     print(f"wait_ready() probe calls for background+outbound paths: {converter.call_count} (expected 1) OK")
 
     # A worker with no background probe started (defensive/edge case, "shouldn't
@@ -1149,6 +1231,8 @@ async def test_worker_telemetry_publish():
     # Trigger stats message and verify stats updates the values
     worker._playout_buffer = bytearray(b"\x00" * 960) # 10 ms at 48kHz mono 16-bit
     worker._on_converter_stats({
+        "model_version": "rvc-runtime-v2",
+        "profile": "baseline",
         "infer_ms": 35.0,
         "block_ms": 320,
         "converter_wait_ms": 50.0,
@@ -1170,6 +1254,13 @@ async def test_worker_telemetry_publish():
     assert payload["network_rtt_ms"] == 15.0
     assert payload["inference_ms"] == 35.0
     assert payload["playout_buffer_latency_ms"] == 10.0
+    assert payload["model_version"] == "rvc-runtime-v2"
+
+    summary_row = worker._call_block_stats[-1]
+    assert summary_row["profile"] == "baseline"
+    assert summary_row["playout_buffer_latency_ms"] == 10.0
+    assert summary_row["processing_latency_ms"] == 45.0
+    assert summary_row["estimated_mouth_to_ear_ms"] == 60.0
     
     print("VoiceConversionWorker Telemetry & Shared Contracts: SUCCESS")
 
@@ -1455,6 +1546,7 @@ async def main():
     await test_rvc_converter_mocked()
     await test_rvc_converter_empty_response()
     await test_rvc_streaming_converter_basic()
+    await test_rvc_ready_metadata_drives_dynamic_block_timing()
     await test_rvc_streaming_converter_reconnect()
     await test_rvc_streaming_converter_buffer_cap_drop_oldest()
     await test_rvc_streaming_adaptive_config_and_locked_pitch_resume()

@@ -360,7 +360,14 @@ class VoiceConversionWorker:
         wait_ready = getattr(self.converter, "wait_ready", None)
         if wait_ready is None:
             return True
-        return await wait_ready(timeout)
+        ready = await wait_ready(timeout)
+        if ready:
+            runtime_model_version = getattr(
+                self.converter, "model_version", None
+            )
+            if runtime_model_version:
+                self.model_version = str(runtime_model_version)
+        return ready
 
     async def wait_for_readiness_probe(self, fallback_timeout: float = 150.0) -> bool:
         """Blocking readiness check that reuses the single background probe
@@ -442,6 +449,10 @@ class VoiceConversionWorker:
         task is driving the converter's receive loop) whenever the backend reports
         timing for a processed block. This is the latency source of truth for
         converters that support it (RVCStreamingConverter)."""
+        runtime_model_version = stats.get("model_version")
+        if runtime_model_version:
+            self.model_version = str(runtime_model_version)
+
         infer_ms = stats.get("infer_ms") or 0.0
         block_ms = stats.get("block_ms") or 0.0
         self._latest_latency_ms = float(infer_ms) + float(block_ms)
@@ -474,6 +485,9 @@ class VoiceConversionWorker:
         self._call_block_stats.append({
             **stats,
             "playout_buffer_bytes": len(playout_buffer) if playout_buffer is not None else None,
+            "playout_buffer_latency_ms": playout_buffer_latency_ms,
+            "processing_latency_ms": self._current_processing_latency_ms,
+            "estimated_mouth_to_ear_ms": self._current_mouth_to_ear_ms,
         })
 
     def _log_call_latency_summary(self):
@@ -503,7 +517,9 @@ class VoiceConversionWorker:
         numeric_fields = [
             "infer_ms", "block_ms", "lock_wait_ms", "hubert_ms", "index_ms",
             "rmvpe_ms", "generator_ms", "postproc_ms", "total_ms",
-            "playout_buffer_bytes",
+            "converter_wait_ms", "network_rtt_ms", "playout_buffer_bytes",
+            "playout_buffer_latency_ms", "processing_latency_ms",
+            "estimated_mouth_to_ear_ms",
         ]
         for field in numeric_fields:
             values = [row[field] for row in stats if isinstance(row.get(field), (int, float))]

@@ -109,8 +109,17 @@ class RVCStreamingConverter(VoiceConverter):
         self.output_drop_count = 0
         self.connection_failure_count = 0
         self.model_version = model_version or "unknown"
+        self.profile = "unknown"
+        self.block_ms = 320
+        self.context_ms = 400
+        self.sola_ms = 80
+        self.sample_rate_in = 16000
+        self.sample_rate_out = 48000
+        self.use_trt = False
+        self._block_size_bytes = self.sample_rate_in * 2 * self.block_ms // 1000
         self._block_sent_timestamps = deque()
         self._sent_bytes_count = 0
+        self._block_started_at: Optional[float] = None
         self._stats_sequence = 0
 
         # Optional callback: on_stats(dict) — called with the server's raw
@@ -166,6 +175,33 @@ class RVCStreamingConverter(VoiceConverter):
             kwargs["additional_headers"] = {"Authorization": f"Bearer {self.api_key}"}
         return kwargs
 
+    def _apply_ready_metadata(self, data: dict) -> None:
+        """Apply effective server geometry from a readiness handshake."""
+        self.model_version = str(data.get("model_version") or self.model_version)
+        self.profile = str(data.get("profile") or self.profile)
+
+        for key in (
+            "block_ms",
+            "context_ms",
+            "sola_ms",
+            "sample_rate_in",
+            "sample_rate_out",
+        ):
+            try:
+                value = int(data.get(key, getattr(self, key)))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                setattr(self, key, value)
+
+        if isinstance(data.get("use_trt"), bool):
+            self.use_trt = data["use_trt"]
+
+        self._block_size_bytes = self.sample_rate_in * 2 * self.block_ms // 1000
+        self._sent_bytes_count = 0
+        self._block_started_at = None
+        self._block_sent_timestamps.clear()
+
     # ------------------------------------------------------------------
     # Warm-gate probe (Task 4): a short-lived connection that just confirms
     # the server can hand back {"type":"ready"} within `timeout`.
@@ -182,9 +218,7 @@ class RVCStreamingConverter(VoiceConverter):
                         data = json.loads(reply)
                         msg_type = data.get("type")
                         if msg_type == "ready":
-                            self.model_version = str(
-                                data.get("model_version") or self.model_version
-                            )
+                            self._apply_ready_metadata(data)
                             return True
                         if msg_type in ("busy", "error"):
                             return False
@@ -205,6 +239,7 @@ class RVCStreamingConverter(VoiceConverter):
         self._closed = False
         self._out_queue = asyncio.Queue(maxsize=self.output_queue_max_chunks)
         self._sent_bytes_count = 0
+        self._block_started_at = None
         self._block_sent_timestamps = deque()
         self._stats_sequence = 0
         self.drop_count = 0
@@ -389,10 +424,8 @@ class RVCStreamingConverter(VoiceConverter):
                             raise WebSocketException(f"unexpected handshake reply: {data}")
 
                         backoff = _BACKOFF_INITIAL_S  # reset after a successful handshake
+                        self._apply_ready_metadata(data)
                         self._is_healthy = True
-                        self.model_version = str(
-                            data.get("model_version") or self.model_version
-                        )
 
                         writer_task = asyncio.create_task(self._writer_loop(ws))
                         try:
@@ -460,11 +493,18 @@ class RVCStreamingConverter(VoiceConverter):
                 continue
             try:
                 await ws.send(buffered.payload)
+                sent_at = time.monotonic()
+                if self._sent_bytes_count == 0:
+                    self._block_started_at = sent_at
                 self._sent_bytes_count += len(buffered.payload)
-                bytes_per_block = int(16000 * 2 * 0.32) # 320ms block = 10240 bytes
-                if self._sent_bytes_count >= bytes_per_block:
-                    self._block_sent_timestamps.append(time.monotonic())
-                    self._sent_bytes_count -= bytes_per_block
+                while self._sent_bytes_count >= self._block_size_bytes:
+                    self._block_sent_timestamps.append(
+                        self._block_started_at or sent_at
+                    )
+                    self._sent_bytes_count -= self._block_size_bytes
+                    self._block_started_at = (
+                        sent_at if self._sent_bytes_count else None
+                    )
             except asyncio.CancelledError:
                 await self._requeue_input(buffered)
                 raise
@@ -491,9 +531,18 @@ class RVCStreamingConverter(VoiceConverter):
         msg_type = data.get("type")
         if msg_type == "stats":
             self._apply_stats_sequence(data)
-            if data.get("model_version"):
-                self.model_version = str(data["model_version"])
-            data.setdefault("model_version", self.model_version)
+            self.model_version = str(
+                data.get("model_version") or self.model_version
+            )
+            self.profile = str(data.get("profile") or self.profile)
+            data["model_version"] = self.model_version
+            data["profile"] = self.profile
+            data.setdefault("block_ms", self.block_ms)
+            data.setdefault("context_ms", self.context_ms)
+            data.setdefault("sola_ms", self.sola_ms)
+            data.setdefault("sample_rate_in", self.sample_rate_in)
+            data.setdefault("sample_rate_out", self.sample_rate_out)
+            data.setdefault("use_trt", self.use_trt)
             locked = data.get("locked_pitch")
             if locked is not None and self.adaptive_pitch:
                 # Adopt the server's per-call locked shift so any WS reconnect
@@ -518,7 +567,14 @@ class RVCStreamingConverter(VoiceConverter):
                 rtt_and_wait = (time.monotonic() - send_time) * 1000.0
                 data["converter_wait_ms"] = rtt_and_wait
                 infer_ms = data.get("total_ms") or data.get("infer_ms") or 0.0
-                data["network_rtt_ms"] = max(0.0, rtt_and_wait - infer_ms)
+                block_ms = data.get("block_ms") or self.block_ms
+                # This is an estimate: first-frame-to-stats includes block
+                # accumulation, inference, and network travel. Remove the
+                # known server-side portions so they are not mislabeled RTT.
+                data["network_rtt_ms"] = max(
+                    0.0,
+                    rtt_and_wait - float(block_ms) - float(infer_ms),
+                )
             if self.on_stats is not None:
                 try:
                     self.on_stats({k: v for k, v in data.items() if k != "type"})

@@ -614,7 +614,25 @@ def fastapi_app():
                 await ws.send_json({"type": "error", "message": "engine not ready"})
                 await ws.close()
                 return
-            await ws.send_json({"type": "ready"})
+            model_version = os.environ.get("RVC_MODEL_VERSION", "unknown")
+            sola_ms = st.SOLA_CROSSFADE_SAMPLES * 1000 // st.SAMPLE_RATE_OUT
+            geometry = (st.BLOCK_MS, st.CONTEXT_MS, sola_ms)
+            profile_name = (
+                "baseline"
+                if geometry == (320, 400, 80)
+                else f"custom-{geometry[0]}-{geometry[1]}-{geometry[2]}"
+            )
+            await ws.send_json({
+                "type": "ready",
+                "model_version": model_version,
+                "profile": profile_name,
+                "block_ms": st.BLOCK_MS,
+                "context_ms": st.CONTEXT_MS,
+                "sola_ms": sola_ms,
+                "sample_rate_in": st.SAMPLE_RATE_IN,
+                "sample_rate_out": st.SAMPLE_RATE_OUT,
+                "use_trt": engine.engine_kind == "trt",
+            })
 
             # ---- Per-session streaming state ----
             acc = st.BlockAccumulator()
@@ -741,8 +759,13 @@ def fastapi_app():
                             dbg_out.extend(emit_bytes)
                     stats_payload = {
                         "type": "stats",
+                        "model_version": model_version,
+                        "profile": profile_name,
                         "infer_ms": round(infer_ms, 2),
                         "block_ms": st.BLOCK_MS,
+                        "context_ms": st.CONTEXT_MS,
+                        "sola_ms": sola_ms,
+                        "use_trt": engine.engine_kind == "trt",
                         "lock_wait_ms": round(lock_wait_ms, 2),
                     }
                     if lock.locked:
