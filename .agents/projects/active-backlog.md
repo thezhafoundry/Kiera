@@ -3,6 +3,8 @@
 ## Backlog
 | Task | Priority | Status |
 |---|---|---|
+| **RVC-first Gate R1**: make the Modal `ready` payload report model/profile/TRT geometry, remove the client's hardcoded 320 ms latency accounting, then capture one warm staff-PSTN baseline before changing block sizes. | P0 | Plan written 2026-07-16; local implementation pending credential rotation for live verification |
+| **Pause LLVC training/deployment**: retain the verified streaming/safety tooling, keep `LLVC_PILOT_ENABLED=false`, and do not generate a 360-hour teacher corpus. Reassess zero-shot streaming VC only after RVC optimization. | P0 | Decision recorded 2026-07-16 |
 | **Rotate the exposed Render MCP bearer token.** A live Authorization header was committed in tracked `.mcp.json` and is present in git history. Stripped from the working tree, but stripping the file does not revoke the credential. Revoke/rotate it in Render and decide whether shared history needs scrubbing. | P0 | Open, identified 2026-07-15 |
 | **Secure the control plane**: set `KEIRA_CONTROL_TOKEN` on Render, require bearer auth for operator routes, validate Twilio signatures, and keep `CORS_ORIGINS` restricted. | P0 | Implemented locally; deployment/configuration pending |
 | **Authenticate the Modal worker**: create the `rvc-api-key` Modal secret and redeploy the worker so `/convert` and `/ws` enforce `RVC_API_KEY`. | P0 | Implemented locally; secret/deploy pending |

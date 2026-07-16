@@ -22,6 +22,17 @@ whether it's a regression of something already tried and reverted here before re
 a fix from scratch.
 
 ## Decisions
+- **RVC-first SaaS pivot; LLVC training paused (2026-07-16).** The product requirement is
+  multi-tenant: each client supplies an authorized target voice and should reach a usable
+  preview without training a new large model. That invalidates LLVC as the default product
+  engine because the current LLVC recipe distills a separate target-specific student for
+  every voice. Preserve the completed LLVC protocol/safety/benchmark work, keep
+  `LLVC_PILOT_ENABLED=false`, and do not generate the 360-hour corpus or deploy a real LLVC
+  service. First make the existing RVC path's profile telemetry truthful, measure a warm
+  staff PSTN baseline, and test only the 160/240/40/160 ms Candidate B geometry against
+  shared quality gates. Revisit a streaming zero-shot engine only after the RVC baseline is
+  stable; LLVC remains a possible future per-tenant compilation optimization for unusually
+  high-volume fixed voices, not the SaaS onboarding path.
 - **Adaptive per-call pitch lock replaces the fixed `RVC_MALE_PITCH_SHIFT` constant
   (2026-07-13/14, spec `docs/superpowers/specs/2026-07-13-adaptive-pitch-shift-design.md`,
   merged `88b3736`).** Why: the fixed shift (`+7`, calibrated 2026-07-08 against a ~137Hz
