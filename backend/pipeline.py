@@ -77,6 +77,7 @@ class VoiceConversionWorker:
     # grow unbounded. 5.0s is an overflow safety cap, not a latency target.
     _PLAYOUT_BUFFER_MAX_BYTES = int(48000 * 2 * 5.0)
     _PLAYOUT_DRAIN_BYTES = int(48000 * 2 * 0.10)
+    _PLAYOUT_BYTES_PER_SECOND = 48000 * 2
 
 
     # If no converted audio has arrived for this long, the data-channel latency
@@ -704,15 +705,30 @@ class VoiceConversionWorker:
                 await watchdog_task
 
     async def _run_playout_consumer(self):
-        """Drains _playout_buffer into LiveKit at a steady pace, decoupled from
-        how bursty or delayed the converter's actual output is. Waits for the
-        initial cushion (_PLAYOUT_BUFFER_TARGET_BYTES) before the first publish,
-        then continuously publishes whatever has accumulated since the last
-        publish — _publish_frames' own capture_frame backpressure already paces
-        real playback correctly; this just guarantees it's never starved by one
-        slow block, because the buffer (not the converter's arrival timing)
-        decides what's available to publish next."""
+        """Drains _playout_buffer into LiveKit at a strictly real-time pace,
+        decoupled from how bursty or delayed the converter's actual output is.
+        Waits for the initial cushion (_PLAYOUT_BUFFER_TARGET_BYTES) before the
+        first publish, then continuously publishes whatever has accumulated
+        since the last publish -- paced here via next_publish_time rather than
+        relying on _publish_frames' capture_frame backpressure alone.
+        LiveKit's AudioSource queue has ~200ms of headroom, so a backpressure-
+        only design can push several drain-sized chunks into that queue faster
+        than real time before backpressure engages -- audible as a burst of
+        time-compressed audio while the buffer quietly refills underneath (see
+        "Open finding 2026-07-14" in .agents/context/subsystem-notes.md).
+        Backlog must only ever show up as growing (bounded, drop-oldest)
+        delay, never as speed.
+
+        next_publish_time is self-correcting: if a chunk becomes available
+        after its deadline already passed (e.g. the buffer genuinely ran dry
+        and we were waiting on _playout_ready), we don't sleep to "catch up" --
+        we publish immediately and re-anchor pacing from now. Otherwise a real
+        stall would leave a stale schedule that forces the next audio out
+        faster than real time once data resumes, which is the same class of
+        bug this pacer exists to prevent, just triggered a different way.
+        """
         filled = False
+        next_publish_time: Optional[float] = None
         try:
             while True:
                 async with self._playout_buffer_lock:
@@ -728,7 +744,13 @@ class VoiceConversionWorker:
                         del self._playout_buffer[:self._PLAYOUT_DRAIN_BYTES]
                     self._playout_ready.clear()
                 if chunk:
+                    now = time.monotonic()
+                    if next_publish_time is None or now >= next_publish_time:
+                        next_publish_time = now
+                    else:
+                        await asyncio.sleep(next_publish_time - now)
                     await self._publish_frames(chunk)
+                    next_publish_time += len(chunk) / self._PLAYOUT_BYTES_PER_SECOND
                 else:
                     await self._playout_ready.wait()
         except asyncio.CancelledError:
