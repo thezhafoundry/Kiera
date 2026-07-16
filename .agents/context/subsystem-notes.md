@@ -516,8 +516,9 @@ Envelope method: 20ms RMS envelopes; windowed xcorr out48k↔twilio-conv gives d
 
 - **Product decision:** optimize the upload-and-train RVC path first. Keira is intended as
   a multi-client SaaS, not one permanently fixed Keira voice, so per-client LLVC-from-scratch
-  training is paused. Keep `LLVC_PILOT_ENABLED=false`; retain its converter, fake service,
-  safety watchdog, and tests as scaffolding for a later zero-shot/conditioned model review.
+  training is paused. Its converter, fake service, safety watchdog, and tests were removed
+  from `main` on 2026-07-16 and set aside on branch `codex/llvc-pilot` for a later
+  zero-shot/conditioned model review — re-derive scope from that branch, not this tree.
 - **Modal v11 is live and authenticated.** The `rvc-api-key` secret is present and an
   authenticated WebSocket received `ready`. The ready payload reports the effective profile,
   block/context/SOLA/output geometry, TensorRT engine/cache state, and an artifact-derived

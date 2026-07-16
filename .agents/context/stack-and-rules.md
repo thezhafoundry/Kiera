@@ -9,9 +9,9 @@
   [[active-backlog]] is done, not pending — see [[subsystem-notes]]).
 - **Media/Telephony**: LiveKit Cloud (WebRTC room + SIP), Twilio (Elastic SIP Trunk + PSTN
   phone number). Twilio webhook points at the Render server's `/api/call/inbound`.
-- **Voice conversion**: RVC-first production path; LLVC scaffolding retained but paused.
+- **Voice conversion**: RVC-first production path.
   - **RVC v2 (Stable Default)**: Served from a Modal **L4/TensorRT** worker (`modal_deploy/worker.py`) over one persistent `/ws` session. Modal v11 exposes the legacy `fastapi_app` (`region="ap-southeast"`, default US input routing) and experimental `fastapi_app_ap` (`routing_region="ap-south"`, broad `region="ap"`). Render still selects the legacy endpoint; do not switch it until both are benchmarked from Render Singapore. Each function allows at most two containers; each container admits one active stream.
-  - **LLVC (Paused)**: `LLVC_PILOT_ENABLED=false`. `LLVCStreamingConverter`, the fake server, bounded reconnect logic, and the 2s fail-closed watchdog remain verified scaffolding. Do not train/deploy a per-voice LLVC model for the SaaS onboarding path; reassess a zero-shot or lightweight-conditioned streaming model after RVC optimization. RVC HTTP `RVCVoiceConverter` remains offline-test-only.
+  - **LLVC (set aside, not in this codebase)**: an experimental low-latency engine was prototyped (`LLVCStreamingConverter`, fake server, bounded reconnect logic, 2s fail-closed watchdog) but never reached production (always gated behind `LLVC_PILOT_ENABLED=false`). That work is preserved on the `codex/llvc-pilot` branch, fully removed from `main`/this tree. Re-derive scope from that branch, not this file, if LLVC work resumes. RVC HTTP `RVCVoiceConverter` remains offline-test-only.
 - **Noise suppression**: `WebRTCNoiseSuppressor` / `RNNoiseSuppressor`
   (`backend/noise/noise_suppressor.py`), both degrade to passthrough if native libs are
   missing (notably on Windows — see [[subsystem-notes]]).
@@ -48,7 +48,6 @@
   `async for ... break` will not reliably stop the converter's backend session.
 - **Readiness polling must stay cheap.** `VoiceConversionWorker.is_ready` is a cached property,
   never a live network probe, because Twilio polls `/api/call/wait` roughly every 3s.
-- **LLVC 2.0-second Watchdog**: If LLVC is the active voice engine, the pipeline monitors the stream's output. If no chunks are received for 2.0 seconds, the fatal watchdog triggers to terminate the call programmatically (hanging up Twilio and deleting the LiveKit room) to prevent any raw voice leakage.
 - **Don't push to `main` mid-call during manual testing.** Render's `autoDeploy: commit`
   redeploys on every push, killing the LiveKit worker and any in-flight
   `VoiceConversionWorker`, forcing a Modal cold-start on the next call. This has been
@@ -63,8 +62,6 @@
 | `backend/converters/base.py` | `VoiceConverter` ABC — pluggability seam #1. |
 | `backend/converters/rvc.py` | `RVCVoiceConverter` — HTTP client to the Modal RVC `/convert` endpoint. Offline-test-only now; not selected by `_do_start_bot`. |
 | `backend/converters/rvc_stream.py` | `RVCStreamingConverter` — WS client to the Modal RVC `/ws` endpoint; one persistent duplex session per call, bounded reconnect buffer + backoff. What `_do_start_bot` actually selects when `RVC_ENDPOINT_URL` is set. |
-| `backend/converters/llvc_stream.py` | `LLVCStreamingConverter` — WS client to the LLVC model server `/ws` endpoint; one persistent duplex session per call, bounded reconnect buffer + backoff. |
-| `backend/converters/llvc_fake_server.py` | `llvc_fake_ws_handler` — Local mock LLVC server used for pipeline integration testing and concurrency limit validation. |
 | `backend/converters/dummy.py` | `DummyVoiceConverter` — ring-mod effect, no external API (local test). |
 | `backend/noise/noise_suppressor.py` | `NoiseSuppressor` ABC + WebRTC/RNNoise implementations — pluggability seam #2. |
 | `backend/test_pipeline.py` | Offline pipeline smoke tests, incl. `RVCStreamingConverter` reconnect/backoff/buffer-cap tests. |
