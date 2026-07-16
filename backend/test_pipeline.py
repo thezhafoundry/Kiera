@@ -743,6 +743,7 @@ async def test_worker_readiness_probe_dedup():
         def __init__(self):
             self.call_count = 0
             self.model_version = "rvc-ready-runtime-v1"
+            self.profile = "candidate_b"
 
         async def wait_ready(self, timeout):
             self.call_count += 1
@@ -773,6 +774,8 @@ async def test_worker_readiness_probe_dedup():
     assert worker.model_version == "rvc-ready-runtime-v1", (
         "the warm handshake's effective model version should replace the configured prior"
     )
+    assert worker.rvc_profile == "candidate_b"
+    assert worker._PLAYOUT_BUFFER_TARGET_BYTES == 15_360
     print(f"wait_ready() probe calls for background+outbound paths: {converter.call_count} (expected 1) OK")
 
     # A worker with no background probe started (defensive/edge case, "shouldn't

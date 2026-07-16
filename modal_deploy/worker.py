@@ -19,6 +19,10 @@ try:
     from modal_deploy import pitch_lock as pl
 except ImportError:   # inside container: modal_deploy package not present
     import pitch_lock as pl
+try:
+    from modal_deploy import rvc_profiles as rp
+except ImportError:  # inside container: modal_deploy package not present
+    import rvc_profiles as rp
 
 import faiss
 from functools import lru_cache
@@ -209,12 +213,24 @@ class RVCEngine:
                     is_half=False, n_mel_channels=128, sampling_rate=16000,
                     win_length=1024, hop_length=160, mel_fmin=30, mel_fmax=8000,
                 ).to("cuda" if _torch.cuda.is_available() else "cpu")
-                cache_dir = "/root/rvc-models/trt_cache"
+                profile = rp.get_active_profile()
+                if st.PROFILE_NAME != profile.name or tp.PROFILE_NAME != profile.name:
+                    raise RuntimeError(
+                        "RVC profile mismatch across worker modules: "
+                        f"worker={profile.name}, streaming={st.PROFILE_NAME}, "
+                        f"trt={tp.PROFILE_NAME}"
+                    )
+                onnx_dir = rp.profile_onnx_dir(profile)
+                cache_dir = rp.profile_trt_cache_dir(profile)
                 self._trt_cache_hot = bool(_glob.glob(f"{cache_dir}/*.engine"))
                 print(f"[TRT] engine cache {'HOT' if self._trt_cache_hot else 'COLD -- building now (slow first boot)'}")
+                print(
+                    f"[TRT] profile={profile.name} "
+                    f"canonical_in={profile.canonical_in} onnx_dir={onnx_dir}"
+                )
                 t0 = time.perf_counter()
                 self.trt_pipe = tp.TRTVoicePipeline(
-                    "/root/rvc-models/onnx", cache_dir, index, big_npy, mel,
+                    onnx_dir, cache_dir, index, big_npy, mel,
                 )
                 self.trt_pipe.warmup()
                 self.engine_kind = "trt"
@@ -494,11 +510,11 @@ def _save_debug_wavs(in_pcm16k: bytes, out_pcm48k: bytes) -> None:
     # _session_active (below) only enforces single-tenancy inside one already-running
     # container — it does nothing to stop Modal's autoscaler from booting a second GPU
     # container for a connection attempt that arrives while the first is still cold-starting
-    # (~75s) or mid-call. Cap at 1 so extra connection attempts queue against the single
-    # container instead of each paying for its own T4 GPU concurrently.
+    # (~75s) or mid-call. Cap at two containers for the approved two-call target;
+    # each container still admits only one active streaming session.
     max_containers=2,
     secrets=[modal.Secret.from_name("rvc-api-key")],
-    env={"USE_TRT": "1"},
+    env={"USE_TRT": "1", rp.PROFILE_ENV_VAR: st.PROFILE_NAME},
 )
 @modal.asgi_app()
 def fastapi_app():
@@ -516,6 +532,10 @@ def fastapi_app():
             "cuda_device": device_name,
             "rvc_device": "cuda" if torch.cuda.is_available() else "cpu",
             "engine": engine.engine_kind,
+            "profile": st.PROFILE_NAME,
+            "block_ms": st.BLOCK_MS,
+            "context_ms": st.CONTEXT_MS,
+            "sola_ms": st.PROFILE.sola_ms,
             "trt_cache": (
                 "hot" if getattr(engine, "_trt_cache_hot", False) else "cold"
             ) if engine.engine_kind == "trt" else "n/a",
@@ -616,12 +636,7 @@ def fastapi_app():
                 return
             model_version = os.environ.get("RVC_MODEL_VERSION", "unknown")
             sola_ms = st.SOLA_CROSSFADE_SAMPLES * 1000 // st.SAMPLE_RATE_OUT
-            geometry = (st.BLOCK_MS, st.CONTEXT_MS, sola_ms)
-            profile_name = (
-                "baseline"
-                if geometry == (320, 400, 80)
-                else f"custom-{geometry[0]}-{geometry[1]}-{geometry[2]}"
-            )
+            profile_name = st.PROFILE_NAME
             await ws.send_json({
                 "type": "ready",
                 "model_version": model_version,
@@ -671,7 +686,7 @@ def fastapi_app():
                     dbg_in.extend(payload)
                 acc.push(np.frombuffer(payload, dtype=np.int16))
 
-                # Drain every complete 1000 ms block currently buffered.
+                # Drain every complete profile-sized block currently buffered.
                 while True:
                     popped = acc.pop_block()
                     if popped is None:

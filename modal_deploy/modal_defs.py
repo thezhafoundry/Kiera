@@ -61,6 +61,7 @@ _trt_build_base = (
 image = (
     _build_base
     .add_local_dir("RVC", remote_path="/root/rvc", ignore=_RVC_IGNORE)
+    .add_local_python_source("rvc_profiles")
     .add_local_python_source("streaming")
     .add_local_python_source("pitch_lock")
     .add_local_python_source("modal_defs")
@@ -69,6 +70,7 @@ image = (
 trt_image = (
     _trt_build_base
     .add_local_dir("RVC", remote_path="/root/rvc", ignore=_RVC_IGNORE)
+    .add_local_python_source("rvc_profiles")
     .add_local_python_source("streaming")
     .add_local_python_source("trt_pipeline")
     .add_local_python_source("pitch_lock")

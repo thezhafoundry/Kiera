@@ -14,26 +14,26 @@ import wave
 
 import numpy as np
 
+try:
+    from modal_deploy.rvc_profiles import get_active_profile
+except ImportError:  # inside Modal container
+    from rvc_profiles import get_active_profile
+
 
 # ---- Parameter table (from the streaming-rebuild plan) ----
 
 SAMPLE_RATE_IN = 16000          # agent mic / inference input rate
 SAMPLE_RATE_OUT = 48000         # RVC / published track rate (3x input)
 
-# TRT Phase 2 (2026-07-07): block shrunk 1000ms→320ms to reduce mouth-to-ear latency
-# now that TRT median is 66ms (21× real-time) and the playout buffer gate has passed.
-# SOLA crossfade stays at 80ms (25% overhead per block at 320ms — up from 8% at 1000ms;
-# watch for time-compression artefacts in C5 listen test).
-# NOTE: BLOCK_MS + CONTEXT_MS must equal trt_pipeline.CANONICAL_IN / SAMPLE_RATE_IN * 1000
-# (now 320+400=720ms = 11520 samples) -- changing either without updating the
-# TRT static shapes requires re-exporting all three ONNX models.
-BLOCK_MS = 320               # new audio processed per inference block (was 1000)
-CONTEXT_MS = 400              # prior input prepended as left context (unchanged)
+PROFILE = get_active_profile()
+PROFILE_NAME = PROFILE.name
+BLOCK_MS = PROFILE.block_ms
+CONTEXT_MS = PROFILE.context_ms
 
-BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000        # 5120  (was 16000)
-CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000    # 6400  (unchanged)
+BLOCK_SAMPLES_IN = SAMPLE_RATE_IN * BLOCK_MS // 1000
+CONTEXT_SAMPLES_IN = SAMPLE_RATE_IN * CONTEXT_MS // 1000
 
-SOLA_CROSSFADE_SAMPLES = SAMPLE_RATE_OUT * 80 // 1000       # 3840 (80 ms @ 48 kHz)
+SOLA_CROSSFADE_SAMPLES = PROFILE.sola_samples
 SOLA_SEARCH_SAMPLES = SAMPLE_RATE_OUT * 10 // 1000          # 480  (10 ms @ 48 kHz)
 
 SILENCE_RMS_THRESHOLD = 150     # block RMS (int16) below this -> silence bypass

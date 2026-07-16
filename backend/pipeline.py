@@ -12,6 +12,7 @@ from livekit import rtc
 from .audio_eq import PresenceEQ
 from .converters.base import VoiceConverter
 from .noise.noise_suppressor import NoiseSuppressor
+from modal_deploy.rvc_profiles import get_profile
 
 
 class BoundedAudioQueue(asyncio.Queue):
@@ -68,11 +69,8 @@ class VoiceConversionWorker:
     # (_run_playout_consumer). This absorbs the case where one inference block
     # takes longer than its real-time budget by growing the lead's delay instead
     # of producing a silence gap.
-    # Phase 2 of the TRT latency plan (2026-07-07): 0.25s target now that
-    # BLOCK_MS=320 and TRT median is 66ms (21x real-time, p95=68ms). Converted
-    # audio arrives in ~320ms bursts; the 0.25s cushion absorbs jitter without
-    # adding a full extra block interval of mouth-to-ear delay.
-    # (Phase 1 was 1.25s, required at BLOCK_MS=1000 to absorb one full block interval.)
+    # The readiness handshake replaces this baseline default with the effective
+    # named profile's playout target before the call is connected.
     _PLAYOUT_BUFFER_TARGET_BYTES = int(48000 * 2 * 0.25)
 
     # Cap: beyond this, drop the OLDEST buffered audio rather than let delay
@@ -117,6 +115,10 @@ class VoiceConversionWorker:
         self.effective_engine = effective_engine
         self.fallback_reason = fallback_reason
         self.model_version = model_version
+        self.rvc_profile = "baseline"
+        self._PLAYOUT_BUFFER_TARGET_BYTES = type(
+            self
+        )._PLAYOUT_BUFFER_TARGET_BYTES
         self.on_llvc_fatal_failure: Optional[Callable[[], Awaitable[None]]] = None
         self._fatal_cleanup_task: Optional[asyncio.Task] = None
 
@@ -367,6 +369,17 @@ class VoiceConversionWorker:
             )
             if runtime_model_version:
                 self.model_version = str(runtime_model_version)
+            runtime_profile = getattr(self.converter, "profile", None)
+            if (
+                self.effective_engine == "rvc"
+                and runtime_profile
+                and str(runtime_profile) != "unknown"
+            ):
+                profile = get_profile(str(runtime_profile))
+                self.rvc_profile = profile.name
+                self._PLAYOUT_BUFFER_TARGET_BYTES = (
+                    48_000 * 2 * profile.playout_ms // 1000
+                )
         return ready
 
     async def wait_for_readiness_probe(self, fallback_timeout: float = 150.0) -> bool:

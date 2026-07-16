@@ -40,6 +40,21 @@ def test_pad_to_canonical_rejects_oversize():
         tp.pad_to_canonical(np.zeros(tp.CANONICAL_IN + 1, dtype=np.int16))
 
 
+def test_static_shape_validation_rejects_wrong_profile_artifact():
+    class FakeInput:
+        name = "audio"
+        shape = [1, tp.PADDED_IN + 1]
+
+    class FakeSession:
+        def get_inputs(self):
+            return [FakeInput()]
+
+    with pytest.raises(RuntimeError, match="static shape mismatch"):
+        tp.assert_static_input_shape(
+            FakeSession(), "hubert", "audio", (1, tp.PADDED_IN)
+        )
+
+
 def test_f0_to_coarse_bounds_and_monotonic():
     f0 = np.array([0.0, 50.0, 220.0, 1100.0, 5000.0])
     c = tp.f0_to_coarse(f0)
