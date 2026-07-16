@@ -462,10 +462,18 @@ class LLVCStreamingConverter(VoiceConverter):
         A standalone probe would be a different socket and creates a TOCTOU race:
         it can succeed even if the session that will carry call audio is rejected.
         """
+        if self._closed:
+            return False
+        start = time.monotonic()
+        while self._conn_task is None and not self._closed and (time.monotonic() - start) < timeout:
+            await asyncio.sleep(0.01)
         if self._conn_task is None or self._conn_task.done() or self._closed:
             return False
         try:
-            await asyncio.wait_for(self._session_ready.wait(), timeout=timeout)
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                return False
+            await asyncio.wait_for(self._session_ready.wait(), timeout=remaining)
             return self.is_healthy
         except Exception as e:
             logger.warning("[LLVCStreamingConverter] wait_ready failed: %s", e)

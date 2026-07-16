@@ -8,8 +8,10 @@ Run:
     python -m pytest scripts/test_llvc_benchmark.py -v
 """
 import asyncio
+import inspect
 import os
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -177,8 +179,129 @@ class TestCLIStructure:
     """Verify the benchmark script has the expected CLI flags."""
 
     def test_parser_has_expected_args(self):
-        import argparse
         from scripts.llvc_benchmark import main_async
-        # We can't easily test argparse without running the function,
-        # but we can verify the function exists and is async
-        assert asyncio.iscoroutinefunction(main_async)
+        assert inspect.iscoroutinefunction(main_async)
+
+
+class _MockDelayedConverter:
+    def __init__(self):
+        self.ready_time = None
+        self.first_audio_received_time = None
+
+    async def wait_ready(self, timeout=10.0):
+        await asyncio.sleep(0.15)
+        self.ready_time = time.monotonic()
+        return True
+
+    async def convert_stream(self, in_audio):
+        async for chunk in in_audio:
+            if self.first_audio_received_time is None:
+                self.first_audio_received_time = time.monotonic()
+            yield chunk * 3
+
+    async def close(self):
+        pass
+
+
+class _MockCombinedOutputConverter:
+    async def wait_ready(self, timeout=10.0):
+        return True
+
+    async def convert_stream(self, in_audio):
+        buf = bytearray()
+        async for chunk in in_audio:
+            buf.extend(chunk * 3)
+            if len(buf) >= 640 * 3 * 4:  # Yield 4 frames combined at once
+                yield bytes(buf)
+                buf.clear()
+        if buf:
+            yield bytes(buf)
+
+    async def close(self):
+        pass
+
+
+class _MockSplitOutputConverter:
+    async def wait_ready(self, timeout=10.0):
+        return True
+
+    async def convert_stream(self, in_audio):
+        async for chunk in in_audio:
+            converted = chunk * 3
+            for offset in range(0, len(converted), 640):
+                yield converted[offset:offset + 640]
+
+    async def close(self):
+        pass
+
+
+class TestDelayedHandshake:
+    @pytest.mark.asyncio
+    async def test_readiness_gate_prevents_early_audio_pumping(self):
+        """Verify input_gen is gated behind wait_ready so no audio or timestamps are queued during handshake."""
+        from scripts.llvc_benchmark import _run_ws_stream_benchmark
+        pcm = generate_dummy_sine(0.2, 16000)
+        converter = _MockDelayedConverter()
+        result = await _run_ws_stream_benchmark(converter, pcm, "Delayed Handshake Test", connect_timeout=5.0)
+        assert result["success"] is True
+        assert converter.ready_time is not None
+        assert converter.first_audio_received_time is not None
+        # Audio must only arrive after wait_ready returned True
+        assert converter.first_audio_received_time >= converter.ready_time
+
+
+class TestCombinedOutput:
+    @pytest.mark.asyncio
+    async def test_combined_output_messages_pop_multiple_timestamps(self):
+        """Verify benchmark accurately tracks latencies when server sends combined multi-frame output chunks."""
+        from scripts.llvc_benchmark import _run_ws_stream_benchmark
+        pcm = generate_dummy_sine(0.2, 16000)  # 10 frames (6400 bytes)
+        converter = _MockCombinedOutputConverter()
+        result = await _run_ws_stream_benchmark(converter, pcm, "Combined Output Test", connect_timeout=5.0)
+        assert result["success"] is True
+        assert len(result["latencies"]) == 10
+        assert result["out_bytes"] == len(pcm) * 3
+
+    @pytest.mark.asyncio
+    async def test_partial_input_frame_drains_full_padded_output(self):
+        """A short final input frame is padded and its complete output must be drained."""
+        from scripts.llvc_benchmark import _run_ws_stream_benchmark
+
+        pcm = generate_dummy_sine(0.205, 16000)
+        converter = _MockSplitOutputConverter()
+        result = await _run_ws_stream_benchmark(
+            converter,
+            pcm,
+            "Split Output Test",
+            connect_timeout=5.0,
+        )
+
+        padded_input_bytes = ((len(pcm) + 639) // 640) * 640
+        assert result["success"] is True
+        assert result["out_bytes"] == padded_input_bytes * 3
+        assert len(result["latencies"]) == padded_input_bytes // 640
+
+
+class TestConfigurationIsolation:
+    @pytest.mark.asyncio
+    async def test_no_rvc_fallback_when_only_rvc_vars_set(self, monkeypatch, tmp_path, capsys):
+        """Verify setting RVC_WS_URL/RVC_API_KEY does not trigger RVC or Real LLVC runs without explicit flag."""
+        monkeypatch.setenv("RVC_WS_URL", "ws://should-not-be-called:9999/ws")
+        monkeypatch.setenv("RVC_API_KEY", "secret-rvc-key")
+        monkeypatch.delenv("LLVC_WS_URL", raising=False)
+        monkeypatch.delenv("LLVC_API_KEY", raising=False)
+
+        wav_path = str(tmp_path / "test.wav")
+        import wave
+        with wave.open(wav_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x00" * 3200)
+
+        monkeypatch.setattr("sys.argv", ["llvc_benchmark.py", "--file", wav_path, "--no-fake"])
+        from scripts.llvc_benchmark import main_async
+        ret = await main_async()
+        captured = capsys.readouterr()
+        assert "No benchmarks were run." in captured.out
+        assert "LLVC (Real)" not in captured.out
