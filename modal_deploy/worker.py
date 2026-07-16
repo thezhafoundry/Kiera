@@ -24,7 +24,6 @@ try:
 except ImportError:  # inside container: modal_deploy package not present
     import rvc_profiles as rp
 
-import faiss
 from functools import lru_cache
 
 # RVC/infer/modules/vc/pipeline.py calls faiss.read_index(file_index) then
@@ -35,11 +34,14 @@ from functools import lru_cache
 # latency in production [Timing] logs). Cache the loaded index and its full
 # reconstruction so only the first call (the GPU warm-up pass in
 # RVCEngine.startup(), before any real caller connects) pays that cost.
-_real_faiss_read_index = faiss.read_index
+_real_faiss_read_index = None
 
 
 @lru_cache(maxsize=4)
-def _cached_read_index(path: str) -> "faiss.Index":
+def _cached_read_index(path: str):
+    global _real_faiss_read_index
+    if _real_faiss_read_index is None:
+        _install_faiss_index_cache()
     index = _real_faiss_read_index(path)
     cached_npy = index.reconstruct_n(0, index.ntotal)
     index.reconstruct_n = lambda *args, **kwargs: cached_npy
@@ -47,13 +49,16 @@ def _cached_read_index(path: str) -> "faiss.Index":
 
 
 def _install_faiss_index_cache():
+    global _real_faiss_read_index
+    import faiss
+
     if getattr(faiss.read_index, "_kiera_cached", False):
         return  # already installed (e.g. re-imported in a test)
+    _real_faiss_read_index = faiss.read_index
     faiss.read_index = _cached_read_index
 
 
 _cached_read_index._kiera_cached = True
-_install_faiss_index_cache()
 
 
 app = modal.App("rvc-worker")
@@ -116,6 +121,8 @@ class RVCEngine:
         import glob
         import faiss
         import onnxruntime as ort
+
+        _install_faiss_index_cache()
 
         print("=" * 80)
         print("Starting RVC ONNX GPU Worker")
