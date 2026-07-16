@@ -6,7 +6,9 @@ containers.
 """
 
 from dataclasses import dataclass
+import hashlib
 import os
+from pathlib import Path
 from typing import Mapping, Optional
 
 
@@ -130,3 +132,20 @@ def profile_trt_cache_dir(
     model_root: str = "/root/rvc-models",
 ) -> str:
     return f"{_profile_artifact_root(profile, model_root)}/trt_cache"
+
+
+def artifact_sha256(path: os.PathLike | str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_model_version(
+    checkpoint_path: os.PathLike | str,
+    index_path: os.PathLike | str,
+) -> str:
+    checkpoint_digest = artifact_sha256(checkpoint_path)[:12]
+    index_digest = artifact_sha256(index_path)[:12]
+    return f"rvc-{checkpoint_digest}-idx-{index_digest}"

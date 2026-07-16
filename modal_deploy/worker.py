@@ -110,6 +110,7 @@ class RVCEngine:
         self.trt_pipe = None
         self.engine_kind = "onnx-cuda"   # "onnx-cuda" (fallback) or "trt"
         self._trt_cache_hot = False
+        self.model_version = "unknown"
 
     def startup(self):
         import glob
@@ -250,6 +251,19 @@ class RVCEngine:
                 "No conversion engine available: TRT init failed/disabled AND base ONNX "
                 "artifacts are missing. Refusing to start (fail-closed, never raw)."
             )
+
+        if self.engine_kind == "trt":
+            active_model_path = os.path.join(
+                rp.profile_onnx_dir(rp.get_active_profile()),
+                "generator.onnx",
+            )
+        else:
+            active_model_path = rvc_path
+        self.model_version = rp.build_model_version(
+            active_model_path,
+            self.index_path,
+        )
+        print(f"[Model] version={self.model_version}")
 
         self.ready = True
         print("GPU Worker Ready")
@@ -532,6 +546,7 @@ def fastapi_app():
             "cuda_device": device_name,
             "rvc_device": "cuda" if torch.cuda.is_available() else "cpu",
             "engine": engine.engine_kind,
+            "model_version": engine.model_version,
             "profile": st.PROFILE_NAME,
             "block_ms": st.BLOCK_MS,
             "context_ms": st.CONTEXT_MS,
@@ -634,7 +649,9 @@ def fastapi_app():
                 await ws.send_json({"type": "error", "message": "engine not ready"})
                 await ws.close()
                 return
-            model_version = os.environ.get("RVC_MODEL_VERSION", "unknown")
+            model_version = (
+                os.environ.get("RVC_MODEL_VERSION") or engine.model_version
+            )
             sola_ms = st.SOLA_CROSSFADE_SAMPLES * 1000 // st.SAMPLE_RATE_OUT
             profile_name = st.PROFILE_NAME
             await ws.send_json({

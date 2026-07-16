@@ -3,6 +3,7 @@
 import pytest
 
 from modal_deploy.rvc_profiles import (
+    build_model_version,
     get_profile,
     profile_onnx_dir,
     profile_trt_cache_dir,
@@ -58,3 +59,17 @@ def test_candidate_artifacts_cannot_overwrite_the_baseline():
     assert profile_trt_cache_dir(candidate).endswith(
         "/profiles/candidate_b/trt_cache"
     )
+
+
+def test_model_version_identifies_checkpoint_and_index(tmp_path):
+    checkpoint = tmp_path / "voice.pth"
+    index = tmp_path / "voice.index"
+    checkpoint.write_bytes(b"checkpoint-v1")
+    index.write_bytes(b"index-v1")
+
+    first = build_model_version(checkpoint, index)
+    index.write_bytes(b"index-v2")
+    second = build_model_version(checkpoint, index)
+
+    assert first.startswith("rvc-") and "-idx-" in first
+    assert first != second
