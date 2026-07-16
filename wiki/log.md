@@ -3,6 +3,25 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
+## [2026-07-16] lint | LATENCY.md and TRT_ROLLOUT_STEPS.md removed, sources re-pointed
+
+Both root docs were merged into `.agents/context/subsystem-notes.md` (new "Latency
+budget, log reference, and troubleshooting" section, plus updates to the existing
+TensorRT section) and deleted, at user request, alongside the same-day LLVC removal.
+Only genuinely still-needed content carried over — `LATENCY.md`'s explicitly historical
+§5 (old VAD-chunked ordered-playout-queue design, already deleted from the code) and
+`TRT_ROLLOUT_STEPS.md`'s completed Phase A/B/C1-C3/D were left out; the still-open C4/C5
+listen-test and rollout-verification commands were preserved.
+
+- [[latency-md]] (source page) repointed at `.agents/context/subsystem-notes.md`.
+- [[tensorrt-migration]], [[audio-pipeline-latency-budget]], [[adaptive-playout-buffer]],
+  [[buffering-history]], and the [[active-backlog]] source page had their `LATENCY.md §N`
+  / `TRT_ROLLOUT_STEPS.md` citations repointed to the merged section instead of left dead.
+- `index.md`'s latency-md source entry annotated with the removal.
+- Not touched: `[[readme-latency-budget-contradiction]]` and `[[rvc-cold-start]]`'s mention
+  of "an earlier version of LATENCY.md" — both are historical narrative about resolved
+  past states, not live citations, so they stay as written.
+
 ## [2026-07-16] ingest | RVC-first baseline measured; routing and duration gates recorded
 
 Paused LLVC training/deployment after correcting the product assumption: Keira is a

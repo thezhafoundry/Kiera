@@ -10,8 +10,9 @@ so latency/config regressions tend to surface as "call sounded wrong" reports in
 after the fact (see [[log]] and [[subsystem-notes]] for examples).
 
 ## Response Conventions
-- Terse, technical, numbers-first — LATENCY.md is the house style: concrete measured
-  values ("~75s", "580-750ms") over vague qualifiers, explicit root causes over guesses.
+- Terse, technical, numbers-first — the latency-budget/troubleshooting section of
+  [[subsystem-notes]] is the house style: concrete measured values ("~75s", "580-750ms")
+  over vague qualifiers, explicit root causes over guesses.
 - When diagnosing a live issue, pull real evidence (Render logs, Modal `/health`, git
   history) before proposing a fix — don't speculate when the data is one command away.
 - Prefer fixing root causes over adding defensive/fallback code, *except* where the

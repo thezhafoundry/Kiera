@@ -80,7 +80,7 @@ wiki. This index is the first stop for any query — find the page here, then dr
   — **resolved historical doc bug.** The old per-request budget was removed by the streaming rebuild.
 
 ## Sources (ingested raw material)
-- [latency-md](pages/sources/latency-md.md) — `LATENCY.md`
+- [latency-md](pages/sources/latency-md.md) — `LATENCY.md` (removed 2026-07-16, merged into `.agents/context/subsystem-notes.md`)
 - [decisions-log](pages/sources/decisions-log.md) — `.agents/decisions/log.md`
 - [subsystem-notes](pages/sources/subsystem-notes.md) — `.agents/context/subsystem-notes.md`
 - [stack-and-rules](pages/sources/stack-and-rules.md) — `.agents/context/stack-and-rules.md`

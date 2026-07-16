@@ -63,9 +63,9 @@ just raise the cap further.
 `bytes(frame.data)` first for a real byte length.
 
 **Not yet manually verified**: this design has passed automated unit tests
-(`backend/test_pipeline.py`) but has not yet had LATENCY.md's spectral latency test run
-against it, nor final confirmation from a live call that "part by part" audio is actually
-gone. See [[active-backlog]].
+(`backend/test_pipeline.py`) but has not yet had the spectral latency test (procedure in
+`.agents/context/subsystem-notes.md`) run against it, nor final confirmation from a live
+call that "part by part" audio is actually gone. See [[active-backlog]].
 
 **Why the target could shrink**: the original ~3s target was sized to absorb a slow
 non-TRT inference path; the TRT migration's benchmarks measured well under 70ms inference

@@ -1,12 +1,17 @@
 ---
 title: LATENCY.md
 type: source
-sources: [../../../LATENCY.md]
+sources: [../../../.agents/context/subsystem-notes.md]
 updated: 2026-07-16
 ---
 
-[LATENCY.md](../../../LATENCY.md) — the canonical latency budget and troubleshooting doc
-for the pipeline, last substantively updated 2026-07-16.
+**`LATENCY.md` was removed from the repo on 2026-07-16** — its still-needed content
+(budget table, log reference, test procedure, troubleshooting checklist) was merged into
+the "Latency budget, log reference, and troubleshooting" section of
+[.agents/context/subsystem-notes.md](../../../.agents/context/subsystem-notes.md); its
+explicitly-marked-historical §5 (the old pre-rebuild ordered-playout-queue design,
+already deleted from the code) was dropped rather than carried forward. This page's key
+claims below remain accurate as facts, just re-sourced.
 
 ## Key claims
 - Current RVC baseline: 320ms block / 400ms context / 80ms SOLA / 250ms playout target.
@@ -22,7 +27,9 @@ for the pipeline, last substantively updated 2026-07-16.
   A/B is open, and Render remains on the stable endpoint.
 - Raw-voice fallback is gone structurally — the fail-closed warm gate blocks the call (503
   outbound / hold-music inbound) rather than degrading to raw audio.
-- LLVC training/deployment is paused and `LLVC_PILOT_ENABLED=false`; fake-server timings are
-  test scaffolding, not production model performance.
-- §5 preserves the old VAD-chunked ordered-playout-queue design as historical record.
+- LLVC training/deployment is paused; its code was removed from `main` the same day
+  (2026-07-16) and set aside on branch `codex/llvc-pilot` — see
+  `.agents/projects/active-backlog.md` for current status.
+- The old VAD-chunked ordered-playout-queue design (formerly §5, historical even before
+  removal) described machinery already deleted from the code; not carried into the merge.
 - A real browser→LiveKit→Render→Modal→SIP/PSTN spectral/listening measurement remains open.

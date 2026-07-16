@@ -34,4 +34,5 @@ The 9.6s baseline returned 211.46ms less output with zero reported drops. That d
 gate must be understood before lowering block sizes because accumulated drift can create
 gaps, accelerated speech, or playout starvation during a long call. See
 [[rvc-baseline-routing-and-duration]], [[adaptive-playout-buffer]], [[rvc-cold-start]], and
-`LATENCY.md` for the measurement procedure and historical designs.
+`.agents/context/subsystem-notes.md` (merged in from the former `LATENCY.md`,
+2026-07-16) for the measurement procedure.

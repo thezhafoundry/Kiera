@@ -74,4 +74,3 @@
 | `frontend/` | Vanilla HTML/JS/CSS agent dashboard. |
 | `scripts/rvc_stream_benchmark.py` | Synthetic call-long benchmark for the real RVC WebSocket path; reports readiness, inference/network estimates, duration delta, profile/model metadata, and drop counters. |
 | `scripts/` | `build_rnnoise.sh`, dataset prep/denoise helpers, second-brain close-out tooling. |
-| `LATENCY.md` | Latency budget, log-reading guide, live troubleshooting log — read before touching pipeline timing. |

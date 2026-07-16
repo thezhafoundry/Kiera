@@ -22,10 +22,13 @@ noise outside the ONNX graph and passing it in as a model input instead (see
 subsystem-notes) — this needs its own fresh listen-test pass since it changes generator
 output.
 
-Remaining before full close-out: C4 (offline A/B WAVs, still unchecked in
-`TRT_ROLLOUT_STEPS.md`), a fresh C5 listen test against the noise-fix specifically, and
-confirming the live Modal deploy is actually serving the TRT path (`/api/health` →
-`"engine": "trt"`) rather than assuming it from committed code alone.
+Remaining before full close-out: C4 (offline A/B WAVs, still open), a fresh C5 listen test
+against the noise-fix specifically, and confirming the live Modal deploy is actually
+serving the TRT path (`/api/health` → `"engine": "trt"`) rather than assuming it from
+committed code alone. The C4/C5/rollout-verification commands are preserved in
+`.agents/context/subsystem-notes.md`'s TensorRT section (`TRT_ROLLOUT_STEPS.md`, the
+original runbook, was removed from the repo 2026-07-16 once its completed phases were
+folded into that section).
 
 ## Review arc (2026-07-05 → 2026-07-06)
 
@@ -46,11 +49,13 @@ confirming the live Modal deploy is actually serving the TRT path (`/api/health`
   [[active-backlog]]) and a **Myelin FP16 compiler bug** forcing the generator engine to
   FP32 while HuBERT/RMVPE stay FP16.
 
-The full spec is
-[TRT_ROLLOUT_STEPS.md](../../../TRT_ROLLOUT_STEPS.md) at the repo root. Unusually for
-this project, the implementation is being done by a *different* AI model; the resident
-agent's role is reviewing the resulting diffs against the plan's gates (checklist in the
-TensorRT row of [.agents/projects/active-backlog.md](../../../.agents/projects/active-backlog.md)).
+The full spec lived in `TRT_ROLLOUT_STEPS.md` at the repo root (removed 2026-07-16, its
+still-open steps preserved in
+[.agents/context/subsystem-notes.md](../../../.agents/context/subsystem-notes.md)'s
+TensorRT section). Unusually for this project, the implementation was done by a
+*different* AI model; the resident agent's role was reviewing the resulting diffs against
+the plan's gates (checklist in the TensorRT row of
+[.agents/projects/active-backlog.md](../../../.agents/projects/active-backlog.md)).
 
 ## What and why
 

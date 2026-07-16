@@ -26,7 +26,8 @@ graph TD
 - **Browser-to-Phone**: Agents dial leads directly from a clean dark glassmorphism dashboard. Incoming calls dial in from the PSTN, trigger a Twilio webhook, and are routed via SIP into a LiveKit room.
 - **Brand Voice Conversion**: Agent audio is captured at 16kHz, denoised, and streamed continuously over a persistent WebSocket to a serverless L4 GPU running RVC v2 on Modal (optionally accelerated with TensorRT). Converted 48kHz audio is returned, held in a standing playout buffer, and published into the room.
 - **One-Way Conversion**: Voice conversion is applied only to the agent-to-lead stream. The lead-to-agent stream is bridged directly and unmodified so the agent hears the lead's raw voice.
-- **Fail-Closed, Never Raw**: There is no raw-voice fallback — it was removed structurally. If the GPU connection drops or errors, the bot publishes silence until real converted audio resumes; the lead never hears the agent's unconverted voice. A standing playout buffer (0.25s target/5s cap) absorbs jitter, then drains in bounded 100ms chunks to avoid gulping long utterances. See [CLAUDE.md](CLAUDE.md) and [LATENCY.md](LATENCY.md) for the full mechanism.
+- **Fail-Closed, Never Raw**: There is no raw-voice fallback — it was removed structurally. If the GPU connection drops or errors, the bot publishes silence until real converted audio resumes; the lead never hears the agent's unconverted voice. A standing playout buffer (0.25s target/5s cap) absorbs jitter, then drains in bounded 100ms chunks to avoid gulping long utterances. See [CLAUDE.md](CLAUDE.md) and
+[wiki/pages/concepts/adaptive-playout-buffer.md](wiki/pages/concepts/adaptive-playout-buffer.md) for the full mechanism.
 
 ### Current RVC rollout state (2026-07-16)
 
@@ -187,7 +188,8 @@ These are **developer-laptop → Modal** measurements, not production mouth-to-e
 measurements. The large network term exposed Modal's default Virginia routing on the
 legacy function; the parallel AP-routed endpoint exists to measure that variable from the
 actual Render Singapore origin. The duration loss is also an open quality gate. See
-[LATENCY.md](LATENCY.md) for interpretation and remaining tests.
+[wiki/pages/concepts/audio-pipeline-latency-budget.md](wiki/pages/concepts/audio-pipeline-latency-budget.md)
+for interpretation and remaining tests.
 
 ### Automatic Spectral Latency Test
 The application includes a built-in digital latency analyzer that runs in the browser, eliminating acoustic feedback and measuring delay with millisecond precision:
@@ -199,7 +201,8 @@ The application includes a built-in digital latency analyzer that runs in the br
 5. In the Agent panel (Tab 1), click **Play Latency Test Tone**.
 6. The Listener tab (Tab 2) will detect the 1kHz beep on the raw stream and the converted stream, displaying the exact **Mouth-to-Ear Latency** instantly.
 
-For physical loopback tests (clap test) and details on the latency budget, see [LATENCY.md](LATENCY.md).
+For physical loopback tests (clap test) and details on the latency budget, see
+[wiki/pages/concepts/audio-pipeline-latency-budget.md](wiki/pages/concepts/audio-pipeline-latency-budget.md).
 
 ---
 

@@ -41,6 +41,6 @@
 | Converted voice mismatch and muffled output | 2026-07-08 | Pitch and double-noise-suppression fixes shipped; later input-clarity regression remains open above. |
 
 ## Known Tech Debt
-- Buffering/playout logic has been reverted and reimplemented repeatedly; treat timing edits as high-risk and rerun the spectral latency test in `LATENCY.md`.
+- Buffering/playout logic has been reverted and reimplemented repeatedly; treat timing edits as high-risk and rerun the spectral latency test (procedure in [[subsystem-notes]]).
 - `scripts/rvc_stream_benchmark.py` now automates converter-path regression measurement, but it is not in CI and cannot replace the manual browser/PSTN mouth-to-ear spectral test.
 - `RVC/` is vendored third-party WebUI code and should remain outside normal runtime scans.

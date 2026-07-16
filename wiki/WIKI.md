@@ -19,7 +19,7 @@ same decision's full context for a human trying to understand *why*.
 ## Layers
 
 1. **Raw sources** — never duplicated here. For code and docs already in this repo
-   (`backend/*.py`, `LATENCY.md`, `README.md`, `.agents/**`), the wiki links straight to
+   (`backend/*.py`, `README.md`, `.agents/**`), the wiki links straight to
    the file path. Only sources that don't already live in the repo as a durable file
    (a pasted call transcript, an incident Slack thread, a one-off log dump) get saved
    under `wiki/raw/` before being ingested.

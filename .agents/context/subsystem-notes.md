@@ -105,9 +105,114 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   alive (e.g. trailing `await asyncio.sleep(...)`) or the `finally:` block cancels the
   playout consumer before anything is published.
 
+## Latency budget, log reference, and troubleshooting (merged from `LATENCY.md`, removed 2026-07-16)
+`LATENCY.md` was a standalone root doc that the `wiki/` knowledge base also ingested as a
+source; it's gone now (superseded by this section) — see `.agents/decisions/log.md` for
+live-measured 2026-07-16 numbers (72.51s cold readiness, TRT inference median/p95
+50.75/51.61ms, converter-wait 1207.11/1358.56ms, network 837.05/988.91ms, zero drops,
+-211.46ms duration delta from a developer-laptop benchmark — re-measure from Render
+Singapore before trusting for capacity/SLA planning). What follows is the still-useful
+mechanism reference that doc carried, not the numbers (which live in the decisions log so
+they don't go stale here too).
+
+### Per-stage mouth-to-ear budget (current streaming pipeline)
+$$\text{Mouth-to-Ear} = T_{\text{ingress}} + T_{\text{noise\_suppression}} + T_{\text{frame\_batch}} + T_{\text{block\_accumulate}} + T_{\text{inference}} + T_{\text{SOLA\_crossfade}} + T_{\text{jitter\_buffer}} + T_{\text{egress}}$$
+
+| Stage | Target | Where |
+|---|---|---|
+| Ingress network | 20-45ms | Browser OPUS→WebRTC→LiveKit→worker at 16kHz mono |
+| Noise suppression | 0.2-0.5ms | `WebRTCNoiseSuppressor`, 10ms/320-byte frames |
+| Input frame batching | up to 20ms | `_frame_pairs()` pairs two 10ms frames into one 20ms/640-byte input frame |
+| Inference block accumulation | up to 320ms | `modal_deploy/streaming.py::BlockAccumulator` pops a block once 320ms of new audio arrived (`BLOCK_MS`) |
+| GPU inference (warm) | see decisions-log numbers above | `RVCEngine.convert_block` / `TRTVoicePipeline` inside the `/ws` handler |
+| GPU inference (cold) | see decisions-log numbers above | Fail-closed warm gate blocks call progression until ready — no partial/degraded audio |
+| SOLA crossfade | 80ms baseline held tail | `modal_deploy/streaming.py::sola_crossfade` aligns adjacent blocks |
+| Standing playout buffer | 250ms target, 5s cap, 100ms steady drain | `VoiceConversionWorker`, see Playout buffer section above — largest budget term, not optional |
+| Egress network | 20-40ms | 960-byte (10ms@48kHz) frames → LiveKit → WebRTC → browser |
+
+Render is confirmed live in Singapore. Modal exposes two functions from the same worker
+code/volume: `fastapi_app` (stable, `region="ap-southeast"`, default US input routing) and
+`fastapi_app_ap` (experimental, `routing_region="ap-south"`, broad `region="ap"`). Keep
+Render on the stable endpoint until both are benchmarked *from Render*, not a laptop.
+
+### Reading live logs
+Worker-side (`backend/pipeline.py`):
+- `[Worker] Subscribed to agent track ...` — pipeline started reading the agent's mic; if
+  this never appears, no audio is flowing in at all (check the agent participant identity
+  contains `"agent"`, per `on_track_subscribed`).
+- `[Worker Error in conversion stream] ...` — the conversion task hit an unhandled
+  exception (not a normal reconnect, which `RVCStreamingConverter` handles silently).
+  Output is silence until the task is retried/reset.
+- `[Worker] Readiness probe failed: ...` — the one-shot `start_readiness_probe()` task
+  raised; check the exception text, usually a WS connect failure to the converter backend.
+
+`RVCStreamingConverter` (`backend/converters/rvc_stream.py`) logs via the `logging` module
+(logger `backend.converters.rvc_stream`), not `print` — make sure `WARNING`-level output is
+surfaced:
+- `WS connection lost/failed` — socket dropped; `_connection_loop` retries with exponential
+  backoff (0.5s→5s cap); incoming audio buffers only the newest 500ms (drop-oldest); the
+  lead hears silence for the outage, never raw voice, and stale speech is never replayed.
+- `reconnect buffer full ... dropped oldest input frame` — outage outlasted the 500ms input
+  buffer; that audio is lost (never converted) but nothing raw leaks.
+- `server error: <message>` — server sent `{"type":"error",...}` for one block; that block
+  emits no audio, session stays open.
+
+Server-side (`modal_deploy/worker.py`'s `/ws` handler) JSON messages: `{"type":"ready"}`
+(handshake ok), `{"type":"busy"}` (a session is already active, 1-concurrent MVP),
+`{"type":"error","message":"..."}` (handshake or one block's inference failed),
+`{"type":"stats","infer_ms":..,"block_ms":..}` (per-block timing — client sums these into
+`pipeline_latency_ms`, published over the room data channel; `is_fallback` now means
+"HOLDING" — `_is_holding` flips true if no converted chunk arrives for 750ms).
+
+### How to run the mouth-to-ear latency test
+**Automatic spectral test (recommended):** confirm `RVC_ENDPOINT_URL` is set and
+`GET /api/health` reports it (otherwise the bot silently uses `DummyVoiceConverter` and
+you measure the wrong pipeline) → warm the GPU (`POST /api/warmup`) → two browser
+tabs/devices, one **Join as Agent**, one **Join as Listener** → Agent clicks **Play
+Latency Test Tone** (mutes mic, injects a 100ms 1kHz pulse into the WebRTC stream) →
+Listener runs an FFT on both the raw and converted tracks, marks $T_1$/$T_2$ on the 1kHz
+peak, displays $\Delta T = T_2 - T_1$ instantly.
+
+**Manual physical test (clap test):** Agent and Listener in the same room, Agent claps
+near their mic, record room audio on a phone, load into Audacity, measure the time
+distance between the original clap and the delayed converted clap from the Listener's
+speakers.
+
+### General troubleshooting checklist (outbound 503 / inbound stuck on hold / live call silent)
+Work through in order:
+1. **Is `RVC_ENDPOINT_URL` actually set?** Check `GET /api/health` → `rvc.endpoint`; "not
+   configured" means the bot never talks to Modal (uses `DummyVoiceConverter`, always
+   "ready" — the warm-gate/503 behavior below only applies with a real RVC endpoint set).
+2. **Is the Modal app deployed?** `modal deploy modal_deploy/worker.py` (or `POST
+   /api/deploy` if `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` are set).
+3. **Hit `/health` directly.** `{"status":"loading"}` = still inside `startup()` (model +
+   HuBERT + FAISS + warm-up), expect up to ~90s cold on an L4 (plus a one-time ~22s TRT
+   engine build if `USE_TRT=1` and the cache is cold). `{"status":"ready"}` = fully warm.
+4. **Use `POST /api/warmup`, not a single health ping** — it polls every 30s for up to 6
+   minutes to ride out a cold start; a short-timeout `curl` will look like "Modal is
+   broken" when it's just cold.
+5. **Check the Modal volume.** `RVCEngine.startup()` raises `RuntimeError("No FAISS index
+   found.")` if `/root/rvc-models/logs/mi-test/*.index` is empty — looks like a hang from
+   the caller's side but is a missing-model error (`modal app logs rvc-worker`).
+6. **A cold GPU blocks the call by design — it does not degrade to raw voice.** Outbound
+   `await`s `worker.wait_for_readiness_probe()` and returns 503 without dialing if not
+   ready in time; inbound only bridges once `worker.is_ready` is true, otherwise keeps
+   returning hold-music TwiML. `wait_until_ready`/`wait_ready` opens a short-lived `/ws`
+   probe expecting `{"type":"ready"}` — if a real call is already active (1-concurrent MVP)
+   it gets `{"type":"busy"}` and reads as not-ready, so "warm gate keeps failing" can also
+   mean "a session is already active," not just "GPU is cold."
+7. **Confirm GPU visibility inside the container**, not just that it started — `/health`'s
+   `cuda_available`/`cuda_device` fields; `false` on the `gpu="L4"` function is a Modal-side
+   scheduling/image issue (check `modal app logs rvc-worker`). A committed `gpu=` change
+   isn't deployed until `modal deploy` actually runs.
+8. **Keep it warm proactively.** `scaledown_window=120` means the container shuts down 2
+   minutes after the last request — ping `/api/warmup` at shift start; the automatic
+   pre-warm ping in `_do_start_bot` overlaps cold start with call setup/ringing on every
+   spawn.
+
 ## Modal RVC GPU worker (`modal_deploy/worker.py`)
 - Cold start is much slower than the code comments assume: measured live at ~75s with
-  no `/health` response at all before `{"status":"ready"}` (see LATENCY.md §4.1), not the
+  no `/health` response at all before `{"status":"ready"}`, not the
   8-30s originally assumed. This is still true post-rebuild (same Modal worker, same
   cold-start problem) — the difference now is what a cold/unready GPU *does* to a call: the
   old per-chunk 2000ms conversion budget/raw-fallback machinery in `_do_start_bot` is gone
@@ -210,9 +315,45 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   ruling out the input-muffling regression noted above. See [[active-backlog]].
 
 ## TensorRT/ONNX migration (merged to main 2026-07-07, merge commit `9c1093a`)
-Full spec: `implementation_plan.md` / `TRT_ROLLOUT_STEPS.md` (repo root). `trt-migration`
-branch is merged into `main`; C4 (A/B WAVs), C5 (listen test) and live-rollout confirmation
-(plan Task 10, USER-RUN) are still pending — see [[active-backlog]].
+`trt-migration` branch is merged into `main`. Rollout status as of 2026-07-16: Phase A
+hardening fixes, Phase B commit slices, Phase C1-C3 (probe/export/engine-build) are all
+done and live in the current code — see "Load-bearing gotchas" below for what they fixed.
+Phase D (keep-warm cost decision) was made and recorded 2026-07-06 (env-gated,
+`RVC_KEEPWARM`, default OFF — see `.agents/decisions/log.md`). **Still open**: C4 (A/B
+WAVs), C5 (listen test), and re-verifying the live rollout end-to-end — see
+[[active-backlog]]. `TRT_ROLLOUT_STEPS.md` (the original step-by-step runbook this section
+summarizes) was removed from the repo 2026-07-16; the still-actionable C4/C5/rollout
+commands are preserved below so that work isn't lost.
+
+### Still-open: C4/C5 verification procedure
+```bash
+# C4 — produce two A/B WAVs (baseline ONNX/CUDA vs TRT+RMVPE candidate)
+modal run modal_deploy/worker.py::main_chunked --pitch 12 --use-trt 0   # baseline
+modal run modal_deploy/worker.py::main_chunked --pitch 12 --use-trt 1   # candidate
+```
+Record per-block `convert_block` timings printed for both runs, then run the **C5 listen
+test** [USER-RUN — human ears required] comparing baseline vs candidate vs the single-pass
+reference WAV:
+
+| Check | What to listen for | Why it's on the list |
+|---|---|---|
+| Voice identity | TRT ≥ baseline resemblance to the trained voice | The whole point |
+| Pitch sanity | No octave jumps / chipmunk segments | RMVPE re-enable |
+| Block seams | No clicks/roughness at ~1s intervals | Fixed 16k-sample pad replaced Config-driven padding |
+| Breath/unvoiced texture | No buzzy or repeating pattern in breaths and s/f/h sounds | The deterministic noise shim repeats per block |
+| Loudness dynamics | Levels track the input naturally | `rms_mix_rate` works on the TRT path only |
+
+**Gate:** if any listen check fails, stop and report — the fix is likely pad size or the
+noise shim, both of which require re-export and a fresh export→engine-build→A/B pass.
+Append results to this section and commit.
+
+### Still-open: live-rollout re-verification order
+1. `GET <worker-url>/health` → expect `"engine": "trt"`, `"trt_cache": "hot"`,
+   `"cuda_device": "NVIDIA L4"`. `"trt_cache": "cold"` means re-run the engine-build step
+   (`modal run modal_deploy/compile_trt.py::build_engines`) before proceeding.
+2. Live test call — watch `infer_ms` in the stats messages/logs; expect it to match the C3
+   benchmark numbers below.
+3. Close the loop here (this section) and in [[active-backlog]] once confirmed.
 
 ### C3 benchmark results (2026-07-06, NVIDIA L4, ap-southeast)
 Block geometry: 1400ms audio in (BLOCK_MS=1000 + CONTEXT_MS=400), 48kHz out.
@@ -281,8 +422,9 @@ Load-bearing gotchas found during the three review rounds:
   the flag split is intentional.
 - **ORT silently falls back to CPU when an EP fails to load** — `TRTVoicePipeline.__init__`
   hard-fails via `sess.get_providers()` checks for exactly this reason. The base ONNX
-  fallback sessions in `worker.py` do NOT have this check yet (open finding). Any new
-  `InferenceSession` in this codebase should assert its expected provider.
+  fallback sessions in `worker.py` now carry the same `CUDAExecutionProvider` assert
+  (fixed 2026-07-06, `worker.py`'s `startup()`). Any new `InferenceSession` in this
+  codebase should assert its expected provider the same way.
 - **Modal image layering**: Modal forbids build steps (`pip_install`/`env`/`run_commands`)
   after any `add_local_*` — that's why `modal_deploy/modal_defs.py` (single source of truth
   for `volume`/`image`/`trt_image`) splits build bases from final images and attaches local

@@ -5,8 +5,9 @@ voice is denoised and converted to a consistent "brand voice" (RVC v2 on a Modal
 and streamed to a lead over the PSTN via Twilio + LiveKit SIP. Conversion is applied
 **only** to the agent→lead direction; lead→agent audio is bridged unmodified.
 
-See [README.md](README.md) for account setup and the end-to-end run guide, and
-[LATENCY.md](LATENCY.md) for the latency methodology.
+See [README.md](README.md) for account setup and the end-to-end run guide. Latency
+methodology, budget, log reference, and troubleshooting live in
+`.agents/context/subsystem-notes.md` (merged in from the former `LATENCY.md` 2026-07-16).
 
 There is also a human-facing knowledge wiki at [wiki/](wiki/WIKI.md) — narrative,
 cross-referenced pages synthesized from project docs (latency, decisions, incidents),
@@ -42,8 +43,7 @@ To prevent context dilution, general invariants and rules are split into modular
     *   Read when: Editing pipeline latency/playout, the Modal RVC worker, the Render deployment, or debugging Windows-only degraded-audio behavior — holds the *why* and traps the code can't.
 
 If a non-trivial architecture question can't be answered from the file above, fall back
-to [LATENCY.md](LATENCY.md) (pipeline timing detail) or a targeted `git log`/grep before
-reading whole source files.
+to a targeted `git log`/grep before reading whole source files.
 
 ---
 

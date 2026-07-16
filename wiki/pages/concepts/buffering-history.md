@@ -41,6 +41,6 @@ current [[adaptive-playout-buffer]]:
 explicitly warns to check whether it's a regression of something already tried and
 reverted here before re-deriving a fix from scratch. [[active-backlog]] flags this area
 as high-risk for the same reason and requires re-running the spectral latency test
-(LATENCY.md §3) after any playout timing edit — there is no automated regression test
+(procedure in `.agents/context/subsystem-notes.md`) after any playout timing edit — there is no automated regression test
 for latency, and as of 2026-07-07 that manual test has **still not** been re-run against
 the current (step 9) design.

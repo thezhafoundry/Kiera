@@ -30,8 +30,8 @@ current roadmap and known tech debt.
   - First `modal deploy` of the streaming rebuild (path bugs fixed 2026-07-03).
 - Tech debt: buffering/pre-buffer logic reverted and re-implemented **five** times
   (now effectively a sixth with the TRT phase 1 1.25s reduction — see [[buffering-history]]).
-  Treat playout timing changes as high-risk, re-run the spectral latency test (LATENCY.md §3)
-  after any edit.
+  Treat playout timing changes as high-risk, re-run the spectral latency test (procedure in
+  `.agents/context/subsystem-notes.md`) after any edit.
 - `scripts/rvc_stream_benchmark.py` automates converter-path measurements, but is not yet a
   CI gate and cannot replace the manual PSTN mouth-to-ear test.
 - `RVC/` vendored third-party WebUI is checked into the repo tree for offline training
