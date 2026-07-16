@@ -516,29 +516,7 @@ def _save_debug_wavs(in_pcm16k: bytes, out_pcm48k: bytes) -> None:
     volume.commit()
 
 
-@app.function(
-    image=trt_image,   # includes ORT + TRT stack; required for USE_TRT to work at runtime
-    gpu="L4",
-    timeout=10800,
-    volumes={"/root/rvc-models": volume},
-    scaledown_window=120,   # keep container warm for 2 min between requests, then auto-shutdown
-    # Pin to Asia-Pacific so this GPU sits next to Render/Twilio in Singapore (Render moves
-    # there in Task 6), instead of Virginia (~13-19,000km / a full extra transpacific round
-    # trip per audio block on the persistent /ws stream). Narrow "ap-southeast" (Singapore)
-    # costs ~1.75x base GPU price vs ~1.5x for the broader "ap" — using the narrow pin here
-    # since this container talks to Render/Twilio in Singapore specifically, not elsewhere in APAC.
-    region="ap-southeast",
-    # _session_active (below) only enforces single-tenancy inside one already-running
-    # container — it does nothing to stop Modal's autoscaler from booting a second GPU
-    # container for a connection attempt that arrives while the first is still cold-starting
-    # (~75s) or mid-call. Cap at two containers for the approved two-call target;
-    # each container still admits only one active streaming session.
-    max_containers=2,
-    secrets=[modal.Secret.from_name("rvc-api-key")],
-    env={"USE_TRT": "1", rp.PROFILE_ENV_VAR: st.PROFILE_NAME},
-)
-@modal.asgi_app()
-def fastapi_app():
+def _build_web_app():
 
     @web_app.get("/health")
     def health():
@@ -554,6 +532,8 @@ def fastapi_app():
             "rvc_device": "cuda" if torch.cuda.is_available() else "cpu",
             "engine": engine.engine_kind,
             "model_version": engine.model_version,
+            "edge": os.getenv("RVC_EDGE_NAME", "unknown"),
+            "container_region": os.getenv("MODAL_REGION", "unknown"),
             "profile": st.PROFILE_NAME,
             "block_ms": st.BLOCK_MS,
             "context_ms": st.CONTEXT_MS,
@@ -832,6 +812,63 @@ def fastapi_app():
                     traceback.print_exc()
 
     return web_app
+
+
+def web_function_location(edge: str) -> dict:
+    """Return the immutable placement contract for a named RVC edge."""
+    locations = {
+        "legacy": {
+            "region": "ap-southeast",
+            "routing_region": None,
+            "edge_name": "legacy-us-east-route",
+        },
+        "ap": {
+            "region": "ap",
+            "routing_region": "ap-south",
+            "edge_name": "ap-south-route",
+        },
+    }
+    if edge not in locations:
+        raise ValueError(f"Unknown RVC web edge: {edge}")
+    return dict(locations[edge])
+
+
+def _web_function_options(edge: str) -> dict:
+    location = web_function_location(edge)
+    options = {
+        "image": trt_image,
+        "gpu": "L4",
+        "timeout": 10800,
+        "volumes": {"/root/rvc-models": volume},
+        "scaledown_window": 120,
+        "region": location["region"],
+        "max_containers": 2,
+        "secrets": [modal.Secret.from_name("rvc-api-key")],
+        "env": {
+            "USE_TRT": "1",
+            rp.PROFILE_ENV_VAR: st.PROFILE_NAME,
+            "RVC_EDGE_NAME": location["edge_name"],
+        },
+    }
+    if location["routing_region"] is not None:
+        options["routing_region"] = location["routing_region"]
+    return options
+
+
+# Keep the existing URL/function ID untouched as an immediate rollback path.
+@app.function(**_web_function_options("legacy"))
+@modal.asgi_app()
+def fastapi_app():
+    return _build_web_app()
+
+
+# New function name is required because Modal does not allow routing_region to
+# be changed on an already-deployed Function. Traffic reaches this edge through
+# Mumbai instead of Virginia, while broad AP placement improves L4 availability.
+@app.function(**_web_function_options("ap"))
+@modal.asgi_app()
+def fastapi_app_ap():
+    return _build_web_app()
 
 
 # ---- Local testing entrypoint (modal run) ----
