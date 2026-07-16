@@ -5,8 +5,8 @@ wiki. This index is the first stop for any query — find the page here, then dr
 
 ## Concepts (evergreen explanations)
 - [audio-pipeline-latency-budget](pages/concepts/audio-pipeline-latency-budget.md) — full
-  mouth-to-ear latency breakdown, stage by stage. Updated 2026-07-07 for the streaming
-  rebuild + TRT migration (was stale on VAD/T4/raw-fallback claims before that).
+  mouth-to-ear latency breakdown, stage by stage. Updated 2026-07-16 with the measured
+  320/400/80 RVC baseline and the still-pending production mouth-to-ear gate.
 - [adaptive-playout-buffer](pages/concepts/adaptive-playout-buffer.md) — the standing
   playout buffer: currently **0.25s** target/5s cap (as of `b38070c`), drop-oldest
   overflow, decoupled producer/consumer. Fifth distinct design this buffer has had. Has an
@@ -16,11 +16,15 @@ wiki. This index is the first stop for any query — find the page here, then dr
   one-revert migration path that led to the current buffer design; check here before
   re-fixing an old bug.
 - [rvc-cold-start](pages/concepts/rvc-cold-start.md) — Modal cold-start behavior
-  (measured ~75s, not the assumed 8-30s) and a confirmed production incident where a lead
+  (72.51s in the current L4 baseline; ~75s historically) and a confirmed incident where a lead
   heard raw voice for a whole call (historical — raw fallback no longer exists at all
   post-rebuild). The live worker moved from T4 to **L4** on 2026-07-03.
 
 ## Issues (open/resolved problems)
+- [rvc-baseline-routing-and-duration](pages/issues/rvc-baseline-routing-and-duration.md) —
+  **open, highest-priority RVC gate.** Modal v11 baseline is verified, but the first stream
+  lost 211.46ms of duration and was measured from a developer laptop. Compare stable/AP
+  routing from Render Singapore and run a warm staff PSTN test before Candidate B.
 - [control-plane-security-and-call-ordering-audit](pages/issues/control-plane-security-and-call-ordering-audit.md)
   — **open for deployment verification.** Operator bearer auth, Twilio signature validation,
   Modal auth, managed worker lifecycle, two-phase outbound dialing, fail-closed SIP gating,
@@ -28,8 +32,8 @@ wiki. This index is the first stop for any query — find the page here, then dr
 - [adaptive-pitch-lock-rollout](pages/issues/adaptive-pitch-lock-rollout.md) — **open,
   deployed + field-confirmed 2026-07-14.** Fixed-shift pitch constant replaced with a
   per-call adaptive lock after the constant itself went stale; two live calls confirmed
-  the lock math exactly. Open: an audible mid-call pitch jump never listen-tested before
-  shipping, and the 208Hz target itself is a single old reference measurement.
+  the lock math exactly. Modal v11 adds a tested one-second prior→locked interpolation;
+  open: live listening and revalidating the 208Hz target.
 - [playout-buffer-gulp-drain-oscillation](pages/issues/playout-buffer-gulp-drain-oscillation.md)
   — **open, found 2026-07-14.** The playout buffer's drain pattern lets it overshoot its
   0.25s target by 6-7x during sustained speech, three times in one 7-second utterance —
@@ -41,8 +45,8 @@ wiki. This index is the first stop for any query — find the page here, then dr
   Phase 2 (block 320ms, buffer 0.25s) benchmark 54ms/55ms median/p95 — but Phase 2 shipped
   without the week-long live soak its own gate called for. Same day, found+fixed a real
   audio bug (zeroed unvoiced-frame noise causing hissing/garbled consonants). Remaining:
-  C4 (offline A/B WAVs), a fresh C5 listen test against the noise fix, and confirming the
-  live Modal deploy is actually serving TRT (`/api/health` → `"engine": "trt"`).
+  C4 (offline A/B WAVs) and a fresh C5 listen test. Modal v11 has now confirmed the live
+  baseline is serving TensorRT with a hot cache; see [[rvc-baseline-routing-and-duration]].
 - [livekit-sip-trunk-stale](pages/issues/livekit-sip-trunk-stale.md) — **open.** First live
   outbound call after the Modal worker came back up failed to dial (`404 object cannot be
   found`); trunk recreated via `/api/setup`, but the Twilio webhook step 401'd separately and

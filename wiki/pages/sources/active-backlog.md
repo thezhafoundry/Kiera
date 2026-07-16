@@ -2,18 +2,18 @@
 title: .agents/projects/active-backlog.md
 type: source
 sources: [../../../.agents/projects/active-backlog.md]
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 [.agents/projects/active-backlog.md](../../../.agents/projects/active-backlog.md) —
 current roadmap and known tech debt.
 
 ## Key claims
-- Backlog (open, as of 2026-07-15): P0 items now cover credential rotation, control-plane
-  authentication, Modal authentication, managed worker/call ordering, and non-destructive
-  `/api/setup`. The code changes are local; provider secrets, deployment, and live-call
-  acceptance remain open.
-- Remaining high-priority verification includes the stale Twilio token, a retried outbound
+- Backlog (open, as of 2026-07-16): the RVC-first P0 gates are duration preservation,
+  stable/AP routing measurement from Render Singapore, and a warm staff PSTN baseline.
+  Modal authentication/deployment is resolved; production Render routing is unchanged.
+- Remaining high-priority verification includes the startup `F0Predictor` warm-up import,
+  Candidate B artifacts/quality after baseline gates, the stale Twilio token, a retried outbound
   call, confirming the deployed worker keeps debug WAV capture disabled, TRT live/C4/C5 checks, the
   adaptive-pitch listen test, and a real-call test of the bounded playout drain. See the
   linked issue pages in `wiki/index.md`.
@@ -22,7 +22,8 @@ current roadmap and known tech debt.
   RNNoise support.
 - **Resolved** (moved out of open backlog):
   - Modal/Render region mismatch (Render confirmed live in Singapore, 2026-07-03).
-  - Modal worker `max_containers` gap.
+  - Modal worker `max_containers` gap (current cap two per edge, one stream per container).
+  - Modal worker authentication deployment.
   - Unreliable GPU-side pitch/gender auto-detection.
   - FAISS index re-read-per-call.
   - SIP audio isolation field-name bug (confirmed live 2026-07-03).
@@ -31,8 +32,8 @@ current roadmap and known tech debt.
   (now effectively a sixth with the TRT phase 1 1.25s reduction — see [[buffering-history]]).
   Treat playout timing changes as high-risk, re-run the spectral latency test (LATENCY.md §3)
   after any edit.
-- No automated latency regression test — the spectral tone test is manual (two browser
-  tabs); a regression could ship without any CI signal.
+- `scripts/rvc_stream_benchmark.py` automates converter-path measurements, but is not yet a
+  CI gate and cannot replace the manual PSTN mouth-to-ear test.
 - `RVC/` vendored third-party WebUI is checked into the repo tree for offline training
   only, not runtime — worth confirming it's excluded from anything that scans/lints the
   whole repo.

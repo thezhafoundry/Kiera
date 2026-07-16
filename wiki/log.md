@@ -3,6 +3,22 @@
 Append-only. Format: `## [YYYY-MM-DD] ingest|query|lint | Title`.
 Parse recent entries with: `grep "^## \[" wiki/log.md | tail -5`
 
+## [2026-07-16] ingest | RVC-first baseline measured; routing and duration gates recorded
+
+Paused LLVC training/deployment after correcting the product assumption: Keira is a
+multi-client SaaS where clients upload target voices, so a separately trained causal LLVC
+model per voice is not the desired onboarding path. Retained its safety/test scaffolding and
+kept `LLVC_PILOT_ENABLED=false`.
+
+Recorded the authenticated Modal v11 RVC baseline: 320/400/80 profile, L4/TensorRT hot cache,
+30 blocks, 50.75/51.61ms median/p95 inference, 72.51s cold active readiness, zero drops, and
+-211.46ms duration delta over 9.6s. Added [[rvc-baseline-routing-and-duration]] to distinguish
+this developer-laptop converter result from the still-missing Render/PSTN mouth-to-ear test.
+The stable endpoint remains production; an AP-routed parallel edge exists only for a controlled
+Render-origin A/B. Also synchronized the one-second adaptive-pitch interpolation, current
+two-container cap, startup warm-up import failure, and Candidate B/C status across the source
+docs, second brain, and wiki.
+
 ## [2026-07-15] ingest | Control-plane hardening + session-close workflow implemented locally
 
 Closed the highest-risk local gaps found in the runtime review: operator routes now use

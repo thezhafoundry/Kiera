@@ -2,7 +2,7 @@
 title: RVC / Modal cold start behavior
 type: concept
 sources: [latency-md, subsystem-notes]
-updated: 2026-07-07
+updated: 2026-07-16
 ---
 
 > **Superseded 2026-07-02, GPU tier changed 2026-07-03:** the "2000ms budget → raw-voice
@@ -26,6 +26,13 @@ got *no response at all* for ~75s before it returned
 the 8–30s the code comments (and an earlier version of LATENCY.md) assumed. Once warm,
 RVC calls completed in 580–750ms. This measurement predates the 2026-07-03 T4→L4 move, so
 treat the absolute number as historical, not a current benchmark.
+
+**Measured live on the current L4/TensorRT baseline (2026-07-16):** an authenticated
+call-session readiness check took **72.51s** from cold. The narrow stable placement logged
+delayed L4 scheduling. A parallel broad-AP function was added for measurement, but its first
+container landed in Tokyo; broader placement is not the same as Singapore colocation. The
+startup sequence also logs a non-fatal `F0Predictor` import failure during its nominal
+warm-up before TRT becomes ready. See [[rvc-baseline-routing-and-duration]].
 
 **(Historical, pre-2026-07-02 rebuild) The 2000ms conversion budget** (`budget_ms=2000.0`
 in `_do_start_bot`, `backend/main.py`) was intentionally shorter than a cold start, so a
@@ -62,5 +69,6 @@ reports `ready` (or the 90s cap is hit, in which case it dials anyway with a war
 - A cold/unready GPU today blocks the call via the fail-closed warm gate
   (`worker.wait_until_ready`/`is_ready`) rather than degrading to raw voice — see the
   top-of-document banner and CLAUDE.md "Telephony & SIP".
-- See also [[modal-render-region-mismatch]] (resolved 2026-07-03 — Render and Modal are
-  now colocated in Singapore, so this is no longer an active concern).
+- See also [[modal-render-region-mismatch]] for the resolved historical Render compute
+  migration. Modal input routing and broad-AP placement are a separate current experiment
+  tracked in [[rvc-baseline-routing-and-duration]].

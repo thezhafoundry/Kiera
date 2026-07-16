@@ -3,7 +3,7 @@ title: Modal/Render region mismatch
 type: issue
 status: resolved
 sources: [decisions-log, subsystem-notes, stack-and-rules, active-backlog, latency-md]
-updated: 2026-07-03
+updated: 2026-07-16
 ---
 
 The Modal RVC worker ([modal_deploy/worker.py](../../../modal_deploy/worker.py)) is
@@ -17,6 +17,11 @@ originally described, consistent with the migration having actually happened at 
 without every doc (this page included) being updated to reflect it. All other pages/docs
 that cited "Render is in Oregon" (decisions log, subsystem notes, stack-and-rules, active
 backlog) have been corrected as of the same date.
+
+This resolution concerns the Render **compute region**. A separate 2026-07-16 experiment
+compares Modal's default US input route against an `ap-south` input edge with broad AP GPU
+placement. It does not reopen the historical Render migration, and production has not been
+switched. See [[rvc-baseline-routing-and-duration]].
 
 **Original impact (historical, no longer applies)**: every RVC call was paying a
 transpacific round trip on top of inference time, eating into the conversion latency

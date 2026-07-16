@@ -3,14 +3,15 @@
 ## Tech Stack
 - **Backend**: FastAPI (`backend/main.py`), async Python, `uvicorn`. Deployed to **Render**
   (service `Kiera`, `srv-d932m4cvikkc73belt1g`), now in **Singapore** — colocated with the
-  Modal `ap-southeast` pin (verified live via Render API 2026-07-03; service ID changed from
+  stable Modal function's `ap-southeast` compute pin (verified live via Render API 2026-07-03;
+  service ID changed from
   the old `srv-d92lh7navr4c738i03a0`/Oregon deployment, so the region migration tracked in
   [[active-backlog]] is done, not pending — see [[subsystem-notes]]).
 - **Media/Telephony**: LiveKit Cloud (WebRTC room + SIP), Twilio (Elastic SIP Trunk + PSTN
   phone number). Twilio webhook points at the Render server's `/api/call/inbound`.
-- **Voice conversion**: Dual-Track implementation.
-  - **RVC v2 (Stable Default)**: Served from a serverless **Modal** GPU worker (`modal_deploy/worker.py`, **L4** as of 2026-07-03, pinned `region="ap-southeast"`), driven as a persistent streaming session over a `/ws` endpoint. `RVCStreamingConverter` (`backend/converters/rvc_stream.py`) holds one long-lived duplex connection for the whole call.
-  - **LLVC (Low Latency Pilot)**: Opt-in (`LLVC_PILOT_ENABLED=true`) low latency voice conversion pilot. Runs on 20 ms blocks over a persistent WebSocket connection to the LLVC model server. `LLVCStreamingConverter` (`backend/converters/llvc_stream.py`) handles communication. A 2.0-second silence watchdog initiates fail-closed call termination if the stream fails mid-call. Fallback to RVC is automatic if LLVC is unavailable/unready before dialing. RVC HTTP `RVCVoiceConverter` (`backend/converters/rvc.py`) still exists but is offline-test-only.
+- **Voice conversion**: RVC-first production path; LLVC scaffolding retained but paused.
+  - **RVC v2 (Stable Default)**: Served from a Modal **L4/TensorRT** worker (`modal_deploy/worker.py`) over one persistent `/ws` session. Modal v11 exposes the legacy `fastapi_app` (`region="ap-southeast"`, default US input routing) and experimental `fastapi_app_ap` (`routing_region="ap-south"`, broad `region="ap"`). Render still selects the legacy endpoint; do not switch it until both are benchmarked from Render Singapore. Each function allows at most two containers; each container admits one active stream.
+  - **LLVC (Paused)**: `LLVC_PILOT_ENABLED=false`. `LLVCStreamingConverter`, the fake server, bounded reconnect logic, and the 2s fail-closed watchdog remain verified scaffolding. Do not train/deploy a per-voice LLVC model for the SaaS onboarding path; reassess a zero-shot or lightweight-conditioned streaming model after RVC optimization. RVC HTTP `RVCVoiceConverter` remains offline-test-only.
 - **Noise suppression**: `WebRTCNoiseSuppressor` / `RNNoiseSuppressor`
   (`backend/noise/noise_suppressor.py`), both degrade to passthrough if native libs are
   missing (notably on Windows — see [[subsystem-notes]]).
@@ -67,12 +68,13 @@
 | `backend/converters/dummy.py` | `DummyVoiceConverter` — ring-mod effect, no external API (local test). |
 | `backend/noise/noise_suppressor.py` | `NoiseSuppressor` ABC + WebRTC/RNNoise implementations — pluggability seam #2. |
 | `backend/test_pipeline.py` | Offline pipeline smoke tests, incl. `RVCStreamingConverter` reconnect/backoff/buffer-cap tests. |
-| `modal_deploy/worker.py` | Serverless RVC GPU worker deployed to Modal — serves `/health`, `/convert`, and the persistent `/ws` streaming session endpoint (1-concurrent-session MVP); routes to the TRT engine path when `USE_TRT=1`. |
+| `modal_deploy/worker.py` | RVC GPU worker deployed to Modal — shared `/health`, `/convert`, and persistent `/ws` ASGI app behind stable `fastapi_app` and experimental AP-routed `fastapi_app_ap`; one stream per container, maximum two containers per function. |
 | `modal_deploy/modal_defs.py` | Single source of truth for the Modal `volume`/`image`/`trt_image` definitions (TRT migration). |
 | `modal_deploy/trt_pipeline.py` | `TRTVoicePipeline` — 3-engine (HuBERT/generator/RMVPE) static-shape TensorRT inference wrapper. |
 | `modal_deploy/export_onnx.py` / `modal_deploy/compile_trt.py` | ONNX exporters with parity gates, and TRT engine-cache priming with a fatal ≤400ms benchmark gate. |
 | `modal_deploy/streaming.py` | Pure numpy/stdlib streaming DSP for the `/ws` path: `BlockAccumulator`, `trim_context`, `sola_crossfade`, `block_rms`. No Modal/GPU import — unit-testable standalone. |
 | `modal_deploy/test_streaming.py` / `modal_deploy/test_trt_pipeline.py` | Unit tests for `modal_deploy/streaming.py` and the TRT pipeline, without live Modal/GPU. |
 | `frontend/` | Vanilla HTML/JS/CSS agent dashboard. |
-| `scripts/` | `build_rnnoise.sh`, dataset prep/denoise helpers. |
+| `scripts/rvc_stream_benchmark.py` | Synthetic call-long benchmark for the real RVC WebSocket path; reports readiness, inference/network estimates, duration delta, profile/model metadata, and drop counters. |
+| `scripts/` | `build_rnnoise.sh`, dataset prep/denoise helpers, second-brain close-out tooling. |
 | `LATENCY.md` | Latency budget, log-reading guide, live troubleshooting log — read before touching pipeline timing. |

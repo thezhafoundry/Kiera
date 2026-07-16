@@ -2,13 +2,19 @@
 title: .agents/decisions/log.md
 type: source
 sources: [../../../.agents/decisions/log.md]
-updated: 2026-07-15
+updated: 2026-07-16
 ---
 
 [.agents/decisions/log.md](../../../.agents/decisions/log.md) — the agent's terse
 architecture-decision and migration history for Keira.
 
 ## Key claims
+- **2026-07-16 RVC-first decision:** LLVC training/deployment is paused for the multi-client
+  SaaS onboarding model. Named RVC profiles, readiness metadata, fingerprinting, and a real
+  WebSocket benchmark were added before tuning geometry.
+- Modal v11 authenticated baseline measured 50.75/51.61ms median/p95 inference and zero
+  drops, but -211.46ms duration delta. Stable/AP routing from Render and a staff PSTN test
+  remain gates; Render was not switched. Candidate C is not implemented.
 - **2026-07-15 control-plane hardening**: operator routes require a bearer token, Twilio
   callbacks require signature validation, Modal conversion endpoints require the RVC key,
   worker tasks are managed explicitly, outbound dialing is gated until the worker and agent
@@ -25,9 +31,9 @@ architecture-decision and migration history for Keira.
 - Four full revert/re-fix cycles before the current design — flagged as high-risk.
 - Explicit rejected alternatives: bidirectional conversion, fixed larger pre-buffer, longer
   RVC budget, causal/streaming-native model.
-- **Modal region**: `ap-southeast` pin confirmed correct; Render colocated (Singapore,
-  resolved 2026-07-03). See [[modal-render-region-mismatch]].
-- **2026-07-03 additions**: `max_containers=1`, pitch auto-detection reverted to manual UI,
+- **Modal region**: the historical Render compute mismatch is resolved; the newer Modal
+  input-routing A/B is tracked in [[rvc-baseline-routing-and-duration]].
+- **2026-07-03 additions**: the original container cap, pitch auto-detection reverted to manual UI,
   FAISS index monkeypatch cache, latency-for-quality tradeoff (standing buffer + bigger
   blocks).
 - **2026-07-05**: TensorRT migration planned; phased playout-buffer reversal approved

@@ -129,12 +129,15 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
 - `RVCEngine.startup()` raises `RuntimeError("No FAISS index found.")` if the Modal
   volume's `logs/mi-test/*.index` is empty — looks like a hang from the caller's side but
   is a missing-model error, only visible in `modal app logs rvc-worker`.
-- **Region mismatch: RESOLVED as of 2026-07-03 (was open 2026-07-02).** The Modal function
-  is pinned `region="ap-southeast"`; the Render service is now confirmed live in
-  **Singapore** (`srv-d932m4cvikkc73belt1g`, verified via Render API), colocated with Modal.
+- **Original compute-region mismatch: RESOLVED as of 2026-07-03 (was open 2026-07-02).**
+  The Render service is confirmed live in **Singapore**
+  (`srv-d932m4cvikkc73belt1g`, verified via Render API), matching the stable function's
+  `region="ap-southeast"` compute pin.
   The old "Render is in Oregon" claim was stale — the Render service ID also changed
   (from `srv-d92lh7navr4c738i03a0`), consistent with a migration having happened. Don't
-  re-open this in [[active-backlog]] without re-checking Render's current region first.
+  re-open that historical issue without re-checking Render's current region first. The
+  separate 2026-07-16 Modal **input-routing** A/B is still open; see the current snapshot
+  at the end of this file.
 - **FAISS index re-read from disk on every conversion call — fixed 2026-07-03.**
   `RVC/infer/modules/vc/pipeline.py` (vendored, not Keira's own code) calls
   `faiss.read_index(file_index)` then `index.reconstruct_n(0, index.ntotal)`
@@ -149,7 +152,8 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   before any real caller connects. Post-fix: `npy` time dropped to ~0.05s, total
   `run_conversion` to ~0.46-0.59s per block. If you ever see the old ~1.4-2.0s `npy` number
   again, suspect the monkeypatch didn't survive a `worker.py` refactor, not a new bottleneck.
-- **`max_containers` was never set on `fastapi_app` — fixed 2026-07-03.** The in-process
+- **`max_containers` was never set on `fastapi_app` — fixed 2026-07-03; cap increased for
+  the approved two-call target on 2026-07-16.** The in-process
   `_session_active`/`_session_lock` single-tenancy gate (above) only enforces "1 session"
   *inside a single already-running container* — it does nothing to stop Modal's autoscaler
   from booting an additional (paid) GPU container for a connection attempt that arrives
@@ -157,8 +161,11 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   simultaneous `rvc-worker` containers were running at once in the Modal dashboard, each a
   full GPU replica (~1.7-1.8GB loaded model each) — traced to WS reconnects/retries during
   active test-calling landing on different containers rather than queuing against one. Fixed
-  by adding `max_containers=1` to the `@app.function(...)` decorator on `fastapi_app`
-  (`worker.py`) so extra connection attempts queue instead of spinning up parallel GPUs.
+  initially by adding `max_containers=1`. The current worker uses `max_containers=2` for
+  each exposed function, while the in-container gate still permits one active streaming
+  session per container. This supports at most two sessions per edge without sharing model
+  state inside a container. Do not interpret the two deployed edges as a four-call production
+  promise: Render selects only the stable edge, and the AP edge is an A/B experiment.
 - **Gender/pitch auto-detection is unreliable — reverted 2026-07-03.** `_auto_detect_pitch`'s
   autocorrelation F0 estimate (male/female boundary at 145Hz) was intended to replace the
   manual UI gender toggle (`a0f3c42`, "more accurate" at the time) but confirmed misdetecting
@@ -194,10 +201,10 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   208Hz, 2.0s voiced, prior +7.0)` and `locked shift=+5.67 st (median F0=149.9Hz →
   target 208Hz, 2.1s voiced, prior +7.0)` — both math-exact against the formula,
   confirming the mechanism and the reconnect-resume design work as built. Two open
-  items surfaced by actually listening: (1) the prior→locked transition is one
-  audible pitch **jump** roughly 20-26s into the call — never listen-tested before
-  shipping (the design's own lock-once-not-continuous tradeoff, now confirmed to have
-  a real audible cost, not just a hypothetical one); (2) `RVC_TARGET_F0=208` is a
+  items surfaced by actually listening: (1) the initial abrupt transition was audible;
+  Modal v11 now interpolates from the prior to the locked pitch over one second and the
+  interpolation is unit-tested, but still needs a fresh live listen; (2)
+  `RVC_TARGET_F0=208` is a
   single 2026-07-08 reference-output measurement, not derived from the model's
   training data — worth re-validating if a user's identity complaint persists after
   ruling out the input-muffling regression noted above. See [[active-backlog]].
@@ -504,3 +511,31 @@ artifacts and diff stage-by-stage:
 Envelope method: 20ms RMS envelopes; windowed xcorr out48k↔twilio-conv gives delay(t)
 (flat lag ⇒ downstream loss is packet loss; step-ups ⇒ playout underruns); replaying the
 320ms/RMS<150 silence gate over in16k reproduces out48k's zero mask (~97% agreement).
+
+## RVC-first baseline and Modal routing experiment (2026-07-16)
+
+- **Product decision:** optimize the upload-and-train RVC path first. Keira is intended as
+  a multi-client SaaS, not one permanently fixed Keira voice, so per-client LLVC-from-scratch
+  training is paused. Keep `LLVC_PILOT_ENABLED=false`; retain its converter, fake service,
+  safety watchdog, and tests as scaffolding for a later zero-shot/conditioned model review.
+- **Modal v11 is live and authenticated.** The `rvc-api-key` secret is present and an
+  authenticated WebSocket received `ready`. The ready payload reports the effective profile,
+  block/context/SOLA/output geometry, TensorRT engine/cache state, and an artifact-derived
+  model/index fingerprint. Credential rotation and Modal CLI authentication were confirmed
+  by the user; do not copy secret values into docs or reports.
+- **Stable vs experimental edge:** `fastapi_app` remains the production rollback endpoint
+  (`region="ap-southeast"`, default Modal input routing through Virginia).
+  `fastapi_app_ap` is a separate experiment with `routing_region="ap-south"` and broad
+  `region="ap"`; its first health container landed in Tokyo (`ap-northeast-1`). Render is
+  still configured for the stable endpoint. Compare both from Render Singapore before any
+  endpoint switch; developer-laptop geography is not representative.
+- **Measured baseline:** one 9.6s synthetic, call-long WebSocket session produced 30 blocks.
+  Active readiness from cold was 72,510.73ms. TensorRT inference median/p95 was
+  50.75/51.61ms; converter wait 1207.11/1358.56ms; estimated network
+  837.05/988.91ms. There were no input/output/connection drops. Output was 9388.54ms,
+  **211.46ms shorter** than input. This is a converter-path measurement, not mouth-to-ear.
+- **Open gates:** diagnose the duration loss (including finite-stream SOLA tail behavior),
+  run the stable/AP A/B from Render, repair the non-fatal startup warm-up import error
+  (`F0Predictor` module path), perform one warm staff PSTN spectral/listen test, and only
+  then benchmark Candidate B (160/240/40/160) with matching TensorRT artifacts. Candidate C
+  is not implemented. Do not promote a profile from laptop results alone.
