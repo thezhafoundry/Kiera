@@ -88,17 +88,6 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   ear against this specific mechanism. Fix direction not yet chosen: either drain the buffer
   in small steady increments instead of one gulp, or re-tune target/consumer pacing. See
   [[active-backlog]].
-- **Update (2026-07-16): the 2026-07-15 bounded-100ms-chunk fix did not resolve this.** A
-  fresh call's `[Worker][LatencySummary]` telemetry showed the identical oscillation
-  signature (`playout_buffer_bytes` swinging between ~0 and 500-740ms repeatedly across the
-  call, `converter_wait_ms`/`network_rtt_ms` consistently 900-1900ms against a 320ms block
-  budget). Smaller bounded chunks reduced the size of each burst but didn't remove the
-  mechanism: `_run_playout_consumer` still had no wall-clock pacing of its own, only
-  LiveKit's `capture_frame` backpressure (~200ms queue headroom), which still let a
-  backlogged 100ms chunk through faster than real time. Fixed by adding an explicit,
-  self-correcting `next_publish_time` pacer directly in the consumer loop -- see
-  `docs/superpowers/plans/2026-07-16-playout-consumer-real-time-pacing.md`. Live listen
-  confirmation against this specific fix is still open (Task 3 of that plan).
 - **`rtc.AudioFrame.data` is an int16-typed `memoryview` — `len()` on it returns *sample*
   count, not byte count.** (`len(frame.data)` on a 960-byte/480-sample frame returns 480,
   not 960.) Wrap it as `bytes(frame.data)` first if you need the real byte length — this is

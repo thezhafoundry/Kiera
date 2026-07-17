@@ -26,7 +26,7 @@
 | Compile RNNoise / get `webrtc-noise-gain` MSVC build working on Windows. | Low | Open |
 | **Adaptive pitch lock**: one-second prior→locked interpolation is implemented, deployed in Modal v11, and covered by tests; listen-test the transition and revalidate `RVC_TARGET_F0=208`. | High | Live listening follow-up open |
 | **Input audio muffled again**: perform a genuine hard refresh before the next field call; static JS/CSS now receive no-cache headers locally. | High | Local cache-control fix implemented 2026-07-15; live hard-refresh verification pending |
-| **Playout buffer overshoots and gulp-drains** during long continuous speech. 2026-07-15 fix (bounded 100ms drain chunks) alone did not resolve it -- 2026-07-16 live call telemetry still showed the same oscillation (playout_buffer_bytes swinging 0 to 500-740ms repeatedly across one call). Root cause: the consumer had no wall-clock pacing of its own, only LiveKit backpressure, which has enough queue headroom to let backlogged chunks through faster than real time. Fixed with an explicit real-time pacer in `_run_playout_consumer` (see `docs/superpowers/plans/2026-07-16-playout-consumer-real-time-pacing.md`). | High | Local fix implemented 2026-07-16; live listen test pending |
+| **Playout buffer overshoots and gulp-drains** during long continuous speech; consumer now drains bounded 100ms chunks. | High | Local fix implemented 2026-07-15; targeted live listen test pending |
 
 ## Resolved
 | Task | Resolved | Notes |
