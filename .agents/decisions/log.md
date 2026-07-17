@@ -13,6 +13,7 @@ tracks pipeline/architecture migrations instead:
 | — | `2a20b3a` | Removed an `age_before` check that was silently dropping/silencing lead audio; added a 4s pre-buffer timeout fallback. |
 | 2026-07-02 | `6661db7` | Rewrote LATENCY.md with live-measured numbers and added the 4s timeout regression note. |
 | 2026-07-02 | `fe678d6` | Replaced the one-shot pre-buffer with the current adaptive, per-session standing playout buffer described in LATENCY.md §5 / [[subsystem-notes]]. |
+| 2026-07-17 | `634c4fb` (reverted `e82bb29`) | Tried an explicit real-time pacer (`next_publish_time`) in `_run_playout_consumer` to fix backlog-burst breaking; implemented, tested, and task-reviewer-approved, but reverted by the user same-day without a stated reason. See narrative entry below. |
 | 2026-07-02 | `f3c16ed` (Tasks 1-5) | Streaming rebuild: replaced the VAD-chunked HTTP-per-request pipeline (rows above) with a persistent-WebSocket duplex streaming design, a never-raw/fail-closed audio policy, and a fail-closed pre-dial/pre-bridge warm gate — see the dedicated entry below. |
 
 Note the `eb016f3`/`da46c48` "Reverted: Buffer Changed for voice issue" commits bracketing
@@ -478,3 +479,32 @@ not a Render-origin or PSTN mouth-to-ear result. The duration loss, Render-origi
 A/B, non-fatal `F0Predictor` startup-warm-up import failure, and a warm staff PSTN test are
 hard gates before lowering block/buffer sizes. The one-second adaptive-pitch interpolation
 is implemented/tested in v11 but still needs that live listen test.
+
+## 2026-07-17 — Real-time playout pacer implemented, reviewed, deployed, then reverted same-day
+
+**Diagnosed why "voice was clear at first, then breaking" from a real PSTN call's Twilio
+recording and `[Worker][LatencySummary]` telemetry.** `playout_buffer_bytes` was clean for
+the first ~15-20 blocks then oscillated between ~0 and 500-740ms for the rest of the call,
+matching the 2026-07-14 "Open finding" in [[subsystem-notes]] almost exactly — the 2026-07-15
+bounded-100ms-drain fix for that finding had not resolved it. Root cause: `_run_playout_consumer`
+had no wall-clock pacing of its own, only LiveKit's `capture_frame` backpressure (~200ms queue
+headroom), which still let a backlogged chunk through faster than real time whenever
+`converter_wait_ms`/`network_rtt_ms` (consistently 900-1900ms against a 320ms block budget)
+put the pipeline behind.
+
+**Implemented a self-correcting `next_publish_time` pacer** in `_run_playout_consumer`
+(plan: `docs/superpowers/plans/2026-07-16-playout-consumer-real-time-pacing.md`) via
+subagent-driven-development. Task-reviewer approved the code (all Global Constraints held,
+correct self-correction on genuine stalls); the one Important finding was about the
+implementer's report overstating verification confidence, not a code defect, and was
+corrected directly. Deployed to Render (`634c4fb`..`a265262` pushed to `origin/main`).
+
+**Reverted same session, same day, before any live listen test happened.** The user asked to
+revert `634c4fb` (code) and, separately, `14f9bca` (the backlog/subsystem-notes doc claims
+this fix generated) — both as explicit, deliberate revert commits (`e82bb29`, `c5eea8c`),
+pushed to `origin/main`. **The user did not state a reason** despite being asked directly;
+`main` is now back to exactly its pre-2026-07-17 state (the 2026-07-15 bounded-100ms fix is
+again the last real attempt, `active-backlog.md` again says "targeted live listen test
+pending"). Do not re-propose this identical pacer design without first asking the user why it
+was reverted — the plan document and this entry exist so the reasoning/code aren't lost, but
+the revert itself is unexplained and should not be treated as "just needs to be redone."

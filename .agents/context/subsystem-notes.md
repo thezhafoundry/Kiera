@@ -589,6 +589,17 @@ diverge for as long as nobody runs `modal deploy`.
   (VAD-based chunking was deleted, not just made optional) — the old "without it, chunking
   falls back to fixed max-length" note no longer applies to anything. It's effectively an
   unused dependency now regardless of platform.
+- **`python -m backend.test_pipeline` is not reliably green on this Windows dev machine, and
+  that's pre-existing/environmental, not necessarily a regression (confirmed 2026-07-17).**
+  Three consecutive full-suite runs each failed at a *different* point in the
+  `RVCStreamingConverter` WS-reconnect test family (`test_rvc_streaming_converter_buffer_cap_drop_oldest`,
+  `test_rvc_ready_metadata_drives_dynamic_block_timing`) — both exercise real in-process
+  `websockets.serve` servers against finite wall-clock deadlines and are sensitive to
+  scheduling jitter when the whole suite runs sequentially in one event loop under load.
+  Before treating a full-suite failure as caused by your change: re-run just the failing test
+  in isolation (`python -c "import asyncio; from backend.test_pipeline import <name>; asyncio.run(<name>())"`)
+  — if it passes alone, and the code you changed doesn't share any state/import path with it,
+  it's very likely this same pre-existing flakiness, not your diff.
 
 ## Voice identity & clarity: pitch range + input-chain fidelity (root-caused 2026-07-08)
 Why live calls never sounded like the trained voice AND were muffled — two *independent*
