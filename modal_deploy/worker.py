@@ -848,6 +848,7 @@ def _web_function_options(edge: str) -> dict:
             "USE_TRT": "1",
             rp.PROFILE_ENV_VAR: st.PROFILE_NAME,
             "RVC_EDGE_NAME": location["edge_name"],
+            "DEBUG_SAVE_AUDIO": "1",
         },
     }
     if location["routing_region"] is not None:
