@@ -1,20 +1,11 @@
 """Small dependency-free security helpers shared by the control plane and tests."""
 
-import hmac
 import re
 import time
 
 
 _E164_RE = re.compile(r"^\+\d{8,15}$")
 _IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-
-
-def verify_bearer_token(authorization: str, configured_token: str) -> bool:
-    """Return True only for an exact Bearer token match."""
-    if not configured_token or not authorization.startswith("Bearer "):
-        return False
-    presented = authorization[7:].strip()
-    return bool(presented) and hmac.compare_digest(presented, configured_token)
 
 
 def validate_e164_phone(value: str) -> bool:

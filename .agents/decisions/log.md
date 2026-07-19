@@ -508,3 +508,25 @@ again the last real attempt, `active-backlog.md` again says "targeted live liste
 pending"). Do not re-propose this identical pacer design without first asking the user why it
 was reverted — the plan document and this entry exist so the reasoning/code aren't lost, but
 the revert itself is unexplained and should not be treated as "just needs to be redone."
+
+## 2026-07-19 — Removed the KEIRA_CONTROL_TOKEN operator-auth gate (frontend + backend)
+
+**Removed the bearer-token control-plane auth added 2026-07-15 (`e501104`, see entry above)
+at explicit user request ("remove the kiera control token thing" → confirmed scope as "remove
+everywhere both front and back").** Deleted: `frontend/app.js`'s `getControlToken()` prompt,
+the `Authorization: Bearer` header on `apiFetch`, and the `keira-auth.<token>` WS subprotocol;
+backend `require_control_token` dependency and its use on every operator route
+(`/api/token`, `/api/start-bot`, `/api/stop-bot`, `/api/call/*`, `/api/setup`, `/api/warmup`,
+`/api/deploy`), the `/api/call/ws` handshake check, `CONTROL_PLANE_TOKEN`, and the now-dead
+`verify_bearer_token` helper + its unit test in `backend/test_control_plane.py`. Also dropped
+`KEIRA_CONTROL_TOKEN` from `render.yaml`, `README.md` §3, and CLAUDE.md's control-plane rules
+and env-var list. Twilio signature validation (`require_twilio_signature`) and rate limiting
+are untouched — this only removed the operator/dashboard bearer-token gate.
+
+**Net effect: every operator HTTP route and the call-events WebSocket are now unauthenticated.**
+On the public Render deployment this means anyone who can reach the URL can start/stop bots,
+place outbound calls, or trigger `/api/deploy` — this is a deliberate regression of the P0 fix
+from `e501104`, not an oversight. Changes were made locally only, not committed or pushed, per
+explicit instruction. If control-plane auth is wanted again later, `e501104`'s diff (and this
+repo's git history around 2026-07-15) has the previous implementation to reference rather than
+rebuilding from scratch.

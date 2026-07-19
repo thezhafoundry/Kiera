@@ -75,7 +75,6 @@ LIVEKIT_API_SECRET=your_livekit_api_secret
 # RVC Serverless GPU
 RVC_ENDPOINT_URL=https://your-modal-app--rvc-convert.modal.run
 RVC_API_KEY=your_modal_secret_value # must match the Modal rvc-api-key secret
-KEIRA_CONTROL_TOKEN=your_operator_token # required for dashboard/control routes
 RVC_PITCH_SHIFT=0 # fallback semitones; dashboard selects male/female per call
 RVC_INDEX_RATE=0.9 # FAISS-retrieved timbre mix; defaults to 0.9 if unset
 RVC_WS_URL= # optional explicit /ws URL override; derived from RVC_ENDPOINT_URL if unset
