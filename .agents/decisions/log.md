@@ -526,7 +526,46 @@ are untouched — this only removed the operator/dashboard bearer-token gate.
 **Net effect: every operator HTTP route and the call-events WebSocket are now unauthenticated.**
 On the public Render deployment this means anyone who can reach the URL can start/stop bots,
 place outbound calls, or trigger `/api/deploy` — this is a deliberate regression of the P0 fix
-from `e501104`, not an oversight. Changes were made locally only, not committed or pushed, per
-explicit instruction. If control-plane auth is wanted again later, `e501104`'s diff (and this
-repo's git history around 2026-07-15) has the previous implementation to reference rather than
-rebuilding from scratch.
+from `e501104`, not an oversight. If control-plane auth is wanted again later, `e501104`'s diff
+(and this repo's git history around 2026-07-15) has the previous implementation to reference
+rather than rebuilding from scratch.
+
+**Correction, same day:** this was made and left as a local-only, uncommitted change per
+explicit instruction ("do not push the code into main"). The user then committed it directly
+in the IDE anyway (`1f1fb5d`, "Removed Control Token from backend and frnotend", 16:22 IST)
+and pushed to `origin/main` — outside this session's visibility; only surfaced during
+`second-brain-close`. Per `render.yaml`'s `autoDeploy: commit`, that push has already
+redeployed the backend, so **the control plane is unauthenticated in production right now**,
+not just locally. See [[active-backlog]]'s updated row. Consistent with the established
+[[feedback_concurrent-repo-edits]] pattern — re-check git state after any gap rather than
+trusting the last-known instruction.
+
+## 2026-07-19 — Two call-diagnosis findings: GPU preemption outage, then a SOLA micro-glitch
+
+**Call 1, 16:29:59 IST (`CA7b845842d9d8eda788c8f2143f32feb2`, 65s):** agent-voice audio ran
+normally for the first 33s then went completely silent for the remaining ~31s of a still-
+connected call. Cross-referencing the Twilio dual-channel recording (envelope analysis),
+Render's `[RVCStreamingConverter]` logs (endless "reconnect buffer full — dropped oldest
+input frame" spam plus one logged `WS connection lost/failed: server rejected WebSocket
+connection: HTTP 500`), and Modal's own worker logs for the window pinned the root cause to
+the second: **Modal preempted the GPU_L4 container serving the call at 16:30:32 IST** (`
+Container terminated due to preemption`) — exactly the moment the audio dropped — and the
+`ap-southeast` region was capacity-constrained enough that no replacement container came up
+for the rest of the call, or for 13 minutes afterward. This is a Modal platform-level/regional
+capacity issue, not a pipeline bug — the fail-closed silence-on-outage design (see
+[[subsystem-notes]]) behaved correctly. Directly corroborates the open "A/B Modal routing"
+backlog row (`ap-southeast` vs `ap-south`/broader `ap`) as an availability risk, not just a
+latency one. No code changed for this finding.
+
+**Call 2, 21:20:40 IST (`CA097fa9be0e716fb489b373bb89e474a6`, 62s), after `DEBUG_SAVE_AUDIO=1`
+was turned back on for this investigation (see [[active-backlog]]):** user reported one word
+("stating," from a fixed diagnostic script) sounded unclear while the rest of the call was
+fine. With the Modal debug `in16k`/`out48k` WAV pair now available, a direct pre- vs. post-
+conversion comparison (5ms RMS envelope) around the phrase's timing (~19.2–21.5s) found the
+raw input continuous and unbroken there, but the converted output had a genuine **~40–60ms
+silence gap spliced in mid-phrase at t≈20.66–20.72s** that doesn't exist in the source. Modal
+and Render logs for this call's window are clean — no preemption, reconnects, or errors — so
+this is a different failure class from Call 1: a small, intermittent artifact consistent with
+a SOLA-splice/block-boundary handoff (320ms block, 80ms SOLA crossfade) rather than a
+data-loss or capacity event. Leading hypothesis only, not yet root-caused in
+`modal_deploy/streaming.py`; flagged for the user, no code changed.
