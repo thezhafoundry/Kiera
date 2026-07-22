@@ -37,9 +37,11 @@ class DesktopSessionStore:
 
         ticket = secrets.token_urlsafe(32)
         ticket_hash = self._hash_ticket(ticket)
-        expires_at = self._clock() + self._ttl_seconds
 
         with self._lock:
+            now = self._clock()
+            self._purge_expired(now)
+            expires_at = now + self._ttl_seconds
             self._tickets[ticket_hash] = (profile, expires_at)
 
         return ticket, self._ttl_seconds
@@ -48,16 +50,26 @@ class DesktopSessionStore:
         ticket_hash = self._hash_ticket(ticket)
 
         with self._lock:
+            now = self._clock()
+            self._purge_expired(now)
             entry = self._tickets.pop(ticket_hash, None)
+            if entry is None:
+                return None
 
-        if entry is None:
-            return None
+            profile, expires_at = entry
+            if now >= expires_at:
+                return None
 
-        profile, expires_at = entry
-        if self._clock() >= expires_at:
-            return None
+            return profile
 
-        return profile
+    def _purge_expired(self, now: float) -> None:
+        expired_hashes = [
+            ticket_hash
+            for ticket_hash, (_, expires_at) in self._tickets.items()
+            if now >= expires_at
+        ]
+        for ticket_hash in expired_hashes:
+            del self._tickets[ticket_hash]
 
     @staticmethod
     def _hash_ticket(ticket: str) -> str:
