@@ -89,10 +89,17 @@ class ReadinessConverter(FakeConverter):
         self.release = release
         self.probe_started = asyncio.Event()
         self.probe_finished = asyncio.Event()
+        self.stream_started = asyncio.Event()
         self.probe_timeout: float | None = None
         self.close_called = False
 
-    async def wait_ready(self, timeout: float) -> bool:
+    async def convert_stream(self, in_audio: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        self.stream_started.set()
+        async for chunk in super().convert_stream(in_audio):
+            yield chunk
+
+    async def wait_stream_ready(self, timeout: float) -> bool:
+        assert self.stream_started.is_set()
         self.probe_timeout = timeout
         self.probe_started.set()
         if self.release is not None:
@@ -240,6 +247,7 @@ async def test_bridge_sends_ready_only_after_converter_readiness_probe_succeeds(
     task = asyncio.create_task(DesktopAudioBridge(converter).run(websocket))
 
     await asyncio.wait_for(converter.probe_started.wait(), timeout=1)
+    assert converter.stream_started.is_set()
     assert converter.probe_finished.is_set() is False
     assert websocket.json_messages == []
     assert converter.probe_timeout == 150.0

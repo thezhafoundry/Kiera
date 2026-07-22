@@ -173,34 +173,12 @@ class DesktopAudioBridge:
                 await websocket.close(code=1008, reason="Invalid audio config")
                 return
 
-        wait_ready = getattr(self.converter, "wait_ready", None)
-        if callable(wait_ready):
-            try:
-                async with asyncio.timeout(self.readiness_timeout):
-                    converter_ready = await wait_ready(self.readiness_timeout)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                converter_ready = False
-
-            if converter_ready is not True:
-                with contextlib.suppress(Exception):
-                    await self.aclose()
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "code": "converter_unavailable",
-                        "message": "conversion backend unavailable",
-                    }
-                )
-                await websocket.close(code=1011, reason="Conversion backend unavailable")
-                return
-
         input_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=self.input_queue_frames
         )
         input_closed = asyncio.Event()
         output_buffer = bytearray()
+        playout_enabled = asyncio.Event()
         failed = False
         stats_tasks: set[asyncio.Task[None]] = set()
 
@@ -290,11 +268,14 @@ class DesktopAudioBridge:
                 async with contextlib.aclosing(self.converter.convert_stream(input_frames())) as stream:
                     async for chunk in stream:
                         for frame in split_output_frames(output_buffer, chunk):
+                            await playout_enabled.wait()
                             await websocket.send_bytes(frame)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 failed = True
+                if not playout_enabled.is_set():
+                    return
                 await drain_stats()
                 await websocket.send_json(
                     {"type": "error", "message": f"conversion failed: {exc}"}
@@ -302,9 +283,39 @@ class DesktopAudioBridge:
                 await websocket.send_bytes(silence_frame())
                 await websocket.close(code=1011, reason="Conversion failed")
 
-        await websocket.send_json({"type": "ready"})
-        receive_task = asyncio.create_task(receive_input())
         convert_task = asyncio.create_task(convert_output())
+        # Let the async generator enter its long-lived stream setup before
+        # waiting for an optional persistent-session readiness hook.
+        await asyncio.sleep(0)
+        wait_stream_ready = getattr(self.converter, "wait_stream_ready", None)
+        if callable(wait_stream_ready):
+            try:
+                async with asyncio.timeout(self.readiness_timeout):
+                    converter_ready = await wait_stream_ready(self.readiness_timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                converter_ready = False
+
+            if converter_ready is not True:
+                with contextlib.suppress(Exception):
+                    await self.aclose()
+                convert_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await convert_task
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "code": "converter_unavailable",
+                        "message": "conversion backend unavailable",
+                    }
+                )
+                await websocket.close(code=1011, reason="Conversion backend unavailable")
+                return
+
+        await websocket.send_json({"type": "ready"})
+        playout_enabled.set()
+        receive_task = asyncio.create_task(receive_input())
         done, pending = await asyncio.wait(
             {receive_task, convert_task},
             return_when=asyncio.FIRST_COMPLETED,
