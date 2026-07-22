@@ -19,8 +19,8 @@ from backend.converters.base import VoiceConverter
 class FakeWebSocket:
     """In-memory binary WebSocket used to exercise relay behavior."""
 
-    def __init__(self, incoming: list[bytes | BaseException]) -> None:
-        self._incoming: asyncio.Queue[bytes | BaseException] = asyncio.Queue()
+    def __init__(self, incoming: list[bytes | dict | BaseException]) -> None:
+        self._incoming: asyncio.Queue[bytes | dict | BaseException] = asyncio.Queue()
         for message in incoming:
             self._incoming.put_nowait(message)
         self.binary_messages: list[bytes] = []
@@ -31,6 +31,14 @@ class FakeWebSocket:
         message = await self._incoming.get()
         if isinstance(message, BaseException):
             raise message
+        return message
+
+    async def receive_json(self) -> dict:
+        message = await self._incoming.get()
+        if isinstance(message, BaseException):
+            raise message
+        if not isinstance(message, dict):
+            raise ValueError("expected JSON config")
         return message
 
     async def send_bytes(self, message: bytes) -> None:
@@ -107,6 +115,18 @@ class StatsConverter(VoiceConverter):
             yield b""
 
 
+VALID_CONFIG = {
+    "type": "config",
+    "sample_rate_in": 16000,
+    "sample_rate_out": 48000,
+    "frame_ms": 20,
+}
+
+
+def configured(incoming: list[bytes | BaseException]) -> list[dict | bytes | BaseException]:
+    return [VALID_CONFIG, *incoming]
+
+
 async def run_bridge(websocket: FakeWebSocket, converter: FakeConverter, **kwargs) -> None:
     bridge = DesktopAudioBridge(converter, **kwargs)
     await asyncio.wait_for(bridge.run(websocket), timeout=1)
@@ -170,7 +190,7 @@ def test_silence_frame_matches_output_contract():
 @pytest.mark.asyncio
 async def test_bridge_sends_ready_and_converted_output_frames():
     sentinel = b"input-sentinel" + bytes(640 - len("input-sentinel"))
-    websocket = FakeWebSocket([sentinel, asyncio.CancelledError()])
+    websocket = FakeWebSocket(configured([sentinel, asyncio.CancelledError()]))
     converter = FakeConverter(output=bytes(1921))
 
     await run_bridge(websocket, converter)
@@ -183,7 +203,7 @@ async def test_bridge_sends_ready_and_converted_output_frames():
 
 @pytest.mark.asyncio
 async def test_bridge_rejects_malformed_input_without_converter_input():
-    websocket = FakeWebSocket([bytes(639), asyncio.CancelledError()])
+    websocket = FakeWebSocket(configured([bytes(639), asyncio.CancelledError()]))
     converter = FakeConverter()
 
     await run_bridge(websocket, converter)
@@ -196,7 +216,7 @@ async def test_bridge_rejects_malformed_input_without_converter_input():
 async def test_bridge_drops_oldest_input_when_queue_is_full():
     start = asyncio.Event()
     frames = [bytes([index]) * 640 for index in range(3)]
-    websocket = FakeWebSocket([*frames, asyncio.CancelledError()])
+    websocket = FakeWebSocket(configured([*frames, asyncio.CancelledError()]))
     converter = FakeConverter(start=start)
     bridge = DesktopAudioBridge(converter, input_queue_frames=2)
 
@@ -216,7 +236,7 @@ async def test_bridge_drops_oldest_input_when_queue_is_full():
 @pytest.mark.asyncio
 async def test_bridge_fails_closed_when_converter_raises():
     sentinel = b"input-sentinel" + bytes(640 - len("input-sentinel"))
-    websocket = FakeWebSocket([sentinel])
+    websocket = FakeWebSocket(configured([sentinel]))
     converter = FakeConverter(fail=True)
 
     await run_bridge(websocket, converter)
@@ -230,7 +250,7 @@ async def test_bridge_fails_closed_when_converter_raises():
 
 @pytest.mark.asyncio
 async def test_bridge_closes_converter_before_waiting_for_disconnect_shutdown():
-    websocket = FakeWebSocket([asyncio.CancelledError()])
+    websocket = FakeWebSocket(configured([asyncio.CancelledError()]))
     converter = CloseRequiredConverter()
 
     await asyncio.wait_for(DesktopAudioBridge(converter).run(websocket), timeout=1)
@@ -241,7 +261,7 @@ async def test_bridge_closes_converter_before_waiting_for_disconnect_shutdown():
 
 @pytest.mark.asyncio
 async def test_bridge_relays_sanitized_converter_stats():
-    websocket = FakeWebSocket([asyncio.CancelledError()])
+    websocket = FakeWebSocket(configured([asyncio.CancelledError()]))
     converter = StatsConverter()
 
     await asyncio.wait_for(DesktopAudioBridge(converter).run(websocket), timeout=1)
@@ -253,6 +273,34 @@ async def test_bridge_relays_sanitized_converter_stats():
     } in websocket.json_messages
     assert all("raw_audio" not in message for message in websocket.json_messages)
     assert all("nested" not in message for message in websocket.json_messages)
+
+
+@pytest.mark.asyncio
+async def test_bridge_requires_config_before_ready_or_audio():
+    websocket = FakeWebSocket([bytes(640)])
+    converter = FakeConverter()
+
+    await asyncio.wait_for(DesktopAudioBridge(converter).run(websocket), timeout=1)
+
+    assert converter.inputs == []
+    assert websocket.json_messages == [
+        {"type": "error", "code": "invalid_config", "message": "expected JSON config"}
+    ]
+    assert websocket.closed
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_wrong_config_sample_rates():
+    config = {**VALID_CONFIG, "sample_rate_out": 16000}
+    websocket = FakeWebSocket([config, bytes(640)])
+    converter = FakeConverter()
+
+    await asyncio.wait_for(DesktopAudioBridge(converter).run(websocket), timeout=1)
+
+    assert converter.inputs == []
+    assert websocket.json_messages[0]["type"] == "error"
+    assert websocket.json_messages[0]["code"] == "invalid_config"
+    assert websocket.closed
 
 
 def test_desktop_session_requires_control_token_and_issues_single_use_ticket(monkeypatch):

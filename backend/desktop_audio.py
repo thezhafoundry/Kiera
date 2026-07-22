@@ -124,6 +124,50 @@ class DesktopAudioBridge:
 
     async def run(self, websocket: WebSocket) -> None:
         """Relay fixed-size PCM frames until either side ends the session."""
+        try:
+            config = await websocket.receive_json()
+        except WebSocketDisconnect:
+            return
+        except Exception as exc:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": "invalid_config",
+                    "message": str(exc) or "expected JSON config",
+                }
+            )
+            await websocket.close(code=1008, reason="Invalid audio config")
+            return
+
+        if not isinstance(config, dict):
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": "invalid_config",
+                    "message": "expected JSON config object",
+                }
+            )
+            await websocket.close(code=1008, reason="Invalid audio config")
+            return
+
+        expected_config = {
+            "type": "config",
+            "sample_rate_in": INPUT_SAMPLE_RATE,
+            "sample_rate_out": OUTPUT_SAMPLE_RATE,
+            "frame_ms": 20,
+        }
+        for key, expected in expected_config.items():
+            if type(config.get(key)) is not type(expected) or config.get(key) != expected:
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "code": "invalid_config",
+                        "message": f"{key} must be {expected!r}",
+                    }
+                )
+                await websocket.close(code=1008, reason="Invalid audio config")
+                return
+
         input_queue: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=self.input_queue_frames
         )
