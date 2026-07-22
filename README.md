@@ -188,9 +188,19 @@ For a Windows acceptance run, make one ten-minute WhatsApp Desktop call and reco
 exact device labels, model-ready time, median and P95 mouth-to-ear latency, input and
 playout drops, underruns, and duration drift. During that call, interrupt the network and
 unplug/reconnect the microphone; confirm that the recipient hears silence during each
-conversion interruption and that conversion resumes cleanly after reconnecting. This
-repository's automated tests and local static checks do not substitute for that
-device-specific validation.
+conversion interruption. After reconnecting the microphone, the operator must click
+**Stop**, start a new conversion session (which obtains a new ticket), and then verify
+clean converted-audio recovery. This repository's automated tests and local static checks
+do not substitute for that device-specific validation.
+
+### Desktop verification evidence (2026-07-23)
+
+- `node --test frontend/desktop/audio_protocol.test.mjs` — 10 tests passed.
+- `node --test frontend/desktop/desktop.test.mjs` — 4 tests passed.
+- `node --check frontend/desktop/desktop.js` and
+  `.venv/bin/python -m py_compile backend/test_desktop_audio.py` — passed.
+- `python -m pytest backend/test_pipeline.py backend/test_streaming_safety.py backend/test_call_safety.py backend/test_control_plane.py backend/test_desktop_audio.py -q` could not run because this macOS workspace has no `python` alias. The equivalent `.venv/bin/python` command was blocked by missing `pytest-asyncio` (or another async pytest plugin): 41 tests passed and 20 async pipeline tests failed before execution.
+- No live Windows/VB-CABLE/WhatsApp Desktop call was performed; the acceptance run above remains required on the target workstation.
 
 ---
 
