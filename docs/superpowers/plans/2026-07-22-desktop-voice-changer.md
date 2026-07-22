@@ -151,7 +151,8 @@ git commit -m "feat: add authenticated desktop audio relay"
 
 **Interfaces:**
 - `mixToMono(channels: Float32Array[]) -> Float32Array`.
-- `downsample48kTo16k(input: Float32Array) -> Float32Array` preserves stream state through a caller-owned carry buffer, applies a fixed 3:1 low-pass polyphase filter with a 7.2 kHz cutoff, and emits the exact output sample count for complete input groups.
+- `createDownsampleState() -> DownsampleState` returns caller-owned filter history for one capture stream.
+- `downsample48kTo16k(input: Float32Array, state: DownsampleState) -> Float32Array` preserves stream state through the supplied state, applies a fixed 3:1 low-pass polyphase filter with a 7.2 kHz cutoff, and emits the exact output sample count for complete input groups.
 - `float32ToPcm16(input: Float32Array) -> Uint8Array` uses little-endian signed 16-bit PCM with clipping to `[-1, 1]`.
 - `pcm16ToFloat32(input: ArrayBuffer) -> Float32Array` decodes little-endian signed 16-bit PCM.
 - `takeFrames(buffer: Float32Array, frameSamples: number) -> { frames: Float32Array[], remainder: Float32Array }` never returns a partial frame.
