@@ -75,6 +75,37 @@ class FakeConverter(VoiceConverter):
                 yield self.output
 
 
+class ReadinessConverter(FakeConverter):
+    def __init__(
+        self,
+        *,
+        ready: bool = True,
+        failure: BaseException | None = None,
+        release: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.ready = ready
+        self.failure = failure
+        self.release = release
+        self.probe_started = asyncio.Event()
+        self.probe_finished = asyncio.Event()
+        self.probe_timeout: float | None = None
+        self.close_called = False
+
+    async def wait_ready(self, timeout: float) -> bool:
+        self.probe_timeout = timeout
+        self.probe_started.set()
+        if self.release is not None:
+            await self.release.wait()
+        self.probe_finished.set()
+        if self.failure is not None:
+            raise self.failure
+        return self.ready
+
+    async def close(self) -> None:
+        self.close_called = True
+
+
 class CloseRequiredConverter(VoiceConverter):
     """A stream that can end only when the bridge explicitly closes it."""
 
@@ -199,6 +230,48 @@ async def test_bridge_sends_ready_and_converted_output_frames():
     assert converter.inputs == [sentinel]
     assert websocket.binary_messages == [bytes(960), bytes(960)]
     assert all(sentinel not in message for message in websocket.binary_messages)
+
+
+@pytest.mark.asyncio
+async def test_bridge_sends_ready_only_after_converter_readiness_probe_succeeds():
+    release = asyncio.Event()
+    websocket = FakeWebSocket(configured([asyncio.CancelledError()]))
+    converter = ReadinessConverter(release=release)
+    task = asyncio.create_task(DesktopAudioBridge(converter).run(websocket))
+
+    await asyncio.wait_for(converter.probe_started.wait(), timeout=1)
+    assert converter.probe_finished.is_set() is False
+    assert websocket.json_messages == []
+    assert converter.probe_timeout == 150.0
+
+    release.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert websocket.json_messages[0] == {"type": "ready"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, RuntimeError("backend secret")])
+async def test_bridge_fails_closed_when_converter_readiness_probe_fails(failure):
+    websocket = FakeWebSocket(configured([bytes(640)]))
+    converter = ReadinessConverter(
+        ready=failure if isinstance(failure, bool) else True,
+        failure=failure if isinstance(failure, BaseException) else None,
+    )
+
+    await asyncio.wait_for(DesktopAudioBridge(converter).run(websocket), timeout=1)
+
+    assert websocket.json_messages == [
+        {
+            "type": "error",
+            "code": "converter_unavailable",
+            "message": "conversion backend unavailable",
+        }
+    ]
+    assert websocket.binary_messages == []
+    assert converter.inputs == []
+    assert converter.close_called
+    assert websocket.closed
 
 
 @pytest.mark.asyncio

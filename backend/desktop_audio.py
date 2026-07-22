@@ -21,6 +21,7 @@ INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 48000
 INPUT_FRAME_BYTES = 640
 OUTPUT_FRAME_BYTES = 960
+READINESS_TIMEOUT_SECONDS = 150.0
 
 Profile = Literal["male", "female"]
 
@@ -115,11 +116,15 @@ class DesktopAudioBridge:
         self,
         converter: VoiceConverter,
         input_queue_frames: int = 25,
+        readiness_timeout: float = READINESS_TIMEOUT_SECONDS,
     ) -> None:
         if input_queue_frames < 1:
             raise ValueError("input_queue_frames must be positive")
+        if readiness_timeout <= 0:
+            raise ValueError("readiness_timeout must be positive")
         self.converter = converter
         self.input_queue_frames = input_queue_frames
+        self.readiness_timeout = readiness_timeout
         self.input_drop_count = 0
 
     async def run(self, websocket: WebSocket) -> None:
@@ -166,6 +171,29 @@ class DesktopAudioBridge:
                     }
                 )
                 await websocket.close(code=1008, reason="Invalid audio config")
+                return
+
+        wait_ready = getattr(self.converter, "wait_ready", None)
+        if callable(wait_ready):
+            try:
+                async with asyncio.timeout(self.readiness_timeout):
+                    converter_ready = await wait_ready(self.readiness_timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                converter_ready = False
+
+            if converter_ready is not True:
+                with contextlib.suppress(Exception):
+                    await self.aclose()
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "code": "converter_unavailable",
+                        "message": "conversion backend unavailable",
+                    }
+                )
+                await websocket.close(code=1011, reason="Conversion backend unavailable")
                 return
 
         input_queue: asyncio.Queue[bytes] = asyncio.Queue(
