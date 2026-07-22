@@ -275,6 +275,28 @@ async def test_bridge_fails_closed_when_converter_readiness_probe_fails(failure)
 
 
 @pytest.mark.asyncio
+async def test_bridge_fails_closed_when_converter_readiness_probe_times_out():
+    websocket = FakeWebSocket(configured([bytes(640)]))
+    converter = ReadinessConverter(release=asyncio.Event())
+
+    await asyncio.wait_for(
+        DesktopAudioBridge(converter, readiness_timeout=0.01).run(websocket),
+        timeout=1,
+    )
+
+    assert websocket.json_messages == [
+        {
+            "type": "error",
+            "code": "converter_unavailable",
+            "message": "conversion backend unavailable",
+        }
+    ]
+    assert websocket.binary_messages == []
+    assert converter.close_called
+    assert websocket.closed
+
+
+@pytest.mark.asyncio
 async def test_bridge_rejects_malformed_input_without_converter_input():
     websocket = FakeWebSocket(configured([bytes(639), asyncio.CancelledError()]))
     converter = FakeConverter()
