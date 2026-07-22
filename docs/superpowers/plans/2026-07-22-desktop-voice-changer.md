@@ -110,7 +110,7 @@ git commit -m "feat: define desktop audio framing contract"
 
 **Interfaces:**
 - `DesktopAudioBridge(converter: VoiceConverter, input_queue_frames: int = 25)`.
-- `DesktopAudioBridge.run(websocket: WebSocket) -> None` consumes binary 640-byte frames and emits complete converted 960-byte frames plus JSON status/error messages.
+- `DesktopAudioBridge.run(websocket: WebSocket) -> None` first requires `{ "type": "config", "sample_rate_in": 16000, "sample_rate_out": 48000, "frame_ms": 20 }`, then consumes binary 640-byte frames and emits complete converted 960-byte frames plus JSON status/error messages.
 - `POST /api/desktop/session` accepts `{ "profile": "male" | "female" }`, requires `Authorization: Bearer <KEIRA_CONTROL_TOKEN>`, and returns `{ "ticket": str, "expires_in": int }`.
 - `WS /api/desktop/audio` accepts the ticket as `keira-desktop.<ticket>` in `Sec-WebSocket-Protocol`; it never accepts a ticket from a query parameter.
 
@@ -213,7 +213,7 @@ Decode incoming PCM into a bounded Float32 queue, drain at 48 kHz, and fill ever
 
 - [ ] **Step 4: Add the client WebSocket and AudioContext graph**
 
-Open `wss://<current-host>/api/desktop/audio` with `keira-desktop.<ticket>` as the subprotocol, send the JSON configuration before binary frames, send binary capture frames, post returned PCM to the playout worklet, and set the `AudioContext` sink to the selected `CABLE Input` device when `setSinkId` is available. On any close/error, disconnect the graph and leave the playout node producing silence.
+Open `wss://<current-host>/api/desktop/audio` with `keira-desktop.<ticket>` as the subprotocol, send `{ type: "config", sample_rate_in: 16000, sample_rate_out: 48000, frame_ms: 20 }` before binary frames, send binary capture frames, post returned PCM to the playout worklet, and set the `AudioContext` sink to the selected `CABLE Input` device when `setSinkId` is available. On any close/error, disconnect the graph and leave the playout node producing silence.
 
 - [ ] **Step 5: Run protocol tests and a local browser smoke test**
 
