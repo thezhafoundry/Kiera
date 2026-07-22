@@ -177,6 +177,7 @@ class DesktopAudioBridge:
             maxsize=self.input_queue_frames
         )
         input_closed = asyncio.Event()
+        input_enabled = asyncio.Event()
         output_buffer = bytearray()
         playout_enabled = asyncio.Event()
         failed = False
@@ -247,6 +248,9 @@ class DesktopAudioBridge:
                         await websocket.send_json({"type": "error", "message": str(exc)})
                         continue
 
+                    if not input_enabled.is_set():
+                        continue
+
                     if input_queue.full():
                         input_queue.get_nowait()
                         self.input_drop_count += 1
@@ -283,12 +287,28 @@ class DesktopAudioBridge:
                 await websocket.send_bytes(silence_frame())
                 await websocket.close(code=1011, reason="Conversion failed")
 
-        convert_task = asyncio.create_task(convert_output())
-        # Let the async generator enter its long-lived stream setup before
-        # waiting for an optional persistent-session readiness hook.
-        await asyncio.sleep(0)
         wait_stream_ready = getattr(self.converter, "wait_stream_ready", None)
-        if callable(wait_stream_ready):
+        needs_stream_readiness = callable(wait_stream_ready)
+        readiness_task: asyncio.Task[bool] | None = None
+        receive_task: asyncio.Task[None] | None = None
+        convert_task: asyncio.Task[None] | None = None
+        converter_closed = False
+
+        async def cleanup_tasks() -> None:
+            nonlocal converter_closed
+            if not converter_closed:
+                with contextlib.suppress(Exception):
+                    await self.aclose()
+                converter_closed = True
+            for task in (readiness_task, receive_task, convert_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (readiness_task, receive_task, convert_task):
+                if task is not None:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+
+        async def await_stream_ready() -> bool:
             try:
                 async with asyncio.timeout(self.readiness_timeout):
                     converter_ready = await wait_stream_ready(self.readiness_timeout)
@@ -296,62 +316,90 @@ class DesktopAudioBridge:
                 raise
             except Exception:
                 converter_ready = False
+            return converter_ready is True
 
-            if converter_ready is not True:
-                with contextlib.suppress(Exception):
-                    await self.aclose()
-                convert_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await convert_task
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "code": "converter_unavailable",
-                        "message": "conversion backend unavailable",
-                    }
+        try:
+            if not needs_stream_readiness:
+                input_enabled.set()
+            receive_task = asyncio.create_task(receive_input())
+            convert_task = asyncio.create_task(convert_output())
+            # Let the async generator enter its long-lived stream setup before
+            # waiting for an optional persistent-session readiness hook.
+            await asyncio.sleep(0)
+
+            if needs_stream_readiness:
+                readiness_task = asyncio.create_task(await_stream_ready())
+                done, _ = await asyncio.wait(
+                    {readiness_task, receive_task},
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                await websocket.close(code=1011, reason="Conversion backend unavailable")
+                if receive_task in done:
+                    await cleanup_tasks()
+                    with contextlib.suppress(Exception):
+                        await websocket.close(code=1000, reason="Client disconnected")
+                    return
+                converter_ready = readiness_task.result()
+
+                if not converter_ready:
+                    await cleanup_tasks()
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "code": "converter_unavailable",
+                            "message": "conversion backend unavailable",
+                        }
+                    )
+                    await websocket.close(code=1011, reason="Conversion backend unavailable")
+                    return
+
+            if needs_stream_readiness and receive_task.done():
+                await cleanup_tasks()
+                with contextlib.suppress(Exception):
+                    await websocket.close(code=1000, reason="Client disconnected")
                 return
 
-        await websocket.send_json({"type": "ready"})
-        playout_enabled.set()
-        receive_task = asyncio.create_task(receive_input())
-        done, pending = await asyncio.wait(
-            {receive_task, convert_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if receive_task in done and not convert_task.done():
-            try:
-                converter_closed = await self.aclose()
-            except Exception:
-                converter_closed = False
-            if not converter_closed:
-                # Generic converters are expected to finish after their input
-                # iterator closes; preserve their accepted buffered frames.
-                await convert_task
-            else:
-                # RVC's explicit close tears down its socket and unblocks its
-                # conversion generator before this task is awaited.
-                with contextlib.suppress(asyncio.CancelledError):
-                    await convert_task
-        elif convert_task in done and not receive_task.done():
-            receive_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await receive_task
-
-        for task in pending:
-            if not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-
-        await drain_stats()
-        if not failed:
-            await websocket.send_json(
-                {"type": "stopped", "input_drop_count": self.input_drop_count}
+            await websocket.send_json({"type": "ready"})
+            input_enabled.set()
+            playout_enabled.set()
+            done, pending = await asyncio.wait(
+                {receive_task, convert_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            await websocket.close()
+
+            if receive_task in done and not convert_task.done():
+                if needs_stream_readiness:
+                    await cleanup_tasks()
+                else:
+                    try:
+                        converter_closed = await self.aclose()
+                    except Exception:
+                        converter_closed = False
+                    if converter_closed:
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await convert_task
+                    else:
+                        # Generic converters are expected to finish after their
+                        # input iterator closes; preserve accepted buffered frames.
+                        await convert_task
+            elif convert_task in done and not receive_task.done():
+                await cleanup_tasks()
+
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+            await drain_stats()
+            if not failed:
+                await websocket.send_json(
+                    {"type": "stopped", "input_drop_count": self.input_drop_count}
+                )
+                await websocket.close()
+        finally:
+            await cleanup_tasks()
+            with contextlib.suppress(Exception):
+                await websocket.close()
 
     async def aclose(self) -> bool:
         """Release a converter that exposes an explicit async close operation."""

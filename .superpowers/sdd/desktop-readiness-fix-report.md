@@ -20,12 +20,15 @@ converter stream's readiness handshake.
 - A false result, timeout, or exception closes the converter best-effort, reports
   only a generic `converter_unavailable` error, and closes the WebSocket before
   creating its audio receive task. Fatal stream teardown wakes the readiness wait.
+- The receive loop runs concurrently during readiness so browser disconnects and
+  bridge cancellation trigger the same task/converter cleanup path; pre-ready
+  frames are discarded until input is enabled.
 
 ## Verification
 
 - Red: the initial readiness tests failed before the gate existed.
 - Green: `.venv/bin/python -m pytest -q backend/test_desktop_audio.py`
-  completed with 20 passing tests.
+  completed with 22 passing tests.
 - Green: `.venv/bin/python -m pytest -q backend/test_streaming_safety.py`
   completed with 13 passing tests/subtests.
 - `git diff --check` completed without findings.
