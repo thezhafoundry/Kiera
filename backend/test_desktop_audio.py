@@ -67,6 +67,46 @@ class FakeConverter(VoiceConverter):
                 yield self.output
 
 
+class CloseRequiredConverter(VoiceConverter):
+    """A stream that can end only when the bridge explicitly closes it."""
+
+    def __init__(self) -> None:
+        self.close_called = False
+        self.closed = asyncio.Event()
+        self.exited = asyncio.Event()
+
+    async def convert_stream(self, in_audio: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        async for _frame in in_audio:
+            pass
+        await self.closed.wait()
+        self.exited.set()
+        if False:
+            yield b""
+
+    async def close(self) -> None:
+        self.close_called = True
+        self.closed.set()
+
+
+class StatsConverter(VoiceConverter):
+    def __init__(self) -> None:
+        self.on_stats = None
+
+    async def convert_stream(self, _in_audio: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        assert self.on_stats is not None
+        self.on_stats(
+            {
+                "infer_ms": 12.5,
+                "model_version": "unit-model",
+                "raw_audio": b"must-not-leak",
+                "nested": {"audio": "must-not-leak"},
+                "type": "not-client-controlled",
+            }
+        )
+        if False:
+            yield b""
+
+
 async def run_bridge(websocket: FakeWebSocket, converter: FakeConverter, **kwargs) -> None:
     bridge = DesktopAudioBridge(converter, **kwargs)
     await asyncio.wait_for(bridge.run(websocket), timeout=1)
@@ -186,6 +226,33 @@ async def test_bridge_fails_closed_when_converter_raises():
     assert websocket.binary_messages == [silence_frame()]
     assert all(sentinel not in message for message in websocket.binary_messages)
     assert websocket.closed
+
+
+@pytest.mark.asyncio
+async def test_bridge_closes_converter_before_waiting_for_disconnect_shutdown():
+    websocket = FakeWebSocket([asyncio.CancelledError()])
+    converter = CloseRequiredConverter()
+
+    await asyncio.wait_for(DesktopAudioBridge(converter).run(websocket), timeout=1)
+
+    assert converter.close_called
+    assert converter.exited.is_set()
+
+
+@pytest.mark.asyncio
+async def test_bridge_relays_sanitized_converter_stats():
+    websocket = FakeWebSocket([asyncio.CancelledError()])
+    converter = StatsConverter()
+
+    await asyncio.wait_for(DesktopAudioBridge(converter).run(websocket), timeout=1)
+
+    assert {
+        "type": "stats",
+        "infer_ms": 12.5,
+        "model_version": "unit-model",
+    } in websocket.json_messages
+    assert all("raw_audio" not in message for message in websocket.json_messages)
+    assert all("nested" not in message for message in websocket.json_messages)
 
 
 def test_desktop_session_requires_control_token_and_issues_single_use_ticket(monkeypatch):

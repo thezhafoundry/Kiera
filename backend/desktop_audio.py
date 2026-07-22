@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import asyncio
 import contextlib
+import math
 import secrets
 import threading
 import time
@@ -129,6 +130,45 @@ class DesktopAudioBridge:
         input_closed = asyncio.Event()
         output_buffer = bytearray()
         failed = False
+        stats_tasks: set[asyncio.Task[None]] = set()
+
+        def sanitize_stats(data: object) -> dict[str, bool | float | int | str]:
+            if not isinstance(data, dict):
+                return {}
+            sanitized: dict[str, bool | float | int | str] = {}
+            for key, value in data.items():
+                if not isinstance(key, str) or key == "type" or len(key) > 64:
+                    continue
+                if isinstance(value, bool):
+                    sanitized[key] = value
+                elif isinstance(value, int):
+                    sanitized[key] = value
+                elif isinstance(value, float) and math.isfinite(value):
+                    sanitized[key] = value
+                elif isinstance(value, str) and len(value) <= 256:
+                    sanitized[key] = value
+            return sanitized
+
+        async def send_stats(data: dict[str, bool | float | int | str]) -> None:
+            try:
+                await websocket.send_json({"type": "stats", **data})
+            except WebSocketDisconnect:
+                return
+
+        def relay_stats(data: object) -> None:
+            sanitized = sanitize_stats(data)
+            if not sanitized:
+                return
+            task = asyncio.create_task(send_stats(sanitized))
+            stats_tasks.add(task)
+            task.add_done_callback(stats_tasks.discard)
+
+        async def drain_stats() -> None:
+            if stats_tasks:
+                await asyncio.gather(*tuple(stats_tasks), return_exceptions=True)
+
+        if hasattr(self.converter, "on_stats"):
+            self.converter.on_stats = relay_stats
 
         async def input_frames():
             while True:
@@ -183,6 +223,7 @@ class DesktopAudioBridge:
                 raise
             except Exception as exc:
                 failed = True
+                await drain_stats()
                 await websocket.send_json(
                     {"type": "error", "message": f"conversion failed: {exc}"}
                 )
@@ -198,7 +239,19 @@ class DesktopAudioBridge:
         )
 
         if receive_task in done and not convert_task.done():
-            await convert_task
+            try:
+                converter_closed = await self.aclose()
+            except Exception:
+                converter_closed = False
+            if not converter_closed:
+                # Generic converters are expected to finish after their input
+                # iterator closes; preserve their accepted buffered frames.
+                await convert_task
+            else:
+                # RVC's explicit close tears down its socket and unblocks its
+                # conversion generator before this task is awaited.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await convert_task
         elif convert_task in done and not receive_task.done():
             receive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -210,14 +263,17 @@ class DesktopAudioBridge:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
+        await drain_stats()
         if not failed:
             await websocket.send_json(
                 {"type": "stopped", "input_drop_count": self.input_drop_count}
             )
             await websocket.close()
 
-    async def aclose(self) -> None:
+    async def aclose(self) -> bool:
         """Release a converter that exposes an explicit async close operation."""
         close = getattr(self.converter, "close", None)
-        if close is not None:
-            await close()
+        if close is None:
+            return False
+        await close()
+        return True
