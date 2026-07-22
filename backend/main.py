@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import secrets
 import time
+from contextlib import asynccontextmanager
 from typing import Literal, Optional
 from fastapi import (
     Depends,
@@ -25,6 +26,7 @@ from dotenv import load_dotenv
 from livekit import api
 from .converters.rvc_stream import RVCStreamingConverter
 from .converters.dummy import DummyVoiceConverter
+from .desktop_audio import DesktopAudioBridge, DesktopSessionStore
 from .noise.noise_suppressor import WebRTCNoiseSuppressor
 from .pipeline import VoiceConversionWorker
 from .security import (
@@ -38,7 +40,28 @@ from .security import (
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Keira MVP Voice Conversion Server")
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """Initialize process-scoped desktop session state and background work."""
+    global _rvc_keepwarm_task
+    application.state.desktop_sessions = DesktopSessionStore(
+        ttl_seconds=int(os.getenv("DESKTOP_SESSION_TTL_SECONDS", "60"))
+    )
+    _rvc_keepwarm_task = _spawn_observed_task(
+        _rvc_keepwarm_loop(),
+        name="keira-rvc-keepwarm",
+    )
+    print("[Server] RVC keep-warm loop started (pings every 90s).")
+    try:
+        yield
+    finally:
+        if _rvc_keepwarm_task and not _rvc_keepwarm_task.done():
+            _rvc_keepwarm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _rvc_keepwarm_task
+
+
+app = FastAPI(title="Keira MVP Voice Conversion Server", lifespan=lifespan)
 
 # Operator control-plane authentication. Fail closed when this is absent: a
 # public deployment must never silently fall back to unauthenticated controls.
@@ -153,16 +176,6 @@ def _spawn_observed_task(coro, *, name: str) -> asyncio.Task:
 
     task.add_done_callback(observe_result)
     return task
-
-
-@app.on_event("startup")
-async def _on_startup():
-    global _rvc_keepwarm_task
-    _rvc_keepwarm_task = _spawn_observed_task(
-        _rvc_keepwarm_loop(),
-        name="keira-rvc-keepwarm",
-    )
-    print("[Server] RVC keep-warm loop started (pings every 90s).")
 
 
 # Configure CORS
@@ -716,6 +729,17 @@ class TokenRequest(BaseModel):
     identity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     agentGender: Literal["male", "female"] = "male"
     voiceEngine: Literal["rvc"] = "rvc"
+
+
+class DesktopSessionRequest(BaseModel):
+    profile: Literal["male", "female"]
+
+
+@app.post("/api/desktop/session", dependencies=[Depends(require_control_token)])
+async def create_desktop_session(request: DesktopSessionRequest):
+    """Issue a short-lived, single-use desktop relay ticket."""
+    ticket, expires_in = app.state.desktop_sessions.issue(request.profile)
+    return {"ticket": ticket, "expires_in": expires_in}
 
 @app.post("/api/token", dependencies=[Depends(require_control_token)])
 async def get_token(request: TokenRequest):
@@ -1537,6 +1561,55 @@ async def deploy_gpu():
         }
 
 # --- WEBSOCKET SIGNALING ROUTE ---
+
+
+@app.websocket("/api/desktop/audio")
+async def desktop_audio_websocket(websocket: WebSocket):
+    """Authenticate a one-time desktop ticket and relay converted PCM only."""
+    offered = [
+        item.strip()
+        for item in websocket.headers.get("sec-websocket-protocol", "").split(",")
+    ]
+    desktop_protocol = next(
+        (item for item in offered if item.startswith("keira-desktop.")),
+        "",
+    )
+    ticket = desktop_protocol[len("keira-desktop."):] if desktop_protocol else ""
+    if not ticket:
+        await websocket.close(code=1008, reason="Desktop session ticket required")
+        return
+    if not RVC_ENDPOINT_URL or not RVC_API_KEY:
+        await websocket.close(code=1013, reason="RVC desktop relay is not configured")
+        return
+
+    sessions = getattr(websocket.app.state, "desktop_sessions", None)
+    profile = sessions.consume(ticket) if sessions is not None else None
+    if profile is None:
+        await websocket.close(code=1008, reason="Desktop session ticket is invalid or expired")
+        return
+
+    pitch_shift = RVC_MALE_PITCH_SHIFT if profile == "male" else 0
+    try:
+        converter = RVCStreamingConverter(
+            endpoint_url=RVC_ENDPOINT_URL,
+            api_key=RVC_API_KEY,
+            pitch_shift=pitch_shift,
+            index_rate=RVC_INDEX_RATE,
+            rms_mix_rate=RVC_RMS_MIX_RATE,
+            protect=RVC_PROTECT,
+            adaptive_pitch=RVC_ADAPTIVE_PITCH,
+            target_f0=RVC_TARGET_F0,
+            connect_timeout=150.0,
+            model_version=RVC_MODEL_VERSION,
+        )
+    except ValueError:
+        await websocket.close(code=1013, reason="RVC desktop relay is not configured")
+        return
+
+    await websocket.accept(subprotocol=desktop_protocol)
+    bridge = DesktopAudioBridge(converter)
+    async with contextlib.aclosing(bridge):
+        await bridge.run(websocket)
 
 
 @app.websocket("/api/call/ws")
