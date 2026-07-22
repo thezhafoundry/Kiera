@@ -35,6 +35,7 @@
 - Create: `frontend/desktop/capture-worklet.js` — microphone capture, mono mix and 48 kHz-to-16 kHz stream framing.
 - Create: `frontend/desktop/playout-worklet.js` — converted-audio queue, 48 kHz output and silence on underrun.
 - Create: `frontend/desktop/audio_protocol.test.mjs` — deterministic Node tests for frame and resampling helpers.
+- Create: `frontend/desktop/desktop.test.mjs` — deterministic Node seam tests for relay readiness and page-state ordering.
 - Modify: `README.md` — Windows/VB-CABLE desktop setup and run instructions.
 
 ---
@@ -234,6 +235,7 @@ git commit -m "feat: add desktop audio worklets and client"
 - Create: `frontend/desktop/index.html`
 - Create: `frontend/desktop/desktop.css`
 - Modify: `frontend/desktop/desktop.js`
+- Create: `frontend/desktop/desktop.test.mjs`
 
 **Interfaces:**
 - `POST /api/desktop/session` is called with the in-memory control token.
@@ -258,7 +260,9 @@ Before starting, obtain a fresh ticket with `fetch('/api/desktop/session', { met
 
 - [ ] **Step 5: Run the frontend smoke test**
 
-Run the server with `uvicorn backend.main:app --reload --port 8000`, open `http://localhost:8000/desktop/`, and verify the complete state transitions with a fake or configured Modal endpoint. Expected: no browser console errors, no raw-audio playback path, and clean Stop/restart behavior.
+Run: `node --test frontend/desktop/desktop.test.mjs frontend/desktop/audio_protocol.test.mjs`.
+
+Then run the server with `uvicorn backend.main:app --reload --port 8000`, open `http://localhost:8000/desktop/`, and verify the complete state transitions with a fake or configured Modal endpoint. Expected: no browser console errors, no raw-audio playback path, and clean Stop/restart behavior.
 
 - [ ] **Step 6: Commit the page**
 
