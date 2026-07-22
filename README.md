@@ -157,6 +157,41 @@ MODAL_TOKEN_SECRET=your_modal_token_secret
 4. **Access the Dashboard**:
    Open **`http://localhost:8000`** in your browser. Click **Warm GPU** before selecting a lead to call.
 
+### Desktop voice changer for WhatsApp Desktop (Windows)
+
+The `/desktop/` page sends **converted audio only** to a Windows virtual audio device;
+it never exposes `RVC_API_KEY` to the browser. Use current Chrome or Edge on Windows,
+which must support microphone access, AudioWorklets, and `AudioContext.setSinkId`.
+
+1. Install [VB-CABLE](https://vb-audio.com/Cable/) on the Windows workstation, then
+   restart the browser so Windows exposes both cable endpoints.
+2. Start Keira and open `https://your-keira-server.example.com/desktop/` (or
+   `http://localhost:8000/desktop/` for local development). Enter the control token and
+   grant the browser's microphone permission when prompted; this is required before the
+   device names can be listed.
+3. In the Keira page, choose the **physical microphone** as **Physical microphone** and
+   choose **CABLE Input** as **Converted output**. Do not select **CABLE Output** as the
+   Keira input: that creates a feedback/raw-routing risk. Start conversion and wait for
+   the relay to reach `ready`/`converting` before beginning a call.
+4. In WhatsApp Desktop's audio settings, set **Microphone** to **CABLE Output** and set
+   **Speakers** to the agent's headphones (not either VB-CABLE endpoint). The cable maps
+   Keira's selected **CABLE Input** playback to WhatsApp's **CABLE Output** microphone.
+5. Use **Test converted voice** before the first call. It plays converted-only audio
+   through normal speakers; it does not route the physical microphone directly to a
+   device.
+
+Keira is fail-closed: if the conversion relay or its upstream conversion connection
+interrupts, it stops the relay and the WhatsApp recipient receives silence until a clean
+converted session is started. Raw microphone audio is never used as a fallback.
+
+For a Windows acceptance run, make one ten-minute WhatsApp Desktop call and record the
+exact device labels, model-ready time, median and P95 mouth-to-ear latency, input and
+playout drops, underruns, and duration drift. During that call, interrupt the network and
+unplug/reconnect the microphone; confirm that the recipient hears silence during each
+conversion interruption and that conversion resumes cleanly after reconnecting. This
+repository's automated tests and local static checks do not substitute for that
+device-specific validation.
+
 ---
 
 ## 6. How to Test & Measure Latency
