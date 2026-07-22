@@ -45,6 +45,7 @@ export class DesktopAudioClient {
     this.captureNode = null;
     this.playoutNode = null;
     this.stopping = false;
+    this.relayReady = false;
   }
 
   onStatus(callback) {
@@ -83,6 +84,7 @@ export class DesktopAudioClient {
     }
 
     this.stopping = false;
+    this.relayReady = false;
     this.emitStatus({ type: 'starting' });
     try {
       this.context = this.createAudioContext({ sampleRate: CAPTURE_SAMPLE_RATE });
@@ -132,7 +134,7 @@ export class DesktopAudioClient {
   bindWorklets() {
     this.captureNode.port.onmessage = ({ data }) => {
       if (data?.type === 'frame') {
-        if (data.pcm instanceof ArrayBuffer && data.pcm.byteLength === 640 && this.socket?.readyState === 1) {
+        if (this.relayReady && data.pcm instanceof ArrayBuffer && data.pcm.byteLength === 640 && this.socket?.readyState === 1) {
           this.socket.send(data.pcm);
         }
       } else if (data?.type === 'meter') {
@@ -209,6 +211,9 @@ export class DesktopAudioClient {
     }
     try {
       const status = JSON.parse(message);
+      if (status.type === 'ready') {
+        this.relayReady = true;
+      }
       this.emitStatus(status);
       if (status.type === 'error') {
         this.fail(status.message || 'Desktop audio relay error');
@@ -230,6 +235,7 @@ export class DesktopAudioClient {
   async release({ closeSocket }) {
     const socket = this.socket;
     this.socket = null;
+    this.relayReady = false;
     if (this.captureNode?.port) {
       this.captureNode.port.onmessage = null;
     }
@@ -412,12 +418,11 @@ export class DesktopSetupPage {
   bindClient(client, { test = false, startedAt = 0 } = {}) {
     client.onStatus((status) => {
       if (status.type === 'connected') {
-        this.setState('warming');
+        this.setState(this.backendReady ? 'converting' : 'warming');
       } else if (status.type === 'ready') {
         this.backendReady = true;
         if (!test) this.setError('');
         this.setState('ready');
-        if (!test) this.setState('converting');
       } else if (status.type === 'interrupted' || status.type === 'error') {
         this.backendReady = false;
         this.setState('interrupted', status.message || 'Desktop audio relay interrupted');
