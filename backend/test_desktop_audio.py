@@ -444,76 +444,17 @@ async def test_bridge_rejects_wrong_config_sample_rates():
     assert websocket.closed
 
 
-def test_desktop_session_requires_control_token_and_issues_single_use_ticket(monkeypatch):
+def test_desktop_session_issues_single_use_ticket_without_auth():
     from backend import main
 
-    monkeypatch.setattr(main, "CONTROL_PLANE_TOKEN", "desktop-test-token")
     with TestClient(main.app) as client:
-        assert client.post("/api/desktop/session", json={"profile": "male"}).status_code == 401
-
-        response = client.post(
-            "/api/desktop/session",
-            json={"profile": "female"},
-            headers={"Authorization": "Bearer desktop-test-token"},
-        )
+        response = client.post("/api/desktop/session", json={"profile": "female"})
 
     assert response.status_code == 200
     ticket = response.json()["ticket"]
     assert response.json()["expires_in"] > 0
     assert main.app.state.desktop_sessions.consume(ticket) == "female"
     assert main.app.state.desktop_sessions.consume(ticket) is None
-
-
-def test_local_no_auth_requires_explicit_loopback_only_flag(monkeypatch):
-    from types import SimpleNamespace
-
-    from backend import main
-
-    loopback_request = SimpleNamespace(
-        client=SimpleNamespace(host="127.0.0.1"),
-        url=SimpleNamespace(scheme="http", netloc="127.0.0.1:8000", hostname="127.0.0.1", port=8000),
-        headers={},
-    )
-    remote_request = SimpleNamespace(
-        client=SimpleNamespace(host="127.0.0.1"),
-        url=SimpleNamespace(scheme="https", netloc="kiera.example.com", hostname="kiera.example.com", port=443),
-        headers={"x-forwarded-for": "203.0.113.10"},
-    )
-
-    monkeypatch.setattr(main, "LOCAL_NO_AUTH", False)
-    assert main._local_no_auth_allowed(loopback_request) is False
-
-    monkeypatch.setattr(main, "LOCAL_NO_AUTH", True)
-    monkeypatch.setattr(main, "LOCAL_BIND_HOST", "127.0.0.1")
-    monkeypatch.setattr(main, "LOCAL_LAUNCHER", True)
-    monkeypatch.setattr(main, "LOCAL_NO_AUTH_ORIGIN", "http://127.0.0.1:8000")
-    assert main._local_no_auth_allowed(loopback_request) is True
-    assert main._local_no_auth_allowed(remote_request) is False
-    monkeypatch.setattr(main, "LOCAL_NO_AUTH_ORIGIN", "https://127.0.0.1:8000")
-    assert main._local_no_auth_allowed(loopback_request) is False
-
-
-def test_local_no_auth_does_not_bypass_general_control_routes(monkeypatch):
-    import asyncio
-
-    from fastapi import HTTPException
-    from backend import main
-
-    monkeypatch.setattr(main, "LOCAL_NO_AUTH", True)
-    monkeypatch.setattr(main, "LOCAL_BIND_HOST", "127.0.0.1")
-    monkeypatch.setattr(main, "LOCAL_LAUNCHER", True)
-    request = type(
-        "RequestStub",
-        (),
-        {
-            "client": type("Client", (), {"host": "127.0.0.1"})(),
-            "url": type("URL", (), {"scheme": "http", "netloc": "127.0.0.1:8000", "hostname": "127.0.0.1", "port": 8000})(),
-            "headers": {},
-        },
-    )()
-    with pytest.raises(HTTPException) as error:
-        asyncio.run(main.require_control_token(request, ""))
-    assert error.value.status_code in {401, 503}
 
 
 def test_desktop_audio_websocket_consumes_subprotocol_ticket(monkeypatch):

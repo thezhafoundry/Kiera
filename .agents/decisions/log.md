@@ -13,6 +13,7 @@ tracks pipeline/architecture migrations instead:
 | — | `2a20b3a` | Removed an `age_before` check that was silently dropping/silencing lead audio; added a 4s pre-buffer timeout fallback. |
 | 2026-07-02 | `6661db7` | Rewrote LATENCY.md with live-measured numbers and added the 4s timeout regression note. |
 | 2026-07-02 | `fe678d6` | Replaced the one-shot pre-buffer with the current adaptive, per-session standing playout buffer described in LATENCY.md §5 / [[subsystem-notes]]. |
+| 2026-07-17 | `634c4fb` (reverted `e82bb29`) | Tried an explicit real-time pacer (`next_publish_time`) in `_run_playout_consumer` to fix backlog-burst breaking; implemented, tested, and task-reviewer-approved, but reverted by the user same-day without a stated reason. See narrative entry below. |
 | 2026-07-02 | `f3c16ed` (Tasks 1-5) | Streaming rebuild: replaced the VAD-chunked HTTP-per-request pipeline (rows above) with a persistent-WebSocket duplex streaming design, a never-raw/fail-closed audio policy, and a fail-closed pre-dial/pre-bridge warm gate — see the dedicated entry below. |
 
 Note the `eb016f3`/`da46c48` "Reverted: Buffer Changed for voice issue" commits bracketing
@@ -478,3 +479,93 @@ not a Render-origin or PSTN mouth-to-ear result. The duration loss, Render-origi
 A/B, non-fatal `F0Predictor` startup-warm-up import failure, and a warm staff PSTN test are
 hard gates before lowering block/buffer sizes. The one-second adaptive-pitch interpolation
 is implemented/tested in v11 but still needs that live listen test.
+
+## 2026-07-17 — Real-time playout pacer implemented, reviewed, deployed, then reverted same-day
+
+**Diagnosed why "voice was clear at first, then breaking" from a real PSTN call's Twilio
+recording and `[Worker][LatencySummary]` telemetry.** `playout_buffer_bytes` was clean for
+the first ~15-20 blocks then oscillated between ~0 and 500-740ms for the rest of the call,
+matching the 2026-07-14 "Open finding" in [[subsystem-notes]] almost exactly — the 2026-07-15
+bounded-100ms-drain fix for that finding had not resolved it. Root cause: `_run_playout_consumer`
+had no wall-clock pacing of its own, only LiveKit's `capture_frame` backpressure (~200ms queue
+headroom), which still let a backlogged chunk through faster than real time whenever
+`converter_wait_ms`/`network_rtt_ms` (consistently 900-1900ms against a 320ms block budget)
+put the pipeline behind.
+
+**Implemented a self-correcting `next_publish_time` pacer** in `_run_playout_consumer`
+(plan: `docs/superpowers/plans/2026-07-16-playout-consumer-real-time-pacing.md`) via
+subagent-driven-development. Task-reviewer approved the code (all Global Constraints held,
+correct self-correction on genuine stalls); the one Important finding was about the
+implementer's report overstating verification confidence, not a code defect, and was
+corrected directly. Deployed to Render (`634c4fb`..`a265262` pushed to `origin/main`).
+
+**Reverted same session, same day, before any live listen test happened.** The user asked to
+revert `634c4fb` (code) and, separately, `14f9bca` (the backlog/subsystem-notes doc claims
+this fix generated) — both as explicit, deliberate revert commits (`e82bb29`, `c5eea8c`),
+pushed to `origin/main`. **The user did not state a reason** despite being asked directly;
+`main` is now back to exactly its pre-2026-07-17 state (the 2026-07-15 bounded-100ms fix is
+again the last real attempt, `active-backlog.md` again says "targeted live listen test
+pending"). Do not re-propose this identical pacer design without first asking the user why it
+was reverted — the plan document and this entry exist so the reasoning/code aren't lost, but
+the revert itself is unexplained and should not be treated as "just needs to be redone."
+
+## 2026-07-19 — Removed the KEIRA_CONTROL_TOKEN operator-auth gate (frontend + backend)
+
+**Removed the bearer-token control-plane auth added 2026-07-15 (`e501104`, see entry above)
+at explicit user request ("remove the kiera control token thing" → confirmed scope as "remove
+everywhere both front and back").** Deleted: `frontend/app.js`'s `getControlToken()` prompt,
+the `Authorization: Bearer` header on `apiFetch`, and the `keira-auth.<token>` WS subprotocol;
+backend `require_control_token` dependency and its use on every operator route
+(`/api/token`, `/api/start-bot`, `/api/stop-bot`, `/api/call/*`, `/api/setup`, `/api/warmup`,
+`/api/deploy`), the `/api/call/ws` handshake check, `CONTROL_PLANE_TOKEN`, and the now-dead
+`verify_bearer_token` helper + its unit test in `backend/test_control_plane.py`. Also dropped
+`KEIRA_CONTROL_TOKEN` from `render.yaml`, `README.md` §3, and CLAUDE.md's control-plane rules
+and env-var list. Twilio signature validation (`require_twilio_signature`) and rate limiting
+are untouched — this only removed the operator/dashboard bearer-token gate.
+
+**Net effect: every operator HTTP route and the call-events WebSocket are now unauthenticated.**
+On the public Render deployment this means anyone who can reach the URL can start/stop bots,
+place outbound calls, or trigger `/api/deploy` — this is a deliberate regression of the P0 fix
+from `e501104`, not an oversight. If control-plane auth is wanted again later, `e501104`'s diff
+(and this repo's git history around 2026-07-15) has the previous implementation to reference
+rather than rebuilding from scratch.
+
+**Correction, same day:** this was made and left as a local-only, uncommitted change per
+explicit instruction ("do not push the code into main"). The user then committed it directly
+in the IDE anyway (`1f1fb5d`, "Removed Control Token from backend and frnotend", 16:22 IST)
+and pushed to `origin/main` — outside this session's visibility; only surfaced during
+`second-brain-close`. Per `render.yaml`'s `autoDeploy: commit`, that push has already
+redeployed the backend, so **the control plane is unauthenticated in production right now**,
+not just locally. See [[active-backlog]]'s updated row. Consistent with the established
+[[feedback_concurrent-repo-edits]] pattern — re-check git state after any gap rather than
+trusting the last-known instruction.
+
+## 2026-07-19 — Two call-diagnosis findings: GPU preemption outage, then a SOLA micro-glitch
+
+**Call 1, 16:29:59 IST (`CA7b845842d9d8eda788c8f2143f32feb2`, 65s):** agent-voice audio ran
+normally for the first 33s then went completely silent for the remaining ~31s of a still-
+connected call. Cross-referencing the Twilio dual-channel recording (envelope analysis),
+Render's `[RVCStreamingConverter]` logs (endless "reconnect buffer full — dropped oldest
+input frame" spam plus one logged `WS connection lost/failed: server rejected WebSocket
+connection: HTTP 500`), and Modal's own worker logs for the window pinned the root cause to
+the second: **Modal preempted the GPU_L4 container serving the call at 16:30:32 IST** (`
+Container terminated due to preemption`) — exactly the moment the audio dropped — and the
+`ap-southeast` region was capacity-constrained enough that no replacement container came up
+for the rest of the call, or for 13 minutes afterward. This is a Modal platform-level/regional
+capacity issue, not a pipeline bug — the fail-closed silence-on-outage design (see
+[[subsystem-notes]]) behaved correctly. Directly corroborates the open "A/B Modal routing"
+backlog row (`ap-southeast` vs `ap-south`/broader `ap`) as an availability risk, not just a
+latency one. No code changed for this finding.
+
+**Call 2, 21:20:40 IST (`CA097fa9be0e716fb489b373bb89e474a6`, 62s), after `DEBUG_SAVE_AUDIO=1`
+was turned back on for this investigation (see [[active-backlog]]):** user reported one word
+("stating," from a fixed diagnostic script) sounded unclear while the rest of the call was
+fine. With the Modal debug `in16k`/`out48k` WAV pair now available, a direct pre- vs. post-
+conversion comparison (5ms RMS envelope) around the phrase's timing (~19.2–21.5s) found the
+raw input continuous and unbroken there, but the converted output had a genuine **~40–60ms
+silence gap spliced in mid-phrase at t≈20.66–20.72s** that doesn't exist in the source. Modal
+and Render logs for this call's window are clean — no preemption, reconnects, or errors — so
+this is a different failure class from Call 1: a small, intermittent artifact consistent with
+a SOLA-splice/block-boundary handoff (320ms block, 80ms SOLA crossfade) rather than a
+data-loss or capacity event. Leading hypothesis only, not yet root-caused in
+`modal_deploy/streaming.py`; flagged for the user, no code changed.

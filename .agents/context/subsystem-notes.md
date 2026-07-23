@@ -85,8 +85,26 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   refills underneath for the next gulp. User-reported symptom the same night: "if I talk a
   big sentence the voice is getting blurred at the last" — plausible match (progressive
   distortion over a long continuous utterance, not a hard dropout) but NOT yet confirmed by
-  ear against this specific mechanism. Fix direction not yet chosen: either drain the buffer
-  in small steady increments instead of one gulp, or re-tune target/consumer pacing. See
+  ear against this specific mechanism.
+  **Update (2026-07-21): fixed with an explicit `next_publish_time` real-time pacer in
+  `_run_playout_consumer`.** This is a re-implementation of the 2026-07-16 design
+  (`docs/superpowers/plans/2026-07-16-playout-consumer-real-time-pacing.md`) that was built,
+  reviewed, deployed, and reverted same-day 2026-07-17 with no stated reason (see [[log]]) —
+  re-derive intent from that plan doc, not from memory. **This pass also fixes a bug the
+  original attempt didn't have a test for:** real-time pacing means the consumer routinely
+  holds genuine backlog mid-call, not just at idle. `_run_conversion_stream`'s teardown used
+  to `consumer_task.cancel()` immediately when the converter's generator ended (e.g. normal
+  call hangup) — under the old "drain instantly" behavior the buffer was almost always empty
+  by then so this never mattered, but under real-time pacing the consumer can be cancelled
+  mid-`asyncio.sleep()` while holding an already-popped, not-yet-published chunk, silently
+  truncating the tail of the call's audio. Fixed two ways: (1) the pacer catches
+  `CancelledError` during its pacing sleep and publishes the in-flight chunk before
+  re-raising: (2) `_run_conversion_stream`'s `finally` flushes any remainder still sitting in
+  `_playout_buffer` (never popped) immediately/unpaced after the consumer stops. Caught by
+  `test_playout_buffer_smooths_bursty_converter_output` (existing test, no new test needed)
+  once its fake converter was pointed at the new pacer — it deterministically lost the last
+  1000 of 9000 bytes without the teardown fix. **Live listen test still not done** — do not
+  treat this as confirmed until one happens; that's the exact step skipped in 2026-07-17. See
   [[active-backlog]].
 - **`rtc.AudioFrame.data` is an int16-typed `memoryview` — `len()` on it returns *sample*
   count, not byte count.** (`len(frame.data)` on a 960-byte/480-sample frame returns 480,
@@ -589,6 +607,17 @@ diverge for as long as nobody runs `modal deploy`.
   (VAD-based chunking was deleted, not just made optional) — the old "without it, chunking
   falls back to fixed max-length" note no longer applies to anything. It's effectively an
   unused dependency now regardless of platform.
+- **`python -m backend.test_pipeline` is not reliably green on this Windows dev machine, and
+  that's pre-existing/environmental, not necessarily a regression (confirmed 2026-07-17).**
+  Three consecutive full-suite runs each failed at a *different* point in the
+  `RVCStreamingConverter` WS-reconnect test family (`test_rvc_streaming_converter_buffer_cap_drop_oldest`,
+  `test_rvc_ready_metadata_drives_dynamic_block_timing`) — both exercise real in-process
+  `websockets.serve` servers against finite wall-clock deadlines and are sensitive to
+  scheduling jitter when the whole suite runs sequentially in one event loop under load.
+  Before treating a full-suite failure as caused by your change: re-run just the failing test
+  in isolation (`python -c "import asyncio; from backend.test_pipeline import <name>; asyncio.run(<name>())"`)
+  — if it passes alone, and the code you changed doesn't share any state/import path with it,
+  it's very likely this same pre-existing flakiness, not your diff.
 
 ## Voice identity & clarity: pitch range + input-chain fidelity (root-caused 2026-07-08)
 Why live calls never sounded like the trained voice AND were muffled — two *independent*

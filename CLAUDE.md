@@ -157,13 +157,14 @@ for endpoint-level detail, known races, and open findings.
 ### Environment
 Config is read from `.env` (no `.env.example` is checked in — see
 [README.md §3](README.md#3-environment-variables-reference) for the reference list):
-`LIVEKIT_*`, `RVC_ENDPOINT_URL`, `RVC_API_KEY`, `KEIRA_CONTROL_TOKEN`, `RVC_PITCH_SHIFT`, `RVC_INDEX_RATE`,
+`LIVEKIT_*`, `RVC_ENDPOINT_URL`, `RVC_API_KEY`, `RVC_PITCH_SHIFT`, `RVC_INDEX_RATE`,
 `RVC_WS_URL`, `RVC_KEEPWARM`, `RVC_ADAPTIVE_PITCH`, `RVC_TARGET_F0`, `CORS_ORIGINS`, `TWILIO_*`, `SERVER_URL`. Never commit `.env` or
 model files (`.pth`/`.index`/`.wav`) — they are gitignored.
 
 ### Current control-plane rules
-- Operator HTTP routes require `Authorization: Bearer <KEIRA_CONTROL_TOKEN>`; the dashboard asks
-  for this token in memory only. The public `/api/health` endpoint is read-only.
+- Operator HTTP routes are unauthenticated (the `KEIRA_CONTROL_TOKEN` bearer-token gate was
+  removed 2026-07-19 — see `.agents/decisions/log.md`). The public `/api/health` endpoint is
+  read-only, as before.
 - Twilio inbound, wait, and status callbacks require valid `X-Twilio-Signature` values.
 - Modal `/convert` and `/ws` require the `RVC_API_KEY` from the `rvc-api-key` Modal secret.
 - Outbound calls are two-phase: prepare the room, let the browser publish its agent track, then

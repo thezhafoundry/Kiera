@@ -75,7 +75,6 @@ LIVEKIT_API_SECRET=your_livekit_api_secret
 # RVC Serverless GPU
 RVC_ENDPOINT_URL=https://your-modal-app--rvc-convert.modal.run
 RVC_API_KEY=your_modal_secret_value # must match the Modal rvc-api-key secret
-KEIRA_CONTROL_TOKEN=your_operator_token # required for dashboard/control routes
 RVC_PITCH_SHIFT=0 # fallback semitones; dashboard selects male/female per call
 RVC_INDEX_RATE=0.9 # FAISS-retrieved timbre mix; defaults to 0.9 if unset
 RVC_WS_URL= # optional explicit /ws URL override; derived from RVC_ENDPOINT_URL if unset
@@ -163,20 +162,17 @@ The `/desktop/` page sends **converted audio only** to a Windows virtual audio d
 it never exposes `RVC_API_KEY` to the browser. Use current Chrome or Edge on Windows,
 which must support microphone access, AudioWorklets, and `AudioContext.setSinkId`.
 
-For localhost development only, set `KEIRA_LOCAL_NO_AUTH=true` and
-`KEIRA_LOCAL_NO_AUTH_ORIGIN=http://127.0.0.1:8000` in `.env`, then bind Keira directly
-to that loopback origin with `python scripts/run_local.py`. The launcher rejects
-non-loopback binds. Only the desktop-session ticket route becomes tokenless, and the page
-hides the control-token field. All other control routes remain token-protected. Never
-enable this mode behind a reverse proxy or public listener.
+Operator/control routes are currently unauthenticated (see "Current control-plane rules"
+in [CLAUDE.md](CLAUDE.md)); no control token is required for the desktop page or any other
+control route. `python scripts/run_local.py` remains available for binding Keira to a
+loopback origin during local development.
 
 1. Install [VB-CABLE](https://vb-audio.com/Cable/) on the Windows workstation, then
    restart the browser so Windows exposes both cable endpoints.
 2. Start Keira and open `https://your-keira-server.example.com/desktop/` (or
-   `http://localhost:8000/desktop/` for local development). In an authenticated
-   deployment, enter the control token; local no-auth development hides that field.
-   Grant the browser's microphone permission when prompted; this is required before
-   the device names can be listed.
+   `http://localhost:8000/desktop/` for local development). Grant the browser's
+   microphone permission when prompted; this is required before the device names can
+   be listed.
 3. In the Keira page, choose the **physical microphone** as **Physical microphone** and
    choose **CABLE Input**, **BlackHole 2ch**, or **Loopback** as **Converted output**.
    Do not select **CABLE Output** or another virtual loopback as the Keira input: that

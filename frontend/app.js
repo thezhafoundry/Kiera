@@ -12,21 +12,9 @@ let isMuted = false;
 let agentIdentity = `agent-${Math.floor(1000 + Math.random() * 9000)}`;
 let localAudioTrack = null;
 let wsConn = null;
-let controlToken = null; // kept in memory only; never persisted in localStorage
-
-function getControlToken() {
-    if (controlToken) return controlToken;
-    const entered = window.prompt('Enter the Keira control token:');
-    if (!entered || !entered.trim()) {
-        throw new Error('A Keira control token is required');
-    }
-    controlToken = entered.trim();
-    return controlToken;
-}
 
 async function apiFetch(url, options = {}) {
     const headers = new Headers(options.headers || {});
-    headers.set('Authorization', `Bearer ${getControlToken()}`);
     if (!wsConn) initWebSocket();
     return fetch(url, { ...options, headers });
 }
@@ -65,11 +53,11 @@ function selectedAgentGender() {
 
 // Initialize WebSockets for Incoming Call Webhook Broadcasts
 function initWebSocket() {
-    if (wsConn || !controlToken) return;
+    if (wsConn) return;
     const wsProto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
     const wsUrl = `${wsProto}${window.location.host}/api/call/ws`;
-    
-    wsConn = new WebSocket(wsUrl, [`keira-auth.${controlToken}`]);
+
+    wsConn = new WebSocket(wsUrl);
 
     wsConn.onopen = () => {
         console.log("[WebSocket] Connection established");
@@ -308,7 +296,7 @@ async function startOutboundCall(phone, name) {
     } catch (e) {
         alert("Outbound call failed:\n\n" + e.message);
         const failedRoom = preparedRoom || currentRoomName;
-        if (failedRoom && controlToken) {
+        if (failedRoom) {
             try {
                 await apiFetch(`${API_BASE}/api/call/end`, {
                     method: 'POST',

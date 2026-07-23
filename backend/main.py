@@ -6,11 +6,8 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
-from urllib.parse import urlsplit
 from fastapi import (
-    Depends,
     FastAPI,
-    Header,
     HTTPException,
     Request,
     Response,
@@ -34,7 +31,6 @@ from .security import (
     redact_phone_number,
     validate_agent_identity,
     validate_e164_phone,
-    verify_bearer_token,
     RateLimiter,
 )
 
@@ -63,44 +59,6 @@ async def lifespan(application: FastAPI):
 
 
 app = FastAPI(title="Keira MVP Voice Conversion Server", lifespan=lifespan)
-
-# Operator control-plane authentication. Fail closed when this is absent: a
-# public deployment must never silently fall back to unauthenticated controls.
-CONTROL_PLANE_TOKEN = os.getenv("KEIRA_CONTROL_TOKEN") or os.getenv("CONTROL_PLANE_TOKEN", "")
-LOCAL_NO_AUTH = os.getenv("KEIRA_LOCAL_NO_AUTH", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-}
-LOCAL_NO_AUTH_ORIGIN = os.getenv("KEIRA_LOCAL_NO_AUTH_ORIGIN", "").strip()
-LOCAL_BIND_HOST = os.getenv("KEIRA_LOCAL_BIND_HOST", "").strip()
-LOCAL_LAUNCHER = os.getenv("KEIRA_LOCAL_LAUNCHER", "").strip() == "1"
-
-
-def _local_no_auth_allowed(request: Request) -> bool:
-    """Allow tokenless control requests only on an explicitly local server."""
-    if not LOCAL_NO_AUTH or not LOCAL_LAUNCHER or LOCAL_BIND_HOST not in {"127.0.0.1", "::1", "localhost"}:
-        return False
-    client_host = request.client.host if request.client else ""
-    request_host = getattr(getattr(request, "url", None), "hostname", "")
-    try:
-        configured_origin = urlsplit(LOCAL_NO_AUTH_ORIGIN)
-        configured_port = configured_origin.port or (443 if configured_origin.scheme == "https" else 80)
-    except ValueError:
-        return False
-    request_url = getattr(request, "url", None)
-    request_port = getattr(request_url, "port", None) or (443 if getattr(request_url, "scheme", "") == "https" else 80)
-    forwarded = request.headers.get("x-forwarded-for", "") or request.headers.get("forwarded", "")
-    loopback = {"127.0.0.1", "::1", "localhost"}
-    return (
-        not forwarded
-        and configured_origin.scheme in {"http", "https"}
-        and configured_origin.scheme == getattr(request_url, "scheme", "")
-        and configured_origin.hostname in loopback
-        and configured_port == request_port
-        and configured_origin.hostname == request_host
-        and client_host in loopback
-    )
 
 # Small per-process rate limiter. This is a first guard, not a replacement for
 # a shared gateway limiter when the service is scaled beyond one instance.
@@ -136,33 +94,6 @@ async def disable_static_asset_cache(request: Request, call_next):
     if request.url.path.endswith((".js", ".css")):
         response.headers["Cache-Control"] = "no-cache, must-revalidate"
     return response
-
-
-async def require_control_token(
-    request: Request,
-    authorization: str = Header(default=""),
-):
-    if not CONTROL_PLANE_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="Control-plane authentication is not configured.",
-        )
-    if not verify_bearer_token(authorization, CONTROL_PLANE_TOKEN):
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-
-async def require_desktop_session_auth(
-    request: Request,
-    authorization: str = Header(default=""),
-):
-    """Allow tokenless desktop tickets only in direct loopback development."""
-    if _local_no_auth_allowed(request):
-        return
-    await require_control_token(request, authorization)
 
 
 async def require_twilio_signature(request: Request):
@@ -785,17 +716,17 @@ class DesktopSessionRequest(BaseModel):
 
 @app.get("/api/desktop/auth-mode")
 async def desktop_auth_mode(request: Request):
-    """Expose only whether this request is in explicit loopback dev mode."""
-    return {"auth_required": not _local_no_auth_allowed(request)}
+    """Operator control-plane auth is disabled; no token is ever required."""
+    return {"auth_required": False}
 
 
-@app.post("/api/desktop/session", dependencies=[Depends(require_desktop_session_auth)])
+@app.post("/api/desktop/session")
 async def create_desktop_session(request: DesktopSessionRequest):
     """Issue a short-lived, single-use desktop relay ticket."""
     ticket, expires_in = app.state.desktop_sessions.issue(request.profile)
     return {"ticket": ticket, "expires_in": expires_in}
 
-@app.post("/api/token", dependencies=[Depends(require_control_token)])
+@app.post("/api/token")
 async def get_token(request: TokenRequest):
     """
     Brokers LiveKit client access tokens for browser web clients.
@@ -823,7 +754,7 @@ async def get_token(request: TokenRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/start-bot", dependencies=[Depends(require_control_token)])
+@app.post("/api/start-bot")
 async def start_bot(request: TokenRequest):
     """
     Spawns the real-time audio pipeline bot and connects it to the specified LiveKit room.
@@ -831,7 +762,7 @@ async def start_bot(request: TokenRequest):
     _require_agent_identity(request.identity)
     return await _do_start_bot(request.roomName, request.agentGender, request.voiceEngine)
 
-@app.post("/api/stop-bot", dependencies=[Depends(require_control_token)])
+@app.post("/api/stop-bot")
 async def stop_bot(request: TokenRequest):
     """
     Forces the voice conversion bot in a specific room to disconnect and clean up.
@@ -902,7 +833,7 @@ async def _agent_has_audio_track(room_name: str, timeout: float = 15.0) -> bool:
     return False
 
 
-@app.post("/api/call/outbound", dependencies=[Depends(require_control_token)])
+@app.post("/api/call/outbound")
 async def call_outbound(request: OutboundCallRequest):
     """Prepare a room and bot; the browser joins before the SIP leg is dialed."""
     _require_agent_identity(request.agentIdentity)
@@ -954,7 +885,7 @@ async def call_outbound(request: OutboundCallRequest):
     }
 
 
-@app.post("/api/call/outbound/dial", dependencies=[Depends(require_control_token)])
+@app.post("/api/call/outbound/dial")
 async def dial_outbound(request: OutboundDialRequest):
     """Dial only after the agent track exists, then confirm SIP isolation."""
     call_info = active_calls.get(request.roomName)
@@ -1179,7 +1110,7 @@ class AcceptCallRequest(BaseModel):
     agentGender: Literal["male", "female"] = "male"
     voiceEngine: Literal["rvc"] = "rvc"
 
-@app.post("/api/call/accept", dependencies=[Depends(require_control_token)])
+@app.post("/api/call/accept")
 async def call_accept(request: AcceptCallRequest):
     """
     Triggered when an agent accepts an incoming call.
@@ -1292,7 +1223,7 @@ async def _do_end_call(room_name: str, reason: str = "") -> None:
         "reason": reason
     })
 
-@app.post("/api/call/end", dependencies=[Depends(require_control_token)])
+@app.post("/api/call/end")
 async def call_end(request: EndCallRequest):
     """
     Disconnects the bot, deletes the LiveKit room, and broadcasts the disconnect event.
@@ -1300,7 +1231,7 @@ async def call_end(request: EndCallRequest):
     await _do_end_call(request.roomName)
     return {"status": "ended", "roomName": request.roomName}
 
-@app.get("/api/call/status", dependencies=[Depends(require_control_token)])
+@app.get("/api/call/status")
 async def call_status(roomName: str = None):
     """
     Returns status of active calls.
@@ -1345,7 +1276,7 @@ async def health_check():
         "active_bots": len(active_workers),
     }
 
-@app.post("/api/setup", dependencies=[Depends(require_control_token)])
+@app.post("/api/setup")
 async def setup_integrations():
     """
     One-time setup endpoint. Call this once after filling in all credentials.
@@ -1542,7 +1473,7 @@ async def setup_integrations():
 
 # --- GPU KEEP-WARM ENDPOINT ---
 
-@app.post("/api/warmup", dependencies=[Depends(require_control_token)])
+@app.post("/api/warmup")
 async def warmup_gpu():
     """
     Pings the RVC endpoint /health to ensure the Modal GPU is warm.
@@ -1556,7 +1487,7 @@ async def warmup_gpu():
 
 # --- GPU DEPLOY ENDPOINT ---
 
-@app.post("/api/deploy", dependencies=[Depends(require_control_token)])
+@app.post("/api/deploy")
 async def deploy_gpu():
     """
     Executes 'modal deploy modal_deploy/worker.py' to deploy the RVC worker to Modal.
@@ -1668,16 +1599,7 @@ async def desktop_audio_websocket(websocket: WebSocket):
 
 @app.websocket("/api/call/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # Browser WebSocket clients cannot set arbitrary Authorization headers. Use a
-    # subprotocol for the in-memory control token instead of putting it in the URL,
-    # where access logs and proxy metrics commonly record query strings.
-    offered = [item.strip() for item in websocket.headers.get("sec-websocket-protocol", "").split(",")]
-    auth_protocol = next((item for item in offered if item.startswith("keira-auth.")), "")
-    token = auth_protocol[len("keira-auth."):] if auth_protocol else ""
-    if not CONTROL_PLANE_TOKEN or not verify_bearer_token(f"Bearer {token}", CONTROL_PLANE_TOKEN):
-        await websocket.close(code=1008, reason="Authentication required")
-        return
-    await websocket.accept(subprotocol=auth_protocol)
+    await websocket.accept()
     await manager.connect(websocket, already_accepted=True)
     try:
         while True:
