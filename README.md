@@ -163,16 +163,25 @@ The `/desktop/` page sends **converted audio only** to a Windows virtual audio d
 it never exposes `RVC_API_KEY` to the browser. Use current Chrome or Edge on Windows,
 which must support microphone access, AudioWorklets, and `AudioContext.setSinkId`.
 
+For localhost development only, set `KEIRA_LOCAL_NO_AUTH=true` and
+`KEIRA_LOCAL_NO_AUTH_ORIGIN=http://127.0.0.1:8000` in `.env`, then bind Keira directly
+to that loopback origin with `python scripts/run_local.py`. The launcher rejects
+non-loopback binds. Only the desktop-session ticket route becomes tokenless, and the page
+hides the control-token field. All other control routes remain token-protected. Never
+enable this mode behind a reverse proxy or public listener.
+
 1. Install [VB-CABLE](https://vb-audio.com/Cable/) on the Windows workstation, then
    restart the browser so Windows exposes both cable endpoints.
 2. Start Keira and open `https://your-keira-server.example.com/desktop/` (or
-   `http://localhost:8000/desktop/` for local development). Enter the control token and
-   grant the browser's microphone permission when prompted; this is required before the
-   device names can be listed.
+   `http://localhost:8000/desktop/` for local development). In an authenticated
+   deployment, enter the control token; local no-auth development hides that field.
+   Grant the browser's microphone permission when prompted; this is required before
+   the device names can be listed.
 3. In the Keira page, choose the **physical microphone** as **Physical microphone** and
-   choose **CABLE Input** as **Converted output**. Do not select **CABLE Output** as the
-   Keira input: that creates a feedback/raw-routing risk. Start conversion and wait for
-   the relay to reach `ready`/`converting` before beginning a call.
+   choose **CABLE Input**, **BlackHole 2ch**, or **Loopback** as **Converted output**.
+   Do not select **CABLE Output** or another virtual loopback as the Keira input: that
+   creates a feedback/raw-routing risk. Start conversion and wait for the relay to reach
+   `ready`/`converting` before beginning a call.
 4. In WhatsApp Desktop's audio settings, set **Microphone** to **CABLE Output** and set
    **Speakers** to the agent's headphones (not either VB-CABLE endpoint). The cable maps
    Keira's selected **CABLE Input** playback to WhatsApp's **CABLE Output** microphone.

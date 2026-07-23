@@ -7,6 +7,13 @@ const defaultAudioContextFactory = (options) => new AudioContext(options);
 
 export const isCableInputSink = (label = '') => /cable\s+input/i.test(label);
 export const isCableOutputInput = (label = '') => /cable\s+output/i.test(label);
+export const isVirtualLoopbackInput = (label = '') =>
+  /cable\s+(?:input|output)|blackhole|loopback/i.test(label);
+export const isApprovedVirtualOutput = (label = '') =>
+  isCableInputSink(label) || /blackhole|loopback/i.test(label);
+const audioContextSupportsSinkId = () =>
+  typeof AudioContext !== 'undefined'
+  && typeof AudioContext.prototype.setSinkId === 'function';
 
 const rmsPcm16 = (pcm) => {
   if (!(pcm instanceof ArrayBuffer) || pcm.byteLength % 2 !== 0) {
@@ -273,6 +280,8 @@ export class DesktopSetupPage {
     this.client = null;
     this.state = 'signed_out';
     this.backendReady = false;
+    this.authModeReady = false;
+    this.authRequired = true;
     this.lastError = '';
     this.devices = { inputs: [], outputs: [] };
   }
@@ -293,16 +302,43 @@ export class DesktopSetupPage {
     this.stopButton.addEventListener('click', () => void this.stopConversion());
     this.testButton.addEventListener('click', () => void this.runVoiceTest());
     this.setState('signed_out');
+    void this.loadAuthMode();
     void this.enumerateDevices();
   }
 
   token() {
-    return this.tokenInput.value.trim();
+    return this.tokenInput?.value.trim() || '';
+  }
+
+  async loadAuthMode() {
+    try {
+      const response = await this.fetchImpl('/api/desktop/auth-mode');
+      const mode = await response.json();
+      this.authRequired = mode.auth_required !== false;
+      this.authModeReady = true;
+      const tokenLabel = this.tokenInput?.closest('label');
+      if (tokenLabel) tokenLabel.hidden = !this.authRequired;
+      if (!this.authRequired && this.tokenInput) this.tokenInput.value = '';
+      if (!this.authRequired && !this.client) this.setState('stopped');
+    } catch {
+      this.authRequired = true;
+      this.authModeReady = true;
+    }
+    this.refreshControls();
   }
 
   onTokenInput() {
-    if (!this.client) this.setState(this.token() ? 'stopped' : 'signed_out');
+    if (!this.client) this.setState(this.canUseDesktopSession() ? 'stopped' : 'signed_out');
     this.refreshControls();
+  }
+
+  canUseDesktopSession() {
+    return this.authModeReady && (!this.authRequired || Boolean(this.token()));
+  }
+
+  canRunVoiceTest() {
+    const input = this.selectedInput();
+    return this.canUseDesktopSession() && input && !isVirtualLoopbackInput(input.label);
   }
 
   setState(state, message = '') {
@@ -338,7 +374,7 @@ export class DesktopSetupPage {
       this.devices.inputs = devices.filter((device) => device.kind === 'audioinput');
       this.devices.outputs = devices.filter((device) => device.kind === 'audiooutput');
       this.populateDevices(this.inputSelect, this.devices.inputs, 'Select a microphone');
-      this.populateDevices(this.outputSelect, this.devices.outputs, 'Select CABLE Input');
+      this.populateDevices(this.outputSelect, this.devices.outputs, 'Select virtual output');
       this.validateDevices();
     } catch (error) {
       this.setError(`Microphone permission is required to select devices: ${error.message}`);
@@ -365,12 +401,12 @@ export class DesktopSetupPage {
   validateDevices() {
     const input = this.selectedInput();
     const output = this.selectedOutput();
-    if (input && isCableOutputInput(input.label)) {
-      this.setNotice('CABLE Output is selected as the input. Choose your physical microphone to prevent feedback and raw routing.');
-    } else if (output && !isCableInputSink(output.label)) {
-      this.setNotice('Converted output must be the VB-CABLE “CABLE Input” device.');
-    } else if (output && typeof AudioContext.prototype.setSinkId !== 'function') {
-      this.setNotice('AudioContext.setSinkId is required. Use a current Chrome or Edge build on Windows.');
+    if (input && isVirtualLoopbackInput(input.label)) {
+      this.setNotice('A virtual loopback device is selected as the input. Choose your physical microphone.');
+    } else if (output && !isApprovedVirtualOutput(output.label)) {
+      this.setNotice('Converted output must be VB-CABLE CABLE Input, BlackHole, or Loopback.');
+    } else if (output && !audioContextSupportsSinkId()) {
+      this.setNotice('AudioContext.setSinkId is required. Use a current Chrome or Edge build.');
     } else {
       this.setNotice('');
     }
@@ -381,10 +417,10 @@ export class DesktopSetupPage {
     const input = this.selectedInput();
     const output = this.selectedOutput();
     return Boolean(
-      this.token()
-      && input && !isCableOutputInput(input.label)
-      && output && isCableInputSink(output.label)
-      && typeof AudioContext.prototype.setSinkId === 'function'
+      this.canUseDesktopSession()
+      && input && !isVirtualLoopbackInput(input.label)
+      && output && isApprovedVirtualOutput(output.label)
+      && audioContextSupportsSinkId()
       && !this.client
       && !['starting', 'warming', 'converting'].includes(this.state)
     );
@@ -394,16 +430,16 @@ export class DesktopSetupPage {
     if (!this.startButton) return;
     this.startButton.disabled = !this.canStart();
     this.stopButton.disabled = !this.client;
-    this.testButton.disabled = !this.token() || !this.selectedInput() || ['starting', 'warming', 'converting'].includes(this.state);
+    this.testButton.disabled = !this.canRunVoiceTest()
+      || ['starting', 'warming', 'converting'].includes(this.state);
   }
 
   async requestTicket() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (this.token()) headers.Authorization = `Bearer ${this.token()}`;
     const response = await this.fetchImpl('/api/desktop/session', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.token()}`,
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({ profile: this.profileInput.value }),
     });
     if (!response.ok) {
@@ -483,11 +519,11 @@ export class DesktopSetupPage {
     if (client) await client.stop();
     this.backendReady = false;
     this.updateMeters({ input: 0, output: 0, bufferMs: 0, input_drop_count: 0, oldestDropCount: 0, reconnect_count: 0 });
-    this.setState(this.token() ? 'stopped' : 'signed_out');
+    this.setState(this.canUseDesktopSession() ? 'stopped' : 'signed_out');
   }
 
   async runVoiceTest() {
-    if (!this.token() || !this.selectedInput()) return;
+    if (!this.canRunVoiceTest()) return;
     this.testButton.disabled = true;
     byId('voice-test-result').textContent = 'Recording a short converted voice test…';
     const client = this.createClient();

@@ -6,6 +6,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
+from urllib.parse import urlsplit
 from fastapi import (
     Depends,
     FastAPI,
@@ -66,6 +67,40 @@ app = FastAPI(title="Keira MVP Voice Conversion Server", lifespan=lifespan)
 # Operator control-plane authentication. Fail closed when this is absent: a
 # public deployment must never silently fall back to unauthenticated controls.
 CONTROL_PLANE_TOKEN = os.getenv("KEIRA_CONTROL_TOKEN") or os.getenv("CONTROL_PLANE_TOKEN", "")
+LOCAL_NO_AUTH = os.getenv("KEIRA_LOCAL_NO_AUTH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+LOCAL_NO_AUTH_ORIGIN = os.getenv("KEIRA_LOCAL_NO_AUTH_ORIGIN", "").strip()
+LOCAL_BIND_HOST = os.getenv("KEIRA_LOCAL_BIND_HOST", "").strip()
+LOCAL_LAUNCHER = os.getenv("KEIRA_LOCAL_LAUNCHER", "").strip() == "1"
+
+
+def _local_no_auth_allowed(request: Request) -> bool:
+    """Allow tokenless control requests only on an explicitly local server."""
+    if not LOCAL_NO_AUTH or not LOCAL_LAUNCHER or LOCAL_BIND_HOST not in {"127.0.0.1", "::1", "localhost"}:
+        return False
+    client_host = request.client.host if request.client else ""
+    request_host = getattr(getattr(request, "url", None), "hostname", "")
+    try:
+        configured_origin = urlsplit(LOCAL_NO_AUTH_ORIGIN)
+        configured_port = configured_origin.port or (443 if configured_origin.scheme == "https" else 80)
+    except ValueError:
+        return False
+    request_url = getattr(request, "url", None)
+    request_port = getattr(request_url, "port", None) or (443 if getattr(request_url, "scheme", "") == "https" else 80)
+    forwarded = request.headers.get("x-forwarded-for", "") or request.headers.get("forwarded", "")
+    loopback = {"127.0.0.1", "::1", "localhost"}
+    return (
+        not forwarded
+        and configured_origin.scheme in {"http", "https"}
+        and configured_origin.scheme == getattr(request_url, "scheme", "")
+        and configured_origin.hostname in loopback
+        and configured_port == request_port
+        and configured_origin.hostname == request_host
+        and client_host in loopback
+    )
 
 # Small per-process rate limiter. This is a first guard, not a replacement for
 # a shared gateway limiter when the service is scaled beyond one instance.
@@ -103,7 +138,10 @@ async def disable_static_asset_cache(request: Request, call_next):
     return response
 
 
-async def require_control_token(authorization: str = Header(default="")):
+async def require_control_token(
+    request: Request,
+    authorization: str = Header(default=""),
+):
     if not CONTROL_PLANE_TOKEN:
         raise HTTPException(
             status_code=503,
@@ -115,6 +153,16 @@ async def require_control_token(authorization: str = Header(default="")):
             detail="Authentication required.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+async def require_desktop_session_auth(
+    request: Request,
+    authorization: str = Header(default=""),
+):
+    """Allow tokenless desktop tickets only in direct loopback development."""
+    if _local_no_auth_allowed(request):
+        return
+    await require_control_token(request, authorization)
 
 
 async def require_twilio_signature(request: Request):
@@ -735,7 +783,13 @@ class DesktopSessionRequest(BaseModel):
     profile: Literal["male", "female"]
 
 
-@app.post("/api/desktop/session", dependencies=[Depends(require_control_token)])
+@app.get("/api/desktop/auth-mode")
+async def desktop_auth_mode(request: Request):
+    """Expose only whether this request is in explicit loopback dev mode."""
+    return {"auth_required": not _local_no_auth_allowed(request)}
+
+
+@app.post("/api/desktop/session", dependencies=[Depends(require_desktop_session_auth)])
 async def create_desktop_session(request: DesktopSessionRequest):
     """Issue a short-lived, single-use desktop relay ticket."""
     ticket, expires_in = app.state.desktop_sessions.issue(request.profile)

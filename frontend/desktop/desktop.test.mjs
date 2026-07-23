@@ -101,3 +101,61 @@ test('page transitions to converting when connected follows relay ready', () => 
   emitStatus({ type: 'connected' });
   assert.equal(page.state, 'converting');
 });
+
+test('local no-auth mode allows starting without a control token', () => {
+  const page = makePage();
+  page.authModeReady = true;
+  page.authRequired = false;
+  page.tokenInput = { value: '' };
+  page.selectedInput = () => ({ label: 'MacBook Microphone' });
+  page.selectedOutput = () => ({ label: 'BlackHole 2ch' });
+  page.state = 'stopped';
+  page.client = null;
+
+  const previousAudioContext = globalThis.AudioContext;
+  globalThis.AudioContext = class {};
+  globalThis.AudioContext.prototype.setSinkId = async () => {};
+  try {
+    assert.equal(page.canStart(), true);
+  } finally {
+    globalThis.AudioContext = previousAudioContext;
+  }
+});
+
+test('tokenless mode permits desktop session actions without a token', () => {
+  const page = makePage();
+  page.authModeReady = true;
+  page.authRequired = false;
+  page.tokenInput = { value: '' };
+
+  assert.equal(page.canUseDesktopSession(), true);
+});
+
+test('virtual loopback devices are rejected as microphone inputs', () => {
+  const page = makePage();
+  page.authModeReady = true;
+  page.authRequired = false;
+  page.tokenInput = { value: '' };
+  page.selectedInput = () => ({ label: 'BlackHole 2ch' });
+  page.selectedOutput = () => ({ label: 'BlackHole 2ch' });
+  page.state = 'stopped';
+
+  const previousAudioContext = globalThis.AudioContext;
+  globalThis.AudioContext = class {};
+  globalThis.AudioContext.prototype.setSinkId = async () => {};
+  try {
+    assert.equal(page.canStart(), false);
+  } finally {
+    globalThis.AudioContext = previousAudioContext;
+  }
+});
+
+test('voice test rejects virtual loopback microphone inputs', () => {
+  const page = makePage();
+  page.authModeReady = true;
+  page.authRequired = false;
+  page.tokenInput = { value: '' };
+  page.selectedInput = () => ({ label: 'Loopback Audio' });
+
+  assert.equal(page.canRunVoiceTest(), false);
+});
