@@ -569,3 +569,52 @@ this is a different failure class from Call 1: a small, intermittent artifact co
 a SOLA-splice/block-boundary handoff (320ms block, 80ms SOLA crossfade) rather than a
 data-loss or capacity event. Leading hypothesis only, not yet root-caused in
 `modal_deploy/streaming.py`; flagged for the user, no code changed.
+
+## 2026-07-23 — Merged origin/main; re-dropped control-token auth from the desktop feature
+
+**Local `main` (20 commits, the desktop voice-changer feature) had diverged from
+`origin/main` (12 commits) with real conflicts, not just textual ones.** The desktop
+feature was built on a base that predated the 2026-07-19 control-token removal (see above)
+and assumed `KEIRA_CONTROL_TOKEN` auth still existed — its new `/api/desktop/session`
+endpoint and `require_desktop_session_auth`/`_local_no_auth_allowed` machinery depended on
+`require_control_token`. Merging naively (accepting `HEAD`'s conflict-marked side, which is
+what a plain `git merge` auto-resolves toward for the unmarked hunks too) would have
+silently reintroduced auth on 10+ operator routes, `/api/call/ws`, and the desktop session
+endpoint — reversing a change already confirmed live in production and, per that entry,
+made at explicit user request. Asked the user directly rather than guessing; confirmed:
+**drop auth everywhere, matching `origin/main`**, including on the new desktop endpoints.
+
+**What that took, beyond resolving the 3 marked conflict hunks in `backend/main.py`:** git's
+3-way merge silently (no conflict markers) resolved several *unmarked* hunks toward
+`origin/main`'s side purely because HEAD hadn't touched them, which combined with a naive
+"take HEAD" resolution of the marked hunks would have left the merged file internally
+inconsistent — e.g. `Depends`/`Header` imports present but every other route decorator
+missing `dependencies=[Depends(require_control_token)]`, `verify_bearer_token` called in a
+websocket handler but not imported, `CONTROL_PLANE_TOKEN` referenced but never defined. Also
+silently dropped by the same mechanism: `verify_bearer_token` itself (`backend/security.py`),
+its unit test (`backend/test_control_plane.py`), the `KEIRA_CONTROL_TOKEN` `render.yaml`
+entry, and all of `frontend/app.js`'s `getControlToken()`/`Authorization` header/WS
+subprotocol logic. Diffing each touched file against both the pre-merge `HEAD` and
+`origin/main` (not just eyeballing conflict markers) is what surfaced these — a `git merge`
+with zero conflict markers reported is not proof nothing was lost from either side.
+
+**Resolution:** removed the control-token/local-no-auth scaffolding from `backend/main.py`
+entirely (all 11 route decorators, the `/api/call/ws` handshake check, `require_control_token`,
+`require_desktop_session_auth`, `_local_no_auth_allowed`, the `KEIRA_LOCAL_*` env vars, the
+now-unused `Depends`/`Header`/`urlsplit` imports); restored `frontend/app.js` to
+`origin/main`'s tokenless version; rewrote `backend/test_desktop_audio.py`'s three
+auth-dependent tests down to one (`/api/desktop/session` now issues a ticket with no auth
+header at all) and deleted the two testing removed functions
+(`_local_no_auth_allowed`/`require_control_token`); updated `README.md`'s desktop-setup
+section, which still described the old "authenticated deployment vs. local no-auth mode"
+split as if both existed. The desktop feature's own ticket-based WS auth
+(`DesktopSessionStore`, single-use `keira-desktop.<ticket>` subprotocol) is unrelated to the
+operator control-token gate and was left untouched — it was never gated by
+`require_control_token` for the actual audio relay, only session issuance was. Ran
+`python -m backend.test_pipeline` and `pytest backend/test_control_plane.py
+backend/test_desktop_audio.py` after, both clean, before committing the merge (`6e284bd`).
+
+**Net effect unchanged from the 2026-07-19 entry: the control plane, including the new
+desktop-session endpoint, remains fully unauthenticated.** If control-plane auth is wanted
+back, this merge commit's parent (`88e1801`) and `e501104` (original P0 add) both have a
+working implementation to reference.
