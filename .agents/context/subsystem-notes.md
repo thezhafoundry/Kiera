@@ -332,6 +332,58 @@ Work through in order:
   training data — worth re-validating if a user's identity complaint persists after
   ruling out the input-muffling regression noted above. See [[active-backlog]].
 
+## Desktop voice changer and macOS BlackHole (`/desktop/`, verified 2026-07-23)
+
+The desktop page is a browser-to-FastAPI relay, not the LiveKit/PSTN worker path:
+`POST /api/desktop/session` issues a short-lived, single-use ticket; the browser offers it
+as `keira-desktop.<ticket>` on `/api/desktop/audio`; `DesktopAudioBridge` accepts fixed
+640-byte/20ms 16kHz PCM frames and returns fixed 960-byte/10ms 48kHz converted frames.
+Operator/control-token auth is currently disabled globally (merge `6e284bd`, decision
+commit `61d677c`), but the single-use desktop WebSocket ticket remains. Do not confuse the
+ticket with the removed `KEIRA_CONTROL_TOKEN` gate.
+
+- **Use a real current Chrome/Edge build.** The Codex in-app browser used during the
+  2026-07-23 local test did not complete the page's required Web Audio/device setup and
+  enumerated only built-in devices, leaving the fallback UI and buttons disabled.
+  This was a browser-surface limitation, not evidence that BlackHole or RVC was missing.
+  The page also requires microphone permission before `enumerateDevices()` reveals complete
+  device names.
+- **macOS device state was verified directly:** the driver exists at
+  `/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver`; CoreAudio reports `BlackHole 2ch`,
+  2 input + 2 output channels, 48kHz, virtual transport. The MacBook Air microphone was
+  48kHz; built-in speakers were 44.1kHz. If Chrome was already running when BlackHole was
+  installed, quit it fully (`Cmd+Q`) and reopen the page after granting microphone access.
+- **Button contracts differ:** **Test converted voice** needs only a selected physical
+  microphone and an available desktop session; it plays converted output through normal
+  speakers and does *not* require BlackHole. **Start conversion** additionally requires
+  `AudioContext.setSinkId` and an approved virtual output (`BlackHole`, `Loopback`, or
+  VB-CABLE `CABLE Input`). **Stop** is enabled only while a relay client exists.
+- **Fresh warm-path evidence:** a 2.0s direct synthetic RVC stream returned 174,086 bytes
+  / 1,813.4ms across 6 blocks, active-ready 1,970.34ms, TensorRT inference median/p95
+  55.64/58.08ms, converter-wait median/p95 1,437.22/1,597.90ms, network estimate
+  median/p95 1,062.58/1,221.63ms, zero drops. The exact local desktop route also passed:
+  a generated 2,208.9ms spoken sentence became 173,760 bytes / 181 valid output frames /
+  1,810.0ms, ready in 1,856.36ms, 6 stats messages, zero input drops. The ignored local
+  listen artifact is `kiera_conversion_test_rerun.wav`.
+- **Cold-path evidence:** the first direct session timed out its opening handshake and
+  failed active readiness after 180s; `/health` also returned no bytes within 45s. Modal
+  logs showed the stable `fastapi_app` waiting roughly five minutes for an
+  `ap-southeast` L4, followed by ~34s model/TRT startup. A later cold desktop session
+  correctly returned `converter_unavailable` after its 150s fail-closed gate. A direct
+  health warm-up then took ~94s; the identical desktop test immediately passed afterward.
+  Treat disabled/failed tests after idle as a capacity/readiness problem until `/health`
+  reports `ready`, not as a voice-model or BlackHole failure.
+- **Keep-warm trap:** `_rvc_keepwarm_loop` is default-off unless `RVC_KEEPWARM=1`.
+  `lifespan()` currently prints “RVC keep-warm loop started” unconditionally even when the
+  coroutine returns immediately; the local `.env` did not set `RVC_KEEPWARM` during this
+  test. Trust the environment and actual `/health` traffic, not that startup line.
+
+Next-session acceptance order: start the local server; explicitly warm `/health`; open
+`http://127.0.0.1:8000/desktop/` in real Chrome; allow microphone access; select the
+physical mic; run **Test converted voice**; select `BlackHole 2ch`; run **Start conversion**;
+then set WhatsApp Desktop's microphone to BlackHole and keep its speaker on the built-in
+speakers/headphones. Record UI state, readiness time, first converted audio, and any drops.
+
 ## TensorRT/ONNX migration (merged to main 2026-07-07, merge commit `9c1093a`)
 `trt-migration` branch is merged into `main`. Rollout status as of 2026-07-16: Phase A
 hardening fixes, Phase B commit slices, Phase C1-C3 (probe/export/engine-build) are all

@@ -618,3 +618,49 @@ backend/test_desktop_audio.py` after, both clean, before committing the merge (`
 desktop-session endpoint, remains fully unauthenticated.** If control-plane auth is wanted
 back, this merge commit's parent (`88e1801`) and `e501104` (original P0 add) both have a
 working implementation to reference.
+
+## 2026-07-23 — Desktop relay validated on macOS; cold Modal capacity is the gating failure
+
+**Separated the disabled desktop buttons from actual conversion health instead of treating
+them as one failure.** The page had been opened in the Codex in-app browser, whose test
+surface did not complete the required Web Audio setup or expose the complete CoreAudio device list.
+That kept the page in its fallback state and showed only built-in devices. The correct
+acceptance surface is a current regular Chrome/Edge build with microphone permission.
+For the page's contracts, **Test converted voice does not require a virtual device**; only
+**Start conversion** requires `AudioContext.setSinkId` plus BlackHole/Loopback/CABLE Input.
+
+**Verified BlackHole below the browser boundary.** The installed driver is
+`/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver`; macOS CoreAudio reports `BlackHole 2ch`
+with two input and two output channels at 48kHz. This rejects the hypothesis that the
+dropdown was empty because the driver was absent. Chrome was opened at
+`http://127.0.0.1:8000/desktop/`; the remaining user-run step is to grant microphone
+permission, confirm the device appears, and perform the human mic/WhatsApp acceptance.
+
+**Proved both converter and desktop relay with fresh live audio.** A warm 2.0s synthetic
+direct WebSocket run produced 174,086 bytes / 1,813.4ms, six stats blocks, TensorRT
+inference median/p95 55.64/58.08ms, no drops. A generated 2,208.9ms spoken sentence sent
+through the exact local `/api/desktop/session` → `/api/desktop/audio` path returned 173,760
+bytes in 181 valid 960-byte 48kHz frames (1,810.0ms), ready in 1,856.36ms, six stats
+messages, zero input drops. The ignored local listening artifact is
+`kiera_conversion_test_rerun.wav`. This proves transport, inference, and output framing;
+subjective identity/clarity still requires the user's ear and real microphone.
+
+**The reproducible failure is cold capacity/readiness, not conversion.** Modal first logged
+the stable function waiting about five minutes for an `ap-southeast` L4, then spent ~34s
+loading the model/TRT pipeline. The first direct WebSocket opening handshake timed out and
+active readiness failed after 180s; `/health` returned zero bytes within 45s. A later cold
+desktop session reached its 150s fail-closed limit and returned
+`{"type":"error","code":"converter_unavailable"}`. An explicit `/health` warm-up then took
+about 94s and returned `ready` on an NVIDIA L4; the identical desktop test passed
+immediately afterward. Decision: preserve fail-closed behavior and treat a warm gate as a
+first-class desktop UX/state problem. The next implementation must expose warming/progress
+and make an explicit cost/availability choice among longer bounded wait/retry,
+`RVC_KEEPWARM=1`, or the pending broader-AP routing experiment.
+
+**Two adjacent tooling/logging defects were recorded rather than silently worked around.**
+Running `scripts/rvc_stream_benchmark.py` directly fails to import `backend`; module form
+(`python -m scripts.rvc_stream_benchmark`) works. Also, the server prints that the keep-warm
+loop started even when `RVC_KEEPWARM` is default-off and the task exits immediately.
+Post-merge `scripts/run_local.py` still sets local-auth launcher markers that the backend no
+longer reads because operator auth was removed globally. These are backlog cleanups, not
+reasons to change the verified audio pipeline.
