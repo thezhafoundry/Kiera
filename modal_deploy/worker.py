@@ -94,9 +94,9 @@ def _require_modal_auth(authorization: str) -> None:
 # truth) which is mounted into containers so compile_trt / export_onnx can also
 # import these without needing worker.py on the container path.
 try:
-    from modal_deploy.modal_defs import volume, image, trt_image
+    from modal_deploy.modal_defs import volume, trt_image
 except ImportError:   # inside container: modal_deploy package not present
-    from modal_defs import volume, image, trt_image
+    from modal_defs import volume, trt_image
 
 
 # ---- Shared conversion logic (plain Python, no Modal decorators) ----
@@ -305,7 +305,7 @@ class RVCEngine:
             is_male = f0 < 145.0
             pitch_shift = 12 if is_male else 0
             return pitch_shift
-        except Exception as e:
+        except Exception:
             return 0
 
     def run_conversion(
@@ -341,8 +341,6 @@ class RVCEngine:
         if pitch == -1:
             pitch = self._auto_detect_pitch(audio_bytes)
 
-        t1 = time.perf_counter()
-        
         # 2. Extract ContentVec features
         feats_input = np.expand_dims(np.expand_dims(audio, 0), 0)
         vec_input_name = self.vec_session.get_inputs()[0].name
@@ -352,9 +350,7 @@ class RVCEngine:
         feats = vec_outputs[0]
         if feats.shape[1] == 768:
             feats = feats.transpose(0, 2, 1)
-        
-        t2 = time.perf_counter()
-        
+
         # 3. Perform index search and feature blending (numpy)
         feats0 = feats.copy()
         if self.index is not None and self.big_npy is not None and index_rate > 0:

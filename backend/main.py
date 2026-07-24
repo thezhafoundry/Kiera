@@ -30,7 +30,6 @@ from .pipeline import VoiceConversionWorker
 from .security import (
     redact_phone_number,
     validate_agent_identity,
-    validate_e164_phone,
     RateLimiter,
 )
 
@@ -343,10 +342,6 @@ async def _restrict_sip_audio(room_name: str, sip_identity: str = "sip-lead"):
                 identity = p.identity
                 is_bot = identity.startswith("voice-converter-bot")
                 is_agent = "agent" in identity.lower() and not is_bot
-                # SIP participant: matches the known identity OR is neither bot nor agent
-                is_sip = (identity == sip_identity) or \
-                          (not is_bot and not is_agent and identity != sip_identity and
-                           sip_identity not in ("sip-lead",))  # dynamic inbound detection
 
                 # For outbound: trust the explicit sip_identity
                 if identity == sip_identity:
@@ -1007,8 +1002,7 @@ async def call_inbound(
 
     # 4. Return TwiML: put caller on hold and poll /api/call/wait until agent accepts
     wait_url = f"{SERVER_URL.rstrip('/') if SERVER_URL else ''}/api/call/wait?callSid={CallSid}"
-    status_callback = f"{SERVER_URL.rstrip('/') if SERVER_URL else ''}/api/call/status-event"
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Pause length="60"/>
     <Hangup/>

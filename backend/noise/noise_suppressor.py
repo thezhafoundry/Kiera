@@ -42,7 +42,7 @@ class WebRTCNoiseSuppressor(NoiseSuppressor):
         try:
             result = self.processor.Process10ms(frame_bytes)
             return result.audio
-        except Exception as e:
+        except Exception:
             # Fallback to raw frame on any processing error
             return frame_bytes
 

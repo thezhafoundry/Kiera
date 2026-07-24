@@ -40,7 +40,7 @@ PROFILE_NAME = PROFILE.name
               volumes={"/root/rvc-models": volume}, region="ap-southeast")
 def probe() -> dict:
     """Task 1: verify TRT EP is available and locate library files."""
-    import os, sys, glob
+    import os, glob
     import onnxruntime as ort
     import torch
 
@@ -151,7 +151,7 @@ def build_engines():
             os.remove(f)
             print(f"[TRT]   removed {os.path.basename(f)}")
     else:
-        print(f"[TRT] Cache dir is clean (no stale files).")
+        print("[TRT] Cache dir is clean (no stale files).")
 
     print(f"[TRT] Building TRT engine caches at {cache_dir}...")
     t0 = time.perf_counter()

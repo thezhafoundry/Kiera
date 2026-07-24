@@ -2,7 +2,7 @@ import numpy as np
 import faiss
 import pytest
 
-from worker import _cached_read_index, _install_faiss_index_cache
+from worker import _install_faiss_index_cache
 
 
 @pytest.fixture
