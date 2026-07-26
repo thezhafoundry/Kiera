@@ -165,6 +165,37 @@ test('default fetchImpl is bound and callable detached from its owner', async ()
   }
 });
 
+test('warmGpu reports success and re-enables the button', async () => {
+  const page = makePage();
+  page.warmButton = { disabled: false };
+  page.warmResult = { textContent: '' };
+  page.fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ status: 'success', message: 'GPU warmed up successfully.' }),
+  });
+
+  await page.warmGpu();
+
+  assert.equal(page.warmButton.disabled, false);
+  assert.equal(page.warmResult.textContent, 'GPU warm and ready.');
+});
+
+test('warmGpu surfaces the server message on failure', async () => {
+  const page = makePage();
+  page.warmButton = { disabled: false };
+  page.warmResult = { textContent: '' };
+  page.fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ status: 'error', message: 'GPU did not become ready within 360s.' }),
+  });
+
+  await page.warmGpu();
+
+  assert.equal(page.warmResult.textContent, 'GPU warmup failed: GPU did not become ready within 360s.');
+});
+
 test('voice test rejects virtual loopback microphone inputs', () => {
   const page = makePage();
   page.authModeReady = true;

@@ -294,6 +294,8 @@ export class DesktopSetupPage {
     this.startButton = byId('start-conversion');
     this.stopButton = byId('stop-conversion');
     this.testButton = byId('voice-test');
+    this.warmButton = byId('warm-gpu');
+    this.warmResult = byId('warm-gpu-result');
     this.tokenInput.addEventListener('input', () => this.onTokenInput());
     this.profileInput.addEventListener('change', () => this.refreshControls());
     this.inputSelect.addEventListener('change', () => this.validateDevices());
@@ -301,6 +303,7 @@ export class DesktopSetupPage {
     this.startButton.addEventListener('click', () => void this.startConversion());
     this.stopButton.addEventListener('click', () => void this.stopConversion());
     this.testButton.addEventListener('click', () => void this.runVoiceTest());
+    this.warmButton.addEventListener('click', () => void this.warmGpu());
     this.setState('signed_out');
     void this.loadAuthMode();
     void this.enumerateDevices();
@@ -520,6 +523,30 @@ export class DesktopSetupPage {
     this.backendReady = false;
     this.updateMeters({ input: 0, output: 0, bufferMs: 0, input_drop_count: 0, oldestDropCount: 0, reconnect_count: 0 });
     this.setState(this.canUseDesktopSession() ? 'stopped' : 'signed_out');
+  }
+
+  async warmGpu() {
+    this.warmButton.disabled = true;
+    this.warmResult.textContent = 'Warming GPU (cold start can take a few minutes)…';
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 7 * 60 * 1000);
+    try {
+      const response = await this.fetchImpl('/api/warmup', {
+        method: 'POST',
+        signal: controller.signal,
+      });
+      const data = await response.json().catch(() => ({}));
+      this.warmResult.textContent = data.status === 'success'
+        ? 'GPU warm and ready.'
+        : `GPU warmup failed: ${data.message || `HTTP ${response.status}`}`;
+    } catch (error) {
+      this.warmResult.textContent = error.name === 'AbortError'
+        ? 'GPU warmup timed out. Try again.'
+        : `GPU warmup failed: ${error.message}`;
+    } finally {
+      clearTimeout(timeoutId);
+      this.warmButton.disabled = false;
+    }
   }
 
   async runVoiceTest() {
