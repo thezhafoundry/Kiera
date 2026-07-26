@@ -150,6 +150,21 @@ test('virtual loopback devices are rejected as microphone inputs', () => {
   }
 });
 
+test('default fetchImpl is bound and callable detached from its owner', async () => {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async function boundCheckingFetch(url) {
+    assert.equal(this, globalThis, 'fetch must be invoked with globalThis as receiver');
+    return { json: async () => ({ url }) };
+  };
+  try {
+    const page = new DesktopSetupPage();
+    const detached = page.fetchImpl;
+    await assert.doesNotReject(detached('/api/desktop/auth-mode'));
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 test('voice test rejects virtual loopback microphone inputs', () => {
   const page = makePage();
   page.authModeReady = true;

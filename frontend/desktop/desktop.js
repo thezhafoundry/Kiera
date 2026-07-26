@@ -274,7 +274,7 @@ const formatPercent = (value) => `${Math.round(Math.min(1, Math.max(0, value || 
 
 /** Controls the desktop setup page without persisting its control-plane token. */
 export class DesktopSetupPage {
-  constructor({ createClient = () => new DesktopAudioClient(), fetchImpl = globalThis.fetch } = {}) {
+  constructor({ createClient = () => new DesktopAudioClient(), fetchImpl = globalThis.fetch.bind(globalThis) } = {}) {
     this.createClient = createClient;
     this.fetchImpl = fetchImpl;
     this.client = null;
