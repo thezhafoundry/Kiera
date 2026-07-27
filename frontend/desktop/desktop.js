@@ -209,8 +209,9 @@ export class DesktopAudioClient {
 
   handleSocketMessage(message) {
     if (message instanceof ArrayBuffer) {
+      const output = rmsPcm16(message);
       this.playoutNode?.port.postMessage({ type: 'audio', pcm: message }, [message]);
-      this.emitMeters({ input: 0, output: rmsPcm16(message), bufferMs: 0 });
+      this.emitMeters({ input: 0, output, bufferMs: 0 });
       return;
     }
     if (typeof message !== 'string') {
