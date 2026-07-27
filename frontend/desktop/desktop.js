@@ -269,6 +269,17 @@ export class DesktopAudioClient {
   }
 }
 
+// How long to wait for the first converted frame, measured from the relay's
+// `ready` handshake. The converter buffers BLOCK_MS+CONTEXT_MS (720ms) before
+// its first inference and returns it ~1.2-1.4s later; measured warm, the first
+// frame lands ~1.36s after `ready`. 10s leaves headroom for a slow first block
+// without hanging the UI.
+const VOICE_TEST_AUDIO_TIMEOUT_MS = 10_000;
+// Cap on the `ready` handshake itself. The backend's own fail-closed gate is
+// 150s (READINESS_TIMEOUT_SECONDS); a cold Modal container has been measured
+// taking 24s+ just to hand back `ready`.
+const VOICE_TEST_READY_TIMEOUT_MS = 60_000;
+
 const byId = (id) => document.getElementById(id);
 const formatMs = (value) => Number.isFinite(value) ? `${Math.round(value)} ms` : '--';
 const formatPercent = (value) => `${Math.round(Math.min(1, Math.max(0, value || 0)) * 100)}%`;
@@ -562,7 +573,18 @@ export class DesktopSetupPage {
     let resolvePlayoutDrained;
     const firstAudio = new Promise((resolve) => { resolveFirstAudio = resolve; });
     const playoutDrained = new Promise((resolve) => { resolvePlayoutDrained = resolve; });
+    let relayReady = false;
+    let resolveRelayReady;
+    const relayReadyPromise = new Promise((resolve) => { resolveRelayReady = resolve; });
     this.bindClient(client, { test: true, startedAt });
+    client.onStatus((status) => {
+      if (status.type === 'ready') {
+        relayReady = true;
+        resolveRelayReady();
+      } else if (status.type === 'interrupted' || status.type === 'error') {
+        resolveRelayReady();
+      }
+    });
     client.onMeters((meters) => {
       if (meters.output > 0) {
         receivedAudio = true;
@@ -576,9 +598,27 @@ export class DesktopSetupPage {
     try {
       const ticket = await this.requestTicket();
       await client.start({ inputDeviceId: this.inputSelect.value, ticket });
+
+      // Wait for the relay handshake first. A cold Modal container has been
+      // measured taking 24s+ to hand back `ready`; folding that into the audio
+      // budget is what made this test tear the socket down mid-conversion.
+      byId('voice-test-result').textContent = 'Connecting to the relay…';
+      await Promise.race([
+        relayReadyPromise,
+        new Promise((resolve) => setTimeout(resolve, VOICE_TEST_READY_TIMEOUT_MS)),
+      ]);
+      if (!relayReady) {
+        byId('voice-test-result').textContent = 'Relay never became ready. Warm the GPU and try again.';
+        return;
+      }
+
+      // Only now start the conversion budget. The converter buffers
+      // BLOCK_MS+CONTEXT_MS (720ms) before its first inference and returns it
+      // ~1.2-1.4s later, so the first frame lands ~1.36s after `ready`.
+      byId('voice-test-result').textContent = 'Speak now — waiting for converted audio…';
       await Promise.race([
         firstAudio,
-        new Promise((resolve) => setTimeout(resolve, 3500)),
+        new Promise((resolve) => setTimeout(resolve, VOICE_TEST_AUDIO_TIMEOUT_MS)),
       ]);
       if (!receivedAudio) byId('voice-test-result').textContent = 'No converted audio returned. Check the relay and voice level.';
       if (receivedAudio) {

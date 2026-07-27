@@ -205,3 +205,104 @@ test('voice test rejects virtual loopback microphone inputs', () => {
 
   assert.equal(page.canRunVoiceTest(), false);
 });
+
+/**
+ * Fake client that reproduces the measured live relay timing: the `ready`
+ * handshake lands after `readyDelayMs`, and the first converted frame arrives
+ * `audioAfterReadyMs` later (measured warm: ~1.9s then ~1.36s).
+ */
+function makeTimedVoiceTestClient({ readyDelayMs, audioAfterReadyMs }) {
+  const statusCallbacks = new Set();
+  const meterCallbacks = new Set();
+  const timers = [];
+  const client = {
+    stopped: false,
+    stoppedAt: null,
+    startedAt: null,
+    onStatus(cb) { statusCallbacks.add(cb); },
+    onMeters(cb) { meterCallbacks.add(cb); },
+    async start() {
+      client.startedAt = Date.now();
+      timers.push(setTimeout(() => {
+        for (const cb of statusCallbacks) cb({ type: 'ready' });
+        timers.push(setTimeout(() => {
+          for (const cb of meterCallbacks) cb({ input: 0, output: 0.5, bufferMs: 40 });
+          timers.push(setTimeout(() => {
+            for (const cb of meterCallbacks) cb({ input: 0, output: 0, bufferMs: 0 });
+          }, 20));
+        }, audioAfterReadyMs));
+      }, readyDelayMs));
+    },
+    async stop() {
+      client.stopped = true;
+      client.stoppedAt = Date.now();
+      for (const t of timers) clearTimeout(t);
+    },
+  };
+  return client;
+}
+
+function makeVoiceTestPage(client) {
+  const elements = {
+    'voice-test-result': { textContent: '' },
+    'voice-test-latency': { textContent: '' },
+    'input-meter-fill': { style: {} },
+    'input-meter-value': { textContent: '' },
+    'output-meter-fill': { style: {} },
+    'output-meter-value': { textContent: '' },
+    'playout-buffer': { textContent: '' },
+    'input-drops': { textContent: '' },
+    'playout-drops': { textContent: '' },
+    'reconnect-count': { textContent: '' },
+    'connection-state': { textContent: '', dataset: {} },
+    'page-error': { textContent: '', hidden: true },
+    'device-warning': { textContent: '', hidden: true },
+  };
+  globalThis.document = { getElementById: (id) => elements[id] };
+
+  const page = new DesktopSetupPage({ createClient: () => client });
+  page.authModeReady = true;
+  page.authRequired = false;
+  page.tokenInput = { value: '' };
+  page.testButton = { disabled: false };
+  page.inputSelect = { value: 'mic-1' };
+  page.profileInput = { value: 'male' };
+  page.selectedInput = () => ({ label: 'Built-in Microphone' });
+  page.requestTicket = async () => 'ticket-abc';
+  page.refreshControls = () => {};
+  page.setState = (state) => { page.state = state; };
+  page.setError = () => {};
+  return { page, elements };
+}
+
+test('voice test waits for converted audio at real pipeline latency', async () => {
+  // Measured live against the deployed relay: ready ~1.9s, first converted
+  // frame ~1.36s after that. The old implementation used a single 3500ms
+  // budget starting at click time, which tore the socket down mid-conversion.
+  const client = makeTimedVoiceTestClient({ readyDelayMs: 1900, audioAfterReadyMs: 1400 });
+  const { page, elements } = makeVoiceTestPage(client);
+
+  await page.runVoiceTest();
+
+  assert.equal(
+    elements['voice-test-result'].textContent.startsWith('Converted audio received'),
+    true,
+    `expected converted audio to be reported, got: "${elements['voice-test-result'].textContent}"`,
+  );
+  assert.equal(client.stopped, true, 'client should still be torn down afterward');
+});
+
+test('voice test does not fold a slow ready handshake into the audio budget', async () => {
+  // A cold Modal container was measured taking 24s+ just to return `ready`.
+  // The audio budget must start from `ready`, not from the click.
+  const client = makeTimedVoiceTestClient({ readyDelayMs: 6000, audioAfterReadyMs: 1400 });
+  const { page, elements } = makeVoiceTestPage(client);
+
+  await page.runVoiceTest();
+
+  assert.equal(
+    elements['voice-test-result'].textContent.startsWith('Converted audio received'),
+    true,
+    `slow handshake should not cause a false "no audio" failure, got: "${elements['voice-test-result'].textContent}"`,
+  );
+});
