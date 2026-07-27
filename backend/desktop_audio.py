@@ -182,6 +182,7 @@ class DesktopAudioBridge:
         playout_enabled = asyncio.Event()
         failed = False
         stats_tasks: set[asyncio.Task[None]] = set()
+        send_lock = asyncio.Lock()
 
         def sanitize_stats(data: object) -> dict[str, bool | float | int | str]:
             if not isinstance(data, dict):
@@ -202,7 +203,8 @@ class DesktopAudioBridge:
 
         async def send_stats(data: dict[str, bool | float | int | str]) -> None:
             try:
-                await websocket.send_json({"type": "stats", **data})
+                async with send_lock:
+                    await websocket.send_json({"type": "stats", **data})
             except WebSocketDisconnect:
                 return
 
@@ -245,7 +247,8 @@ class DesktopAudioBridge:
                     try:
                         validate_input_frame(frame)
                     except ValueError as exc:
-                        await websocket.send_json({"type": "error", "message": str(exc)})
+                        async with send_lock:
+                            await websocket.send_json({"type": "error", "message": str(exc)})
                         continue
 
                     if not input_enabled.is_set():
@@ -254,12 +257,13 @@ class DesktopAudioBridge:
                     if input_queue.full():
                         input_queue.get_nowait()
                         self.input_drop_count += 1
-                        await websocket.send_json(
-                            {
-                                "type": "stats",
-                                "input_drop_count": self.input_drop_count,
-                            }
-                        )
+                        async with send_lock:
+                            await websocket.send_json(
+                                {
+                                    "type": "stats",
+                                    "input_drop_count": self.input_drop_count,
+                                }
+                            )
                     input_queue.put_nowait(frame)
             except (WebSocketDisconnect, asyncio.CancelledError):
                 return
@@ -273,7 +277,8 @@ class DesktopAudioBridge:
                     async for chunk in stream:
                         for frame in split_output_frames(output_buffer, chunk):
                             await playout_enabled.wait()
-                            await websocket.send_bytes(frame)
+                            async with send_lock:
+                                await websocket.send_bytes(frame)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -281,11 +286,12 @@ class DesktopAudioBridge:
                 if not playout_enabled.is_set():
                     return
                 await drain_stats()
-                await websocket.send_json(
-                    {"type": "error", "message": f"conversion failed: {exc}"}
-                )
-                await websocket.send_bytes(silence_frame())
-                await websocket.close(code=1011, reason="Conversion failed")
+                async with send_lock:
+                    await websocket.send_json(
+                        {"type": "error", "message": f"conversion failed: {exc}"}
+                    )
+                    await websocket.send_bytes(silence_frame())
+                    await websocket.close(code=1011, reason="Conversion failed")
 
         wait_stream_ready = getattr(self.converter, "wait_stream_ready", None)
         needs_stream_readiness = callable(wait_stream_ready)
@@ -342,14 +348,15 @@ class DesktopAudioBridge:
 
                 if not converter_ready:
                     await cleanup_tasks()
-                    await websocket.send_json(
-                        {
-                            "type": "error",
-                            "code": "converter_unavailable",
-                            "message": "conversion backend unavailable",
-                        }
-                    )
-                    await websocket.close(code=1011, reason="Conversion backend unavailable")
+                    async with send_lock:
+                        await websocket.send_json(
+                            {
+                                "type": "error",
+                                "code": "converter_unavailable",
+                                "message": "conversion backend unavailable",
+                            }
+                        )
+                        await websocket.close(code=1011, reason="Conversion backend unavailable")
                     return
 
             if needs_stream_readiness and receive_task.done():
@@ -358,7 +365,8 @@ class DesktopAudioBridge:
                     await websocket.close(code=1000, reason="Client disconnected")
                 return
 
-            await websocket.send_json({"type": "ready"})
+            async with send_lock:
+                await websocket.send_json({"type": "ready"})
             input_enabled.set()
             playout_enabled.set()
             done, pending = await asyncio.wait(
@@ -392,10 +400,11 @@ class DesktopAudioBridge:
 
             await drain_stats()
             if not failed:
-                await websocket.send_json(
-                    {"type": "stopped", "input_drop_count": self.input_drop_count}
-                )
-                await websocket.close()
+                async with send_lock:
+                    await websocket.send_json(
+                        {"type": "stopped", "input_drop_count": self.input_drop_count}
+                    )
+                    await websocket.close()
         finally:
             await cleanup_tasks()
             with contextlib.suppress(Exception):
