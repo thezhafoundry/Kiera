@@ -2,6 +2,7 @@ import os
 import asyncio
 import contextlib
 import datetime
+import logging
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -35,6 +36,9 @@ from .security import (
 
 # Load environment variables
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("backend.converters.rvc_stream").setLevel(logging.INFO)
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
