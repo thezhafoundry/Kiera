@@ -205,7 +205,7 @@ class DesktopAudioBridge:
             try:
                 async with send_lock:
                     await websocket.send_json({"type": "stats", **data})
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, RuntimeError):
                 return
 
         def relay_stats(data: object) -> None:
