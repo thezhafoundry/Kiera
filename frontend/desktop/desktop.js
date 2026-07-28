@@ -272,9 +272,10 @@ export class DesktopAudioClient {
 // How long to wait for the first converted frame, measured from the relay's
 // `ready` handshake. The converter buffers BLOCK_MS+CONTEXT_MS (720ms) before
 // its first inference and returns it ~1.2-1.4s later; measured warm, the first
-// frame lands ~1.36s after `ready`. 10s leaves headroom for a slow first block
-// without hanging the UI.
-const VOICE_TEST_AUDIO_TIMEOUT_MS = 10_000;
+// frame lands ~1.36s after `ready`. TEMPORARY: bumped 10s -> 30s to diagnose
+// audio arriving after the test already closed the socket (2026-07-29); revert
+// once real first-block latency is confirmed.
+const VOICE_TEST_AUDIO_TIMEOUT_MS = 30_000;
 // Cap on the `ready` handshake itself. The backend's own fail-closed gate is
 // 150s (READINESS_TIMEOUT_SECONDS); a cold Modal container has been measured
 // taking 24s+ just to hand back `ready`.
