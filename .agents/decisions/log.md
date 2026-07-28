@@ -664,3 +664,83 @@ loop started even when `RVC_KEEPWARM` is default-off and the task exits immediat
 Post-merge `scripts/run_local.py` still sets local-auth launcher markers that the backend no
 longer reads because operator auth was removed globally. These are backlog cleanups, not
 reasons to change the verified audio pipeline.
+
+## 2026-07-28 — Desktop "no converted audio": timeout fix landed, two speculative fixes shipped in error, pacing gap identified
+
+Investigated the desktop `/desktop/` flow returning "No converted audio returned" and, later,
+audio audible only for "a fraction of a second". Three distinct problems surfaced; only one
+was correctly fixed. Recording all three because two live commits are still in production.
+
+**The load-bearing fact everyone should read first: `WARNING:asyncio:socket.send() raised
+exception.` does NOT mean a send raced or threw into our code.** It comes from CPython's
+`asyncio/selector_events.py:1068` (and `proactor_events.py:353`):
+
+```python
+if self._conn_lost:
+    if self._conn_lost >= constants.LOG_THRESHOLD_FOR_CONNLOST_WRITES:  # 5
+        logger.warning('socket.send() raised exception.')
+    self._conn_lost += 1
+    return   # silently discards; never raises
+```
+
+It fires when something writes to a transport whose connection is *already lost*, it
+**silently discards the data, and never raises** — so no `try/except` anywhere in
+`desktop_audio.py` can catch or fix it. Seeing N of these means N frames of converted audio
+were produced *after* the peer went away, i.e. the converter was working and the client had
+already hung up. Do not "fix" this warning by adding exception handling; find out why the
+client disconnected.
+
+**Fixed correctly (live, verified): the voice test's client-side deadline was shorter than the
+pipeline's real latency.** `runVoiceTest()` allowed 3500ms for the first converted frame,
+timed from click. Measured live against the deployed relay on a warm GPU while streaming audio
+from the instant of readiness: `ready` at **1943ms**, first converted frame at **3303ms** — a
+197ms margin. Real use is worse (the user must start speaking after clicking). On a cold
+container `ready` alone took **24.3s**. The test therefore called `client.stop()` mid-conversion
+on essentially every run, which is what generated the asyncio warnings above. Fixed in
+`8537093`/`e2566cc`: wait for `ready` first (60s cap), then start a separate 10s conversion
+budget. Two tests in `frontend/desktop/desktop.test.mjs` pin the measured timings; the
+slow-handshake one was confirmed to fail at 3511ms against the old code.
+
+**Shipped in error, still live, one actively harmful:**
+- `85bda43` added an `asyncio.Lock` serializing every `websocket.send_*` in
+  `DesktopAudioBridge.run`, on the incorrect theory that concurrent sends were racing.
+  **This introduced head-of-line blocking.** `RVCStreamingConverter` fires `on_stats`
+  continuously and `relay_stats` spawns an unbounded `asyncio.create_task` per stats event;
+  because `send_json({"type":"ready"})` was moved *inside* that lock, `ready` now queues behind
+  every pending stats send. Reproduced locally: hundreds of `stats` emitted before `ready`.
+  This plausibly explains `ready` taking 6.5s locally and 24s in one production run.
+  **Recommend reverting.**
+- `d967620` widened `send_stats`' `except WebSocketDisconnect` to also catch `RuntimeError`.
+  Inert — the exception it targets is never raised (see the asyncio semantics above). Harmless
+  but pointless.
+
+**Identified, NOT fixed — the real remaining cause of "a fraction of a second":
+`backend/desktop_audio.py` has no playout pacing at all.** `convert_output()` forwards every
+frame the instant it arrives, so Modal's bursty delivery reaches the browser unmodified.
+Measured live over a 30s continuous-input session: second 4 delivered 0.22s of audio, seconds
+5-11 delivered **nothing**, then seconds 13-14 dumped **6.2s of audio inside one second**.
+Totals were conservative (27.5s in, 24.96s out) — nothing is lost, it is purely a delivery-timing
+problem. `backend/pipeline.py` solved exactly this for the LiveKit path (0.25s cushion +
+self-correcting `next_publish_time` pacer, see [[subsystem-notes]] 2026-07-21); the desktop
+bridge never got the equivalent. That asymmetry is why the PSTN path sounds fine and the
+desktop path stutters.
+
+An attempt to port the pacer was **committed as `ea78c50`, pushed, and auto-deployed by the
+user during the session-close ritual, before any end-to-end verification.** The committed
+version does contain fixes for both starvation bugs below, and passes 24/24 unit tests — but
+two consecutive 30-35s local runs against a warm GPU afterwards produced **no `ready` message
+and zero audio**, where the pre-pacer code had reliably reached `ready` in 1.9-6.5s. That is
+unresolved: it could be the pacer, the `85bda43` ready-ordering bug, or Modal cold-start
+flapping (the same session saw a 150s warmup). See [[active-backlog]]. The original
+pre-fix version was outright broken — It starved
+playout completely (23.5s of audio in, **zero bytes out** against a local server) via two bugs:
+(1) the consumer called `playout_ready.clear()` on every wake including when it took no chunk,
+swallowing the producer's `set()` from the append that had just woken it; (2) a single
+`await playout_enabled.wait()` before the loop stranded the consumer, and its audio, whenever
+the session ended before the readiness gate opened. Fix the `ready`-ordering bug first —
+otherwise every timing measurement taken while diagnosing pacing is distorted by it.
+
+**Method note for future sessions:** the first two fixes were written by inferring a mechanism
+from a log message's wording rather than reading the source that emits it. Reading
+`selector_events.py` took two minutes and immediately invalidated both. Read the emitting
+source before patching an unfamiliar runtime warning.

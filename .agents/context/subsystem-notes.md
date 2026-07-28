@@ -373,6 +373,31 @@ ticket with the removed `KEIRA_CONTROL_TOKEN` gate.
   health warm-up then took ~94s; the identical desktop test immediately passed afterward.
   Treat disabled/failed tests after idle as a capacity/readiness problem until `/health`
   reports `ready`, not as a voice-model or BlackHole failure.
+- **`WARNING:asyncio:socket.send() raised exception.` is not an exception you can catch
+  (learned the hard way 2026-07-28).** It is emitted by CPython's
+  `asyncio/selector_events.py:1068` / `proactor_events.py:353` when something calls
+  `transport.write()` on a transport whose connection is **already lost**: it logs (only
+  after `LOG_THRESHOLD_FOR_CONNLOST_WRITES`, i.e. 5 prior silent drops), **discards the
+  data, and returns without raising.** Nothing in `desktop_audio.py`'s `try/except` can
+  ever see it. N of these warnings means N frames of converted audio were written *after*
+  the browser disconnected — which is evidence the converter is **working**, not failing.
+  Two separate "fixes" (a send lock, then a broadened `except`) were shipped against the
+  wrong mental model before anyone read the emitting source; see [[log]] 2026-07-28. When
+  this appears, ask why the client went away, not what threw.
+- **The desktop bridge has NO playout pacing, unlike the LiveKit path — this is the
+  known cause of stuttering desktop audio (measured 2026-07-28, unfixed).**
+  `DesktopAudioBridge.convert_output()` writes each converted frame the moment it arrives,
+  so Modal's arrival timing passes straight through to the browser. Measured over 30s of
+  evenly-sent input: 0.22s of audio at second 4, **nothing for seconds 5-11**, then
+  **6.2s of audio inside second 14**. Byte totals were near-conservative (27.5s in /
+  24.96s out), so this is purely delivery timing, not loss. The browser's playout worklet
+  only holds 5s (`MAX_QUEUE_SAMPLES`, drop-oldest), so the user hears a fraction of a
+  second then silence. `backend/pipeline.py` fixed exactly this class of bug for LiveKit
+  with a standing cushion + `next_publish_time` pacer (see the Playout buffer section
+  above); porting it here is tracked in [[active-backlog]]. **A first port attempt starved
+  playout to zero bytes** — clearing `playout_ready` on wakes that took no chunk swallows
+  the producer's `set()`, and a single `playout_enabled.wait()` before the loop strands the
+  consumer when a session ends pre-readiness. Both traps are documented in [[log]].
 - **Keep-warm trap:** `_rvc_keepwarm_loop` is default-off unless `RVC_KEEPWARM=1`.
   `lifespan()` currently prints “RVC keep-warm loop started” unconditionally even when the
   coroutine returns immediately; the local `.env` did not set `RVC_KEEPWARM` during this
@@ -383,6 +408,12 @@ Next-session acceptance order: start the local server; explicitly warm `/health`
 physical mic; run **Test converted voice**; select `BlackHole 2ch`; run **Start conversion**;
 then set WhatsApp Desktop's microphone to BlackHole and keep its speaker on the built-in
 speakers/headphones. Record UI state, readiness time, first converted audio, and any drops.
+**Blocked as of 2026-07-28**: run the two [[active-backlog]] P0s first (revert the `ready`-
+delaying send lock, then add playout pacing). Until pacing exists, **Test converted voice**
+delivers audio in bursts with multi-second gaps regardless of device setup, so a failed
+acceptance run would say nothing about BlackHole/VB-CABLE. This is also a Windows/VB-CABLE
+context now, not just macOS/BlackHole — the 2026-07-27/28 sessions ran on Windows with
+`CABLE Input`/`CABLE Output`.
 
 ## TensorRT/ONNX migration (merged to main 2026-07-07, merge commit `9c1093a`)
 `trt-migration` branch is merged into `main`. Rollout status as of 2026-07-16: Phase A

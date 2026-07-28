@@ -32,3 +32,6 @@ graphify-out/
 
 # Kilo Code VSCode extension local agent config — IDE tooling, not project code
 .kilo/
+
+# Playwright MCP browser session artifacts (snapshots/console logs)
+.playwright-mcp/
