@@ -624,9 +624,15 @@ export class DesktopSetupPage {
       if (!receivedAudio) byId('voice-test-result').textContent = 'No converted audio returned. Check the relay and voice level.';
       if (receivedAudio) {
         await new Promise((resolve) => setTimeout(resolve, 150));
+        // Cap on waiting for the playout buffer to drain after first audio.
+        // A slow/cold backend (confirmed live 2026-07-29: engine=onnx-cuda,
+        // not trt) can still be delivering the burst well past a short cap,
+        // and client.stop() below tears the socket down unconditionally —
+        // cutting playback off mid-stream ("split second, then gone"). Give
+        // it real headroom instead of assuming a warm-path drain time.
         await Promise.race([
           playoutDrained,
-          new Promise((resolve) => setTimeout(resolve, 1200)),
+          new Promise((resolve) => setTimeout(resolve, 15_000)),
         ]);
       }
     } catch (error) {
