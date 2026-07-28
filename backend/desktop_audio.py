@@ -23,6 +23,18 @@ INPUT_FRAME_BYTES = 640
 OUTPUT_FRAME_BYTES = 960
 READINESS_TIMEOUT_SECONDS = 150.0
 
+# 48kHz mono 16-bit: how many bytes represent one second of playout audio.
+OUTPUT_BYTES_PER_SECOND = OUTPUT_SAMPLE_RATE * 2
+# Standing cushion held before the first frame is written, absorbing the
+# converter's bursty arrival timing. Mirrors backend/pipeline.py's
+# _PLAYOUT_BUFFER_TARGET_BYTES (0.25s) for the LiveKit path.
+PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.25)
+# Hard cap on held backlog; oldest audio is dropped beyond this so a persistent
+# stall grows delay only up to a bound.
+PLAYOUT_MAX_BYTES = int(OUTPUT_BYTES_PER_SECOND * 5)
+# Bytes written per pacing step (100ms) once the cushion has filled.
+PLAYOUT_DRAIN_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.1)
+
 Profile = Literal["male", "female"]
 
 
@@ -117,15 +129,24 @@ class DesktopAudioBridge:
         converter: VoiceConverter,
         input_queue_frames: int = 25,
         readiness_timeout: float = READINESS_TIMEOUT_SECONDS,
+        playout_cushion_bytes: int = PLAYOUT_CUSHION_BYTES,
+        playout_max_bytes: int = PLAYOUT_MAX_BYTES,
     ) -> None:
         if input_queue_frames < 1:
             raise ValueError("input_queue_frames must be positive")
         if readiness_timeout <= 0:
             raise ValueError("readiness_timeout must be positive")
+        if playout_cushion_bytes < 0:
+            raise ValueError("playout_cushion_bytes must not be negative")
+        if playout_max_bytes < playout_cushion_bytes:
+            raise ValueError("playout_max_bytes must be >= playout_cushion_bytes")
         self.converter = converter
         self.input_queue_frames = input_queue_frames
         self.readiness_timeout = readiness_timeout
+        self.playout_cushion_bytes = playout_cushion_bytes
+        self.playout_max_bytes = playout_max_bytes
         self.input_drop_count = 0
+        self.playout_drop_count = 0
 
     async def run(self, websocket: WebSocket) -> None:
         """Relay fixed-size PCM frames until either side ends the session."""
@@ -183,6 +204,9 @@ class DesktopAudioBridge:
         failed = False
         stats_tasks: set[asyncio.Task[None]] = set()
         send_lock = asyncio.Lock()
+        playout_buffer = bytearray()
+        playout_lock = asyncio.Lock()
+        playout_ready = asyncio.Event()
 
         def sanitize_stats(data: object) -> dict[str, bool | float | int | str]:
             if not isinstance(data, dict):
@@ -270,15 +294,97 @@ class DesktopAudioBridge:
             finally:
                 input_closed.set()
 
+        async def write_frames(payload: bytes) -> None:
+            """Write whole playout frames to the client, serialized."""
+            for frame in split_output_frames(output_buffer, payload):
+                async with send_lock:
+                    await websocket.send_bytes(frame)
+
+        async def run_playout_consumer() -> None:
+            """Drain the playout buffer at a strictly real-time pace.
+
+            The converter's arrival timing is bursty: measured live on
+            2026-07-27, Modal delivered 0.22s of audio, stalled ~8s, then
+            dumped 6.2s inside one second. Forwarded unpaced that is audible
+            as a fraction of a second of speech then silence. Backlog must
+            surface as growing (bounded) delay, never as speed.
+
+            next_publish_time is self-correcting: if a chunk becomes available
+            after its deadline already passed (the buffer genuinely ran dry),
+            publish immediately and re-anchor from now rather than sleeping to
+            "catch up" -- a stale schedule would push the next audio out faster
+            than real time, which is the bug this pacer exists to prevent.
+            Mirrors backend/pipeline.py::_run_playout_consumer.
+            """
+            filled = False
+            next_publish_time: Optional[float] = None
+            try:
+                while True:
+                    # Checked per-iteration rather than once up front: the
+                    # session can end before the readiness gate ever opens
+                    # playout, and a single wait() here would strand the
+                    # consumer (and the audio it holds) forever.
+                    await playout_enabled.wait()
+                    async with playout_lock:
+                        if not filled:
+                            if len(playout_buffer) < self.playout_cushion_bytes:
+                                chunk = b""
+                            else:
+                                chunk = bytes(playout_buffer[: self.playout_cushion_bytes])
+                                del playout_buffer[: self.playout_cushion_bytes]
+                                filled = True
+                        else:
+                            chunk = bytes(playout_buffer[:PLAYOUT_DRAIN_BYTES])
+                            del playout_buffer[:PLAYOUT_DRAIN_BYTES]
+                        # Only clear once the buffer is genuinely drained.
+                        # Clearing unconditionally swallows the producer's
+                        # set() from the append that just happened, and the
+                        # consumer then waits forever on a signal it destroyed
+                        # -- which starves playout completely while the cushion
+                        # is still filling.
+                        if not playout_buffer:
+                            playout_ready.clear()
+                    if chunk:
+                        now = time.monotonic()
+                        if next_publish_time is None or now >= next_publish_time:
+                            next_publish_time = now
+                        else:
+                            try:
+                                await asyncio.sleep(next_publish_time - now)
+                            except asyncio.CancelledError:
+                                # `chunk` is already popped -- it exists only in
+                                # this local now. Honoring the cancellation
+                                # without writing it would drop it entirely:
+                                # not in the buffer for teardown to flush, not
+                                # sent either. Write it before re-raising.
+                                await write_frames(chunk)
+                                raise
+                        await write_frames(chunk)
+                        next_publish_time += len(chunk) / OUTPUT_BYTES_PER_SECOND
+                    else:
+                        await playout_ready.wait()
+            except asyncio.CancelledError:
+                pass
+
         async def convert_output() -> None:
             nonlocal failed
+            consumer_task: asyncio.Task[None] | None = None
+            stream_ended_naturally = False
             try:
+                # The consumer must not start writing before the readiness gate
+                # opens playout, but the converter stream itself has to start
+                # now -- wait_stream_ready() depends on it having begun.
+                consumer_task = asyncio.create_task(run_playout_consumer())
                 async with contextlib.aclosing(self.converter.convert_stream(input_frames())) as stream:
                     async for chunk in stream:
-                        for frame in split_output_frames(output_buffer, chunk):
-                            await playout_enabled.wait()
-                            async with send_lock:
-                                await websocket.send_bytes(frame)
+                        async with playout_lock:
+                            playout_buffer.extend(chunk)
+                            overflow = len(playout_buffer) - self.playout_max_bytes
+                            if overflow > 0:
+                                del playout_buffer[:overflow]
+                                self.playout_drop_count += overflow
+                            playout_ready.set()
+                stream_ended_naturally = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -292,6 +398,24 @@ class DesktopAudioBridge:
                     )
                     await websocket.send_bytes(silence_frame())
                     await websocket.close(code=1011, reason="Conversion failed")
+            finally:
+                if consumer_task is not None:
+                    consumer_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await consumer_task
+                # The consumer paces to real time and can be mid-sleep holding
+                # backlog when the converter stream ends. Flush the remainder
+                # immediately/unpaced rather than truncating the tail -- a brief
+                # blip on the last fragment beats losing it outright. Only on a
+                # natural end: if we were cancelled or the conversion failed,
+                # the session is going away and nobody is listening.
+                if stream_ended_naturally and not failed:
+                    async with playout_lock:
+                        leftover = bytes(playout_buffer)
+                        playout_buffer.clear()
+                    if leftover:
+                        with contextlib.suppress(Exception):
+                            await write_frames(leftover)
 
         wait_stream_ready = getattr(self.converter, "wait_stream_ready", None)
         needs_stream_readiness = callable(wait_stream_ready)

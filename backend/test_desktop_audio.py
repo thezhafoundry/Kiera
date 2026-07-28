@@ -1,9 +1,11 @@
 """Tests for the desktop audio transport contracts and relay."""
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 
 import pytest
+from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
 
 from backend.desktop_audio import (
@@ -179,6 +181,51 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.now
+
+
+class TimestampingWebSocket(FakeWebSocket):
+    """Records the wall-clock time of every binary send, to assert pacing."""
+
+    def __init__(self, incoming) -> None:
+        super().__init__(incoming)
+        self.binary_send_times: list[float] = []
+
+    async def send_bytes(self, message: bytes) -> None:
+        self.binary_send_times.append(asyncio.get_running_loop().time())
+        await super().send_bytes(message)
+
+
+class BurstyConverter(VoiceConverter):
+    """Reproduces the measured live Modal delivery pattern: a small burst,
+    a long stall, then a flood of catch-up audio arriving far faster than
+    real time. See the 2026-07-27 desktop investigation.
+    """
+
+    def __init__(self, *, burst_bytes: int, stall_seconds: float, flood_bytes: int) -> None:
+        self.burst_bytes = burst_bytes
+        self.stall_seconds = stall_seconds
+        self.flood_bytes = flood_bytes
+        self.finished = asyncio.Event()
+
+    async def convert_stream(self, in_audio: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        consumer = asyncio.create_task(self._drain(in_audio))
+        try:
+            yield bytes(self.burst_bytes)
+            await asyncio.sleep(self.stall_seconds)
+            yield bytes(self.flood_bytes)
+            self.finished.set()
+            # Stay alive so teardown is driven by the caller, like the real
+            # long-lived converter session.
+            await asyncio.sleep(3600)
+        finally:
+            consumer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer
+
+    @staticmethod
+    async def _drain(in_audio: AsyncIterator[bytes]) -> None:
+        async for _frame in in_audio:
+            pass
 
 
 def test_input_frame_contract():
@@ -489,3 +536,119 @@ def test_desktop_audio_websocket_consumes_subprotocol_ticket(monkeypatch):
             assert websocket.receive_json() == {"type": "ready"}
 
     assert captured["converter"]["pitch_shift"] == main.RVC_MALE_PITCH_SHIFT
+
+
+@pytest.mark.asyncio
+async def test_bursty_converter_output_is_paced_to_real_time():
+    """A stalled-then-flooding converter must not be forwarded as a flood.
+
+    Measured live 2026-07-27: Modal delivered 0.22s of audio, stalled ~8s, then
+    dumped 6.2s of audio inside a single second. Forwarded unpaced, that is
+    audible as a fraction of a second of speech followed by silence. Backlog
+    must surface as delay, never as speed.
+    """
+    one_second = 96000  # 48kHz * 2 bytes
+    websocket = TimestampingWebSocket(
+        configured([bytes(640)] * 4 + [WebSocketDisconnect()])
+    )
+    converter = BurstyConverter(
+        burst_bytes=one_second // 4,
+        stall_seconds=0.2,
+        flood_bytes=one_second,
+    )
+    bridge = DesktopAudioBridge(converter, playout_cushion_bytes=one_second // 10)
+
+    task = asyncio.create_task(bridge.run(websocket))
+    await asyncio.wait_for(converter.finished.wait(), timeout=5)
+    await asyncio.sleep(0.35)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    sent = len(websocket.binary_messages) * 960
+    assert sent > 0, "expected some audio to be delivered"
+    # 0.35s after the flood was produced, at most ~0.35s of it (plus the
+    # cushion) may have been written. Unpaced, the whole 1s flood goes at once.
+    assert sent < one_second, (
+        f"converted audio was forwarded faster than real time: {sent} bytes "
+        f"({sent / one_second:.2f}s of audio) written in ~0.35s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_paced_playout_flushes_remaining_audio_on_teardown():
+    """Real-time pacing means the bridge routinely holds genuine backlog.
+
+    Tearing down must flush it rather than silently truncating the tail --
+    the exact bug the LiveKit path hit when its pacer first landed
+    (see .agents/context/subsystem-notes.md, 2026-07-21).
+    """
+    one_second = 96000
+    websocket = FakeWebSocket(configured([bytes(640), WebSocketDisconnect()]))
+
+    class ShortBurstConverter(VoiceConverter):
+        async def convert_stream(self, in_audio: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+            async for _frame in in_audio:
+                break
+            yield bytes(one_second // 2)
+
+    bridge = DesktopAudioBridge(
+        ShortBurstConverter(), playout_cushion_bytes=one_second // 10
+    )
+    await asyncio.wait_for(bridge.run(websocket), timeout=5)
+
+    delivered = len(websocket.binary_messages) * 960
+    assert delivered == one_second // 2, (
+        f"expected all {one_second // 2} bytes flushed on teardown, got {delivered}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_playout_starts_when_chunks_are_smaller_than_the_cushion():
+    """Chunks smaller than the cushion must still accumulate and play.
+
+    Regression: the consumer cleared `playout_ready` on every wake, including
+    when it took no chunk, swallowing the producer's set() from the append that
+    had just woken it. Playout then starved forever -- 23.5s of audio in, zero
+    bytes out (measured locally 2026-07-27 before this fix).
+    """
+    one_second = 96000
+    cushion = one_second // 4
+    small_chunk = cushion // 5  # five chunks needed to reach the cushion
+    websocket = FakeWebSocket(configured([bytes(640), WebSocketDisconnect()]))
+
+    done = asyncio.Event()
+
+    class SmallChunkConverter(VoiceConverter):
+        async def convert_stream(self, in_audio: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+            drain = asyncio.create_task(_consume(in_audio))
+            try:
+                for _ in range(10):
+                    yield bytes(small_chunk)
+                    await asyncio.sleep(0.01)
+                done.set()
+                await asyncio.sleep(3600)  # long-lived, like the real session
+            finally:
+                drain.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await drain
+
+    async def _consume(in_audio: AsyncIterator[bytes]) -> None:
+        async for _frame in in_audio:
+            pass
+
+    bridge = DesktopAudioBridge(
+        SmallChunkConverter(), playout_cushion_bytes=cushion
+    )
+    task = asyncio.create_task(bridge.run(websocket))
+    await asyncio.wait_for(done.wait(), timeout=10)
+    # Give the paced consumer time to drain everything it holds.
+    await asyncio.sleep(1.2)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    delivered = len(websocket.binary_messages) * 960
+    assert delivered == small_chunk * 10, (
+        f"expected all {small_chunk * 10} bytes delivered, got {delivered}"
+    )
