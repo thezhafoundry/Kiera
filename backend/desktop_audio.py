@@ -336,13 +336,21 @@ class DesktopAudioBridge:
                         else:
                             chunk = bytes(playout_buffer[:PLAYOUT_DRAIN_BYTES])
                             del playout_buffer[:PLAYOUT_DRAIN_BYTES]
-                        # Only clear once the buffer is genuinely drained.
-                        # Clearing unconditionally swallows the producer's
-                        # set() from the append that just happened, and the
-                        # consumer then waits forever on a signal it destroyed
-                        # -- which starves playout completely while the cushion
-                        # is still filling.
-                        if not playout_buffer:
+                        # Clear whenever this iteration took no chunk -- that is
+                        # exactly when we're about to await playout_ready below,
+                        # so the event must not still be set from a stale
+                        # append or we spin forever without truly waiting
+                        # (reproduced 2026-07-29: buffer sits at a few hundred
+                        # ms below the cushion, never empty, so a "clear only
+                        # when empty" guard never fires and playout_ready.wait()
+                        # returns instantly every iteration -- 100% CPU, zero
+                        # audio ever sent). Clearing here is still safe against
+                        # the original bug this guarded (swallowing a producer's
+                        # set() from the same append that just filled `chunk`):
+                        # when a chunk WAS taken we skip this branch entirely,
+                        # so a fresh set() from a concurrent append is never
+                        # destroyed by it.
+                        if not chunk:
                             playout_ready.clear()
                     if chunk:
                         now = time.monotonic()
