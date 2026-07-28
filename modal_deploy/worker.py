@@ -838,7 +838,7 @@ def _web_function_options(edge: str) -> dict:
         "volumes": {"/root/rvc-models": volume},
         "scaledown_window": 120,
         "region": location["region"],
-        "max_containers": 2,
+        "max_containers": 1,
         "secrets": [modal.Secret.from_name("rvc-api-key")],
         "env": {
             "USE_TRT": "1",
