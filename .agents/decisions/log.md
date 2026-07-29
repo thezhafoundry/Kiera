@@ -13,6 +13,7 @@ tracks pipeline/architecture migrations instead:
 | — | `2a20b3a` | Removed an `age_before` check that was silently dropping/silencing lead audio; added a 4s pre-buffer timeout fallback. |
 | 2026-07-02 | `6661db7` | Rewrote LATENCY.md with live-measured numbers and added the 4s timeout regression note. |
 | 2026-07-02 | `fe678d6` | Replaced the one-shot pre-buffer with the current adaptive, per-session standing playout buffer described in LATENCY.md §5 / [[subsystem-notes]]. |
+| 2026-07-17 | `634c4fb` (reverted `e82bb29`) | Tried an explicit real-time pacer (`next_publish_time`) in `_run_playout_consumer` to fix backlog-burst breaking; implemented, tested, and task-reviewer-approved, but reverted by the user same-day without a stated reason. See narrative entry below. |
 | 2026-07-02 | `f3c16ed` (Tasks 1-5) | Streaming rebuild: replaced the VAD-chunked HTTP-per-request pipeline (rows above) with a persistent-WebSocket duplex streaming design, a never-raw/fail-closed audio policy, and a fail-closed pre-dial/pre-bridge warm gate — see the dedicated entry below. |
 
 Note the `eb016f3`/`da46c48` "Reverted: Buffer Changed for voice issue" commits bracketing
@@ -478,3 +479,280 @@ not a Render-origin or PSTN mouth-to-ear result. The duration loss, Render-origi
 A/B, non-fatal `F0Predictor` startup-warm-up import failure, and a warm staff PSTN test are
 hard gates before lowering block/buffer sizes. The one-second adaptive-pitch interpolation
 is implemented/tested in v11 but still needs that live listen test.
+
+## 2026-07-17 — Real-time playout pacer implemented, reviewed, deployed, then reverted same-day
+
+**Diagnosed why "voice was clear at first, then breaking" from a real PSTN call's Twilio
+recording and `[Worker][LatencySummary]` telemetry.** `playout_buffer_bytes` was clean for
+the first ~15-20 blocks then oscillated between ~0 and 500-740ms for the rest of the call,
+matching the 2026-07-14 "Open finding" in [[subsystem-notes]] almost exactly — the 2026-07-15
+bounded-100ms-drain fix for that finding had not resolved it. Root cause: `_run_playout_consumer`
+had no wall-clock pacing of its own, only LiveKit's `capture_frame` backpressure (~200ms queue
+headroom), which still let a backlogged chunk through faster than real time whenever
+`converter_wait_ms`/`network_rtt_ms` (consistently 900-1900ms against a 320ms block budget)
+put the pipeline behind.
+
+**Implemented a self-correcting `next_publish_time` pacer** in `_run_playout_consumer`
+(plan: `docs/superpowers/plans/2026-07-16-playout-consumer-real-time-pacing.md`) via
+subagent-driven-development. Task-reviewer approved the code (all Global Constraints held,
+correct self-correction on genuine stalls); the one Important finding was about the
+implementer's report overstating verification confidence, not a code defect, and was
+corrected directly. Deployed to Render (`634c4fb`..`a265262` pushed to `origin/main`).
+
+**Reverted same session, same day, before any live listen test happened.** The user asked to
+revert `634c4fb` (code) and, separately, `14f9bca` (the backlog/subsystem-notes doc claims
+this fix generated) — both as explicit, deliberate revert commits (`e82bb29`, `c5eea8c`),
+pushed to `origin/main`. **The user did not state a reason** despite being asked directly;
+`main` is now back to exactly its pre-2026-07-17 state (the 2026-07-15 bounded-100ms fix is
+again the last real attempt, `active-backlog.md` again says "targeted live listen test
+pending"). Do not re-propose this identical pacer design without first asking the user why it
+was reverted — the plan document and this entry exist so the reasoning/code aren't lost, but
+the revert itself is unexplained and should not be treated as "just needs to be redone."
+
+## 2026-07-19 — Removed the KEIRA_CONTROL_TOKEN operator-auth gate (frontend + backend)
+
+**Removed the bearer-token control-plane auth added 2026-07-15 (`e501104`, see entry above)
+at explicit user request ("remove the kiera control token thing" → confirmed scope as "remove
+everywhere both front and back").** Deleted: `frontend/app.js`'s `getControlToken()` prompt,
+the `Authorization: Bearer` header on `apiFetch`, and the `keira-auth.<token>` WS subprotocol;
+backend `require_control_token` dependency and its use on every operator route
+(`/api/token`, `/api/start-bot`, `/api/stop-bot`, `/api/call/*`, `/api/setup`, `/api/warmup`,
+`/api/deploy`), the `/api/call/ws` handshake check, `CONTROL_PLANE_TOKEN`, and the now-dead
+`verify_bearer_token` helper + its unit test in `backend/test_control_plane.py`. Also dropped
+`KEIRA_CONTROL_TOKEN` from `render.yaml`, `README.md` §3, and CLAUDE.md's control-plane rules
+and env-var list. Twilio signature validation (`require_twilio_signature`) and rate limiting
+are untouched — this only removed the operator/dashboard bearer-token gate.
+
+**Net effect: every operator HTTP route and the call-events WebSocket are now unauthenticated.**
+On the public Render deployment this means anyone who can reach the URL can start/stop bots,
+place outbound calls, or trigger `/api/deploy` — this is a deliberate regression of the P0 fix
+from `e501104`, not an oversight. If control-plane auth is wanted again later, `e501104`'s diff
+(and this repo's git history around 2026-07-15) has the previous implementation to reference
+rather than rebuilding from scratch.
+
+**Correction, same day:** this was made and left as a local-only, uncommitted change per
+explicit instruction ("do not push the code into main"). The user then committed it directly
+in the IDE anyway (`1f1fb5d`, "Removed Control Token from backend and frnotend", 16:22 IST)
+and pushed to `origin/main` — outside this session's visibility; only surfaced during
+`second-brain-close`. Per `render.yaml`'s `autoDeploy: commit`, that push has already
+redeployed the backend, so **the control plane is unauthenticated in production right now**,
+not just locally. See [[active-backlog]]'s updated row. Consistent with the established
+[[feedback_concurrent-repo-edits]] pattern — re-check git state after any gap rather than
+trusting the last-known instruction.
+
+## 2026-07-19 — Two call-diagnosis findings: GPU preemption outage, then a SOLA micro-glitch
+
+**Call 1, 16:29:59 IST (`CA7b845842d9d8eda788c8f2143f32feb2`, 65s):** agent-voice audio ran
+normally for the first 33s then went completely silent for the remaining ~31s of a still-
+connected call. Cross-referencing the Twilio dual-channel recording (envelope analysis),
+Render's `[RVCStreamingConverter]` logs (endless "reconnect buffer full — dropped oldest
+input frame" spam plus one logged `WS connection lost/failed: server rejected WebSocket
+connection: HTTP 500`), and Modal's own worker logs for the window pinned the root cause to
+the second: **Modal preempted the GPU_L4 container serving the call at 16:30:32 IST** (`
+Container terminated due to preemption`) — exactly the moment the audio dropped — and the
+`ap-southeast` region was capacity-constrained enough that no replacement container came up
+for the rest of the call, or for 13 minutes afterward. This is a Modal platform-level/regional
+capacity issue, not a pipeline bug — the fail-closed silence-on-outage design (see
+[[subsystem-notes]]) behaved correctly. Directly corroborates the open "A/B Modal routing"
+backlog row (`ap-southeast` vs `ap-south`/broader `ap`) as an availability risk, not just a
+latency one. No code changed for this finding.
+
+**Call 2, 21:20:40 IST (`CA097fa9be0e716fb489b373bb89e474a6`, 62s), after `DEBUG_SAVE_AUDIO=1`
+was turned back on for this investigation (see [[active-backlog]]):** user reported one word
+("stating," from a fixed diagnostic script) sounded unclear while the rest of the call was
+fine. With the Modal debug `in16k`/`out48k` WAV pair now available, a direct pre- vs. post-
+conversion comparison (5ms RMS envelope) around the phrase's timing (~19.2–21.5s) found the
+raw input continuous and unbroken there, but the converted output had a genuine **~40–60ms
+silence gap spliced in mid-phrase at t≈20.66–20.72s** that doesn't exist in the source. Modal
+and Render logs for this call's window are clean — no preemption, reconnects, or errors — so
+this is a different failure class from Call 1: a small, intermittent artifact consistent with
+a SOLA-splice/block-boundary handoff (320ms block, 80ms SOLA crossfade) rather than a
+data-loss or capacity event. Leading hypothesis only, not yet root-caused in
+`modal_deploy/streaming.py`; flagged for the user, no code changed.
+
+## 2026-07-23 — Merged origin/main; re-dropped control-token auth from the desktop feature
+
+**Local `main` (20 commits, the desktop voice-changer feature) had diverged from
+`origin/main` (12 commits) with real conflicts, not just textual ones.** The desktop
+feature was built on a base that predated the 2026-07-19 control-token removal (see above)
+and assumed `KEIRA_CONTROL_TOKEN` auth still existed — its new `/api/desktop/session`
+endpoint and `require_desktop_session_auth`/`_local_no_auth_allowed` machinery depended on
+`require_control_token`. Merging naively (accepting `HEAD`'s conflict-marked side, which is
+what a plain `git merge` auto-resolves toward for the unmarked hunks too) would have
+silently reintroduced auth on 10+ operator routes, `/api/call/ws`, and the desktop session
+endpoint — reversing a change already confirmed live in production and, per that entry,
+made at explicit user request. Asked the user directly rather than guessing; confirmed:
+**drop auth everywhere, matching `origin/main`**, including on the new desktop endpoints.
+
+**What that took, beyond resolving the 3 marked conflict hunks in `backend/main.py`:** git's
+3-way merge silently (no conflict markers) resolved several *unmarked* hunks toward
+`origin/main`'s side purely because HEAD hadn't touched them, which combined with a naive
+"take HEAD" resolution of the marked hunks would have left the merged file internally
+inconsistent — e.g. `Depends`/`Header` imports present but every other route decorator
+missing `dependencies=[Depends(require_control_token)]`, `verify_bearer_token` called in a
+websocket handler but not imported, `CONTROL_PLANE_TOKEN` referenced but never defined. Also
+silently dropped by the same mechanism: `verify_bearer_token` itself (`backend/security.py`),
+its unit test (`backend/test_control_plane.py`), the `KEIRA_CONTROL_TOKEN` `render.yaml`
+entry, and all of `frontend/app.js`'s `getControlToken()`/`Authorization` header/WS
+subprotocol logic. Diffing each touched file against both the pre-merge `HEAD` and
+`origin/main` (not just eyeballing conflict markers) is what surfaced these — a `git merge`
+with zero conflict markers reported is not proof nothing was lost from either side.
+
+**Resolution:** removed the control-token/local-no-auth scaffolding from `backend/main.py`
+entirely (all 11 route decorators, the `/api/call/ws` handshake check, `require_control_token`,
+`require_desktop_session_auth`, `_local_no_auth_allowed`, the `KEIRA_LOCAL_*` env vars, the
+now-unused `Depends`/`Header`/`urlsplit` imports); restored `frontend/app.js` to
+`origin/main`'s tokenless version; rewrote `backend/test_desktop_audio.py`'s three
+auth-dependent tests down to one (`/api/desktop/session` now issues a ticket with no auth
+header at all) and deleted the two testing removed functions
+(`_local_no_auth_allowed`/`require_control_token`); updated `README.md`'s desktop-setup
+section, which still described the old "authenticated deployment vs. local no-auth mode"
+split as if both existed. The desktop feature's own ticket-based WS auth
+(`DesktopSessionStore`, single-use `keira-desktop.<ticket>` subprotocol) is unrelated to the
+operator control-token gate and was left untouched — it was never gated by
+`require_control_token` for the actual audio relay, only session issuance was. Ran
+`python -m backend.test_pipeline` and `pytest backend/test_control_plane.py
+backend/test_desktop_audio.py` after, both clean, before committing the merge (`6e284bd`).
+
+**Net effect unchanged from the 2026-07-19 entry: the control plane, including the new
+desktop-session endpoint, remains fully unauthenticated.** If control-plane auth is wanted
+back, this merge commit's parent (`88e1801`) and `e501104` (original P0 add) both have a
+working implementation to reference.
+
+## 2026-07-23 — Desktop relay validated on macOS; cold Modal capacity is the gating failure
+
+**Separated the disabled desktop buttons from actual conversion health instead of treating
+them as one failure.** The page had been opened in the Codex in-app browser, whose test
+surface did not complete the required Web Audio setup or expose the complete CoreAudio device list.
+That kept the page in its fallback state and showed only built-in devices. The correct
+acceptance surface is a current regular Chrome/Edge build with microphone permission.
+For the page's contracts, **Test converted voice does not require a virtual device**; only
+**Start conversion** requires `AudioContext.setSinkId` plus BlackHole/Loopback/CABLE Input.
+
+**Verified BlackHole below the browser boundary.** The installed driver is
+`/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver`; macOS CoreAudio reports `BlackHole 2ch`
+with two input and two output channels at 48kHz. This rejects the hypothesis that the
+dropdown was empty because the driver was absent. Chrome was opened at
+`http://127.0.0.1:8000/desktop/`; the remaining user-run step is to grant microphone
+permission, confirm the device appears, and perform the human mic/WhatsApp acceptance.
+
+**Proved both converter and desktop relay with fresh live audio.** A warm 2.0s synthetic
+direct WebSocket run produced 174,086 bytes / 1,813.4ms, six stats blocks, TensorRT
+inference median/p95 55.64/58.08ms, no drops. A generated 2,208.9ms spoken sentence sent
+through the exact local `/api/desktop/session` → `/api/desktop/audio` path returned 173,760
+bytes in 181 valid 960-byte 48kHz frames (1,810.0ms), ready in 1,856.36ms, six stats
+messages, zero input drops. The ignored local listening artifact is
+`kiera_conversion_test_rerun.wav`. This proves transport, inference, and output framing;
+subjective identity/clarity still requires the user's ear and real microphone.
+
+**The reproducible failure is cold capacity/readiness, not conversion.** Modal first logged
+the stable function waiting about five minutes for an `ap-southeast` L4, then spent ~34s
+loading the model/TRT pipeline. The first direct WebSocket opening handshake timed out and
+active readiness failed after 180s; `/health` returned zero bytes within 45s. A later cold
+desktop session reached its 150s fail-closed limit and returned
+`{"type":"error","code":"converter_unavailable"}`. An explicit `/health` warm-up then took
+about 94s and returned `ready` on an NVIDIA L4; the identical desktop test passed
+immediately afterward. Decision: preserve fail-closed behavior and treat a warm gate as a
+first-class desktop UX/state problem. The next implementation must expose warming/progress
+and make an explicit cost/availability choice among longer bounded wait/retry,
+`RVC_KEEPWARM=1`, or the pending broader-AP routing experiment.
+
+**Two adjacent tooling/logging defects were recorded rather than silently worked around.**
+Running `scripts/rvc_stream_benchmark.py` directly fails to import `backend`; module form
+(`python -m scripts.rvc_stream_benchmark`) works. Also, the server prints that the keep-warm
+loop started even when `RVC_KEEPWARM` is default-off and the task exits immediately.
+Post-merge `scripts/run_local.py` still sets local-auth launcher markers that the backend no
+longer reads because operator auth was removed globally. These are backlog cleanups, not
+reasons to change the verified audio pipeline.
+
+## 2026-07-28 — Desktop "no converted audio": timeout fix landed, two speculative fixes shipped in error, pacing gap identified
+
+Investigated the desktop `/desktop/` flow returning "No converted audio returned" and, later,
+audio audible only for "a fraction of a second". Three distinct problems surfaced; only one
+was correctly fixed. Recording all three because two live commits are still in production.
+
+**The load-bearing fact everyone should read first: `WARNING:asyncio:socket.send() raised
+exception.` does NOT mean a send raced or threw into our code.** It comes from CPython's
+`asyncio/selector_events.py:1068` (and `proactor_events.py:353`):
+
+```python
+if self._conn_lost:
+    if self._conn_lost >= constants.LOG_THRESHOLD_FOR_CONNLOST_WRITES:  # 5
+        logger.warning('socket.send() raised exception.')
+    self._conn_lost += 1
+    return   # silently discards; never raises
+```
+
+It fires when something writes to a transport whose connection is *already lost*, it
+**silently discards the data, and never raises** — so no `try/except` anywhere in
+`desktop_audio.py` can catch or fix it. Seeing N of these means N frames of converted audio
+were produced *after* the peer went away, i.e. the converter was working and the client had
+already hung up. Do not "fix" this warning by adding exception handling; find out why the
+client disconnected.
+
+**Fixed correctly (live, verified): the voice test's client-side deadline was shorter than the
+pipeline's real latency.** `runVoiceTest()` allowed 3500ms for the first converted frame,
+timed from click. Measured live against the deployed relay on a warm GPU while streaming audio
+from the instant of readiness: `ready` at **1943ms**, first converted frame at **3303ms** — a
+197ms margin. Real use is worse (the user must start speaking after clicking). On a cold
+container `ready` alone took **24.3s**. The test therefore called `client.stop()` mid-conversion
+on essentially every run, which is what generated the asyncio warnings above. Fixed in
+`8537093`/`e2566cc`: wait for `ready` first (60s cap), then start a separate 10s conversion
+budget. Two tests in `frontend/desktop/desktop.test.mjs` pin the measured timings; the
+slow-handshake one was confirmed to fail at 3511ms against the old code.
+
+**Shipped in error, still live, one actively harmful:**
+- `85bda43` added an `asyncio.Lock` serializing every `websocket.send_*` in
+  `DesktopAudioBridge.run`, on the incorrect theory that concurrent sends were racing.
+  **This introduced head-of-line blocking.** `RVCStreamingConverter` fires `on_stats`
+  continuously and `relay_stats` spawns an unbounded `asyncio.create_task` per stats event;
+  because `send_json({"type":"ready"})` was moved *inside* that lock, `ready` now queues behind
+  every pending stats send. Reproduced locally: hundreds of `stats` emitted before `ready`.
+  This plausibly explains `ready` taking 6.5s locally and 24s in one production run.
+  **Recommend reverting.**
+- `d967620` widened `send_stats`' `except WebSocketDisconnect` to also catch `RuntimeError`.
+  Inert — the exception it targets is never raised (see the asyncio semantics above). Harmless
+  but pointless.
+
+**Identified, NOT fixed — the real remaining cause of "a fraction of a second":
+`backend/desktop_audio.py` has no playout pacing at all.** `convert_output()` forwards every
+frame the instant it arrives, so Modal's bursty delivery reaches the browser unmodified.
+Measured live over a 30s continuous-input session: second 4 delivered 0.22s of audio, seconds
+5-11 delivered **nothing**, then seconds 13-14 dumped **6.2s of audio inside one second**.
+Totals were conservative (27.5s in, 24.96s out) — nothing is lost, it is purely a delivery-timing
+problem. `backend/pipeline.py` solved exactly this for the LiveKit path (0.25s cushion +
+self-correcting `next_publish_time` pacer, see [[subsystem-notes]] 2026-07-21); the desktop
+bridge never got the equivalent. That asymmetry is why the PSTN path sounds fine and the
+desktop path stutters.
+
+An attempt to port the pacer was **committed as `ea78c50`, pushed, and auto-deployed by the
+user during the session-close ritual, before any end-to-end verification.** The committed
+version does contain fixes for both starvation bugs below, and passes 24/24 unit tests — but
+two consecutive 30-35s local runs against a warm GPU afterwards produced **no `ready` message
+and zero audio**, where the pre-pacer code had reliably reached `ready` in 1.9-6.5s. That is
+unresolved: it could be the pacer, the `85bda43` ready-ordering bug, or Modal cold-start
+flapping (the same session saw a 150s warmup). See [[active-backlog]]. The original
+pre-fix version was outright broken — It starved
+playout completely (23.5s of audio in, **zero bytes out** against a local server) via two bugs:
+(1) the consumer called `playout_ready.clear()` on every wake including when it took no chunk,
+swallowing the producer's `set()` from the append that had just woken it; (2) a single
+`await playout_enabled.wait()` before the loop stranded the consumer, and its audio, whenever
+the session ended before the readiness gate opened. Fix the `ready`-ordering bug first —
+otherwise every timing measurement taken while diagnosing pacing is distorted by it.
+
+**Method note for future sessions:** the first two fixes were written by inferring a mechanism
+from a log message's wording rather than reading the source that emits it. Reading
+`selector_events.py` took two minutes and immediately invalidated both. Read the emitting
+source before patching an unfamiliar runtime warning.
+
+**Fixed (uncommitted as of 2026-07-29): `RVCStreamingConverter`'s WS `connect_timeout`
+default (10s) was silently below Modal's real `/ws` handshake latency, producing a
+"resolved" call with zero converted audio.** Modal's `/health` endpoint answering fast
+(~1s on a warm container) does not mean the `/ws` handshake is equally fast — measured
+live against a warm container, the handshake alone took 18.4s. Every connect attempt timed
+out at the old 10s default, so `_connection_loop` reconnected forever, every input frame
+landed in the 500ms reconnect buffer and was dropped there, and the session reported ready
+while producing no converted audio at all — a fail-closed policy failing in a way that
+looked like silence, not an error. Raised the default to 45s
+(`backend/converters/rvc_stream.py`) as a ceiling, not an added delay, since a fast
+handshake still returns immediately. Not yet committed — see `git diff` on that file.

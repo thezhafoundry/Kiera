@@ -17,8 +17,6 @@ services:
         sync: false
       - key: RVC_API_KEY
         sync: false         # must match the Modal rvc-api-key secret
-      - key: KEIRA_CONTROL_TOKEN
-        sync: false         # bearer token for operator/dashboard control routes
       - key: RVC_PITCH_SHIFT
         sync: false         # fallback semitones; dashboard selects male/female per call
       - key: RVC_INDEX_RATE

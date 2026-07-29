@@ -147,6 +147,7 @@ class RVCStreamingConverter(VoiceConverter):
         self._conn_task: Optional[asyncio.Task] = None
         self._is_healthy = False
         self._fatal_error: Optional[RuntimeError] = None
+        self._stream_ready = asyncio.Event()
 
     @property
     def is_healthy(self) -> bool:
@@ -236,6 +237,16 @@ class RVCStreamingConverter(VoiceConverter):
             logger.warning("[RVCStreamingConverter] wait_ready failed: %s", e)
             return False
 
+    async def wait_stream_ready(self, timeout: float) -> bool:
+        """Wait for the handshake on the active long-lived stream."""
+        try:
+            async with asyncio.timeout(timeout):
+                await self._stream_ready.wait()
+            return self.is_healthy
+        except Exception as e:
+            logger.warning("[RVCStreamingConverter] active stream readiness failed: %s", e)
+            return False
+
     # ------------------------------------------------------------------
     # Long-lived duplex conversion
     # ------------------------------------------------------------------
@@ -258,6 +269,7 @@ class RVCStreamingConverter(VoiceConverter):
         self.connection_failure_count = 0
         self._is_healthy = False
         self._fatal_error = None
+        self._stream_ready.clear()
 
         self._pump_task = asyncio.create_task(self._pump_input(in_audio))
         self._conn_task = asyncio.create_task(self._connection_loop())
@@ -274,6 +286,7 @@ class RVCStreamingConverter(VoiceConverter):
     async def _teardown(self):
         self._closed = True
         self._is_healthy = False
+        self._stream_ready.set()
         for task in (self._pump_task, self._conn_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -331,6 +344,7 @@ class RVCStreamingConverter(VoiceConverter):
     async def _signal_fatal(self, message: str) -> None:
         self._is_healthy = False
         self._closed = True
+        self._stream_ready.set()
         self._fatal_error = RuntimeError(
             f"RVC streaming converter fatal error: {message}"
         )
@@ -435,6 +449,8 @@ class RVCStreamingConverter(VoiceConverter):
                         backoff = _BACKOFF_INITIAL_S  # reset after a successful handshake
                         self._apply_ready_metadata(data)
                         self._is_healthy = True
+                        self._stream_ready.set()
+                        logger.warning("[DEBUG] handshake OK, spawning writer_task")
 
                         writer_task = asyncio.create_task(self._writer_loop(ws))
                         try:
@@ -479,7 +495,12 @@ class RVCStreamingConverter(VoiceConverter):
         fails (socket died mid-write), the frame is pushed back onto the
         front of the buffer so the next connection's writer resumes it —
         never silently lost."""
+        logger.warning("[DEBUG] writer_loop started")
+        iterations = 0
         while True:
+            iterations += 1
+            if iterations <= 3:
+                logger.warning("[DEBUG] writer_loop iteration %d, buffer len=%d", iterations, len(self._buffer))
             buffered = None
             async with self._buffer_lock:
                 if self._buffer:
@@ -502,6 +523,7 @@ class RVCStreamingConverter(VoiceConverter):
                 continue
             try:
                 await ws.send(buffered.payload)
+                logger.warning("[DEBUG] sent frame, %d bytes", len(buffered.payload))
                 sent_at = time.monotonic()
                 if self._sent_bytes_count == 0:
                     self._block_started_at = sent_at

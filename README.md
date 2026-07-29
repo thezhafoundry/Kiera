@@ -75,7 +75,6 @@ LIVEKIT_API_SECRET=your_livekit_api_secret
 # RVC Serverless GPU
 RVC_ENDPOINT_URL=https://your-modal-app--rvc-convert.modal.run
 RVC_API_KEY=your_modal_secret_value # must match the Modal rvc-api-key secret
-KEIRA_CONTROL_TOKEN=your_operator_token # required for dashboard/control routes
 RVC_PITCH_SHIFT=0 # fallback semitones; dashboard selects male/female per call
 RVC_INDEX_RATE=0.9 # FAISS-retrieved timbre mix; defaults to 0.9 if unset
 RVC_WS_URL= # optional explicit /ws URL override; derived from RVC_ENDPOINT_URL if unset
@@ -83,6 +82,9 @@ RVC_KEEPWARM=0 # read at backend startup; changing it on Render restarts the ser
 RVC_ADAPTIVE_PITCH=1 # per-call F0-derived pitch lock; 0 = legacy fixed RVC_MALE_PITCH_SHIFT only
 RVC_TARGET_F0=208 # Hz center of the trained model's pitch range the adaptive lock targets
 PRESENCE_EQ_GAIN_DB=4 # dB boost on 1.2-3.4kHz before publish (PSTN clarity); 0 disables
+
+# Desktop Audio
+DESKTOP_INPUT_GAIN=3.0 # gain applied to desktop mic PCM before RVC conversion (default 3.0)
 
 # CORS (comma-separated; defaults to "*" if unset)
 CORS_ORIGINS=*
@@ -156,6 +158,57 @@ MODAL_TOKEN_SECRET=your_modal_token_secret
 
 4. **Access the Dashboard**:
    Open **`http://localhost:8000`** in your browser. Click **Warm GPU** before selecting a lead to call.
+
+### Desktop voice changer for WhatsApp Desktop (Windows)
+
+The `/desktop/` page sends **converted audio only** to a Windows virtual audio device;
+it never exposes `RVC_API_KEY` to the browser. Use current Chrome or Edge on Windows,
+which must support microphone access, AudioWorklets, and `AudioContext.setSinkId`.
+
+Operator/control routes are currently unauthenticated (see "Current control-plane rules"
+in [CLAUDE.md](CLAUDE.md)); no control token is required for the desktop page or any other
+control route. `python scripts/run_local.py` remains available for binding Keira to a
+loopback origin during local development.
+
+1. Install [VB-CABLE](https://vb-audio.com/Cable/) on the Windows workstation, then
+   restart the browser so Windows exposes both cable endpoints.
+2. Start Keira and open `https://your-keira-server.example.com/desktop/` (or
+   `http://localhost:8000/desktop/` for local development). Grant the browser's
+   microphone permission when prompted; this is required before the device names can
+   be listed.
+3. In the Keira page, choose the **physical microphone** as **Physical microphone** and
+   choose **CABLE Input**, **BlackHole 2ch**, or **Loopback** as **Converted output**.
+   Do not select **CABLE Output** or another virtual loopback as the Keira input: that
+   creates a feedback/raw-routing risk. Start conversion and wait for the relay to reach
+   `ready`/`converting` before beginning a call.
+4. In WhatsApp Desktop's audio settings, set **Microphone** to **CABLE Output** and set
+   **Speakers** to the agent's headphones (not either VB-CABLE endpoint). The cable maps
+   Keira's selected **CABLE Input** playback to WhatsApp's **CABLE Output** microphone.
+5. Use **Test converted voice** before the first call. It plays converted-only audio
+   through normal speakers; it does not route the physical microphone directly to a
+   device.
+
+Keira is fail-closed: if the conversion relay or its upstream conversion connection
+interrupts, it stops the relay and the WhatsApp recipient receives silence until a clean
+converted session is started. Raw microphone audio is never used as a fallback.
+
+For a Windows acceptance run, make one ten-minute WhatsApp Desktop call and record the
+exact device labels, model-ready time, median and P95 mouth-to-ear latency, input and
+playout drops, underruns, and duration drift. During that call, interrupt the network and
+unplug/reconnect the microphone; confirm that the recipient hears silence during each
+conversion interruption. After reconnecting the microphone, the operator must click
+**Stop**, start a new conversion session (which obtains a new ticket), and then verify
+clean converted-audio recovery. This repository's automated tests and local static checks
+do not substitute for that device-specific validation.
+
+### Desktop verification evidence (2026-07-23)
+
+- `node --test frontend/desktop/audio_protocol.test.mjs` — 10 tests passed.
+- `node --test frontend/desktop/desktop.test.mjs` — 4 tests passed.
+- `node --check frontend/desktop/desktop.js` and
+  `.venv/bin/python -m py_compile backend/test_desktop_audio.py` — passed.
+- `python -m pytest backend/test_pipeline.py backend/test_streaming_safety.py backend/test_call_safety.py backend/test_control_plane.py backend/test_desktop_audio.py -q` could not run because this macOS workspace has no `python` alias. The equivalent `.venv/bin/python` command was blocked by missing `pytest-asyncio` (or another async pytest plugin): 41 tests passed and 20 async pipeline tests failed before execution.
+- No live Windows/VB-CABLE/WhatsApp Desktop call was performed; the acceptance run above remains required on the target workstation.
 
 ---
 

@@ -972,7 +972,16 @@ async def test_playout_buffer_smooths_bursty_converter_output():
     # RVCStreamingConverter's _MAX_BUFFER_BYTES, applied here to the new
     # playout buffer's class constants instead.
     worker._PLAYOUT_BUFFER_TARGET_BYTES = 3000
-    worker._PLAYOUT_BUFFER_MAX_BYTES = 8000
+    # Comfortably above the 9000 bytes this test ever injects. With real-time
+    # playout pacing (added alongside the next_publish_time pacer), the
+    # consumer no longer drains near-instantly -- it paces drain to actual
+    # playback duration, so peak buffer occupancy during a burst is now
+    # legitimately higher than under the old "drain as fast as the event
+    # loop allows" behavior. This test is about no-data-loss/cushion-wait,
+    # not the drop-oldest-on-overflow path (that's
+    # test_playout_buffer_drops_oldest_over_cap) -- so the cap here just
+    # needs enough headroom that pacing doesn't spuriously trigger it.
+    worker._PLAYOUT_BUFFER_MAX_BYTES = 20000
 
     conversion_task = asyncio.create_task(worker._run_conversion_stream())
     try:
@@ -1018,6 +1027,13 @@ async def test_playout_buffer_drops_oldest_over_cap():
             for i in range(20):
                 yield bytes([i % 256]) * 1000  # 1000 bytes per chunk, 20000 total
                 await asyncio.sleep(0.01)
+            # Keep the duplex stream open after the last chunk, like a real
+            # in-progress call -- otherwise the generator exhausting here
+            # ends _run_conversion_stream naturally, which now flushes and
+            # clears _playout_buffer on the way out (see the teardown fix
+            # in pipeline.py), emptying it before this test's own delayed
+            # inspection below ever runs.
+            await asyncio.sleep(30)
 
     worker = VoiceConversionWorker(
         room_url="ws://unused",
@@ -1058,6 +1074,74 @@ async def test_playout_buffer_drops_oldest_over_cap():
             await conversion_task
 
     print("Standing playout buffer cap/drop-oldest test: SUCCESS")
+
+
+async def test_playout_consumer_paces_drain_to_real_time():
+    print("\n--- Testing playout consumer paces backlog drain to real time (no burst) ---")
+
+    class _OneShotBurstConverter:
+        """Yields one big chunk immediately -- simulates backlog that has
+        already piled up in _playout_buffer (this pipeline's Modal round trip
+        regularly runs 900-1900ms against a 320ms block budget) -- then keeps
+        the duplex stream open, same as a real in-progress call."""
+        async def convert_stream(self, in_audio):
+            yield b"\x00\x01" * 48000  # 96000 bytes = 1.0s of 48kHz 16-bit mono PCM
+            await asyncio.sleep(30)
+
+    worker = VoiceConversionWorker(
+        room_url="ws://unused",
+        token="unused",
+        converter=_OneShotBurstConverter(),
+        suppressor=WebRTCNoiseSuppressor(ns_level=3),
+    )
+    publish_events = []
+
+    async def fake_publish_frames(payload):
+        publish_events.append((time.monotonic(), len(payload)))
+
+    worker._publish_frames = fake_publish_frames
+    # Small cushion so the first publish starts almost immediately -- the
+    # invariant under test is DRAIN pacing, not the initial cushion wait.
+    worker._PLAYOUT_BUFFER_TARGET_BYTES = 4000
+    worker._PLAYOUT_DRAIN_BYTES = 9600  # matches the real 100ms production default
+
+    conversion_task = asyncio.create_task(worker._run_conversion_stream())
+    try:
+        total_bytes = 96000
+        deadline = time.monotonic() + 5.0
+        while sum(n for _, n in publish_events) < total_bytes and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+
+        assert sum(n for _, n in publish_events) == total_bytes, (
+            f"expected all {total_bytes} bytes to eventually reach _publish_frames, "
+            f"got {sum(n for _, n in publish_events)}"
+        )
+
+        first_ts, first_len = publish_events[0]
+        last_ts, _ = publish_events[-1]
+        elapsed_s = last_ts - first_ts
+        # Audio duration published AFTER the first (cushion) call -- that's
+        # what real-time pacing governs; the first call is the cushion
+        # release and isn't paced against anything before it.
+        remaining_audio_s = (total_bytes - first_len) / worker._PLAYOUT_BYTES_PER_SECOND
+
+        print(f"Drained {total_bytes} bytes across {len(publish_events)} publish calls "
+              f"in {elapsed_s:.3f}s wall time (audio duration after cushion: {remaining_audio_s:.3f}s)")
+        assert elapsed_s >= remaining_audio_s - 0.1, (
+            f"backlog drained faster than real time -- got {elapsed_s:.3f}s wall time for "
+            f"{remaining_audio_s:.3f}s of audio (a burst of time-compressed audio, the exact "
+            f"bug this pacer exists to prevent)"
+        )
+        assert elapsed_s <= remaining_audio_s + 1.0, (
+            f"drain took much longer than real time ({elapsed_s:.3f}s for {remaining_audio_s:.3f}s "
+            f"of audio) -- pacing is over-throttling, not just preventing bursts"
+        )
+    finally:
+        conversion_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await conversion_task
+
+    print("Playout consumer real-time pacing test: SUCCESS")
 
 
 async def test_presence_eq():
@@ -1288,6 +1372,7 @@ async def main():
     await test_stop_logs_summary_before_teardown()
     await test_playout_buffer_smooths_bursty_converter_output()
     await test_playout_buffer_drops_oldest_over_cap()
+    await test_playout_consumer_paces_drain_to_real_time()
     await test_presence_eq()
     await test_worker_applies_presence_eq()
     print("\nAll automated verification tests completed successfully!")

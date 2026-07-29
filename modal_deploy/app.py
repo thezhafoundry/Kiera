@@ -4,7 +4,6 @@ import json
 import subprocess
 import modal
 import shutil
-from scipy.io import wavfile
 import numpy as np
 import faiss
 
@@ -259,9 +258,6 @@ def generate_filelist():
     experiment_dir = "/root/rvc-models/logs/mi-test"
 
     gt_dir = os.path.join(experiment_dir, "0_gt_wavs")
-    feature_dir = os.path.join(experiment_dir, "3_feature768")
-    f0_dir = os.path.join(experiment_dir, "2a_f0")
-    f0nsf_dir = os.path.join(experiment_dir, "2b-f0nsf")
 
     filelist_path = os.path.join(experiment_dir, "filelist.txt")
 
@@ -539,7 +535,7 @@ def train():
     print()
         
     # Run without capture_output so training progress streams live to Modal logs
-    result = subprocess.run(command, check=True)
+    subprocess.run(command, check=True)
 
     print("Training Finished")
 

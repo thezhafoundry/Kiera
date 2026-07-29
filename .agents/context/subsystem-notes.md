@@ -85,8 +85,26 @@ size), at the cost of more per-block delay, which this buffer is what absorbs.
   refills underneath for the next gulp. User-reported symptom the same night: "if I talk a
   big sentence the voice is getting blurred at the last" — plausible match (progressive
   distortion over a long continuous utterance, not a hard dropout) but NOT yet confirmed by
-  ear against this specific mechanism. Fix direction not yet chosen: either drain the buffer
-  in small steady increments instead of one gulp, or re-tune target/consumer pacing. See
+  ear against this specific mechanism.
+  **Update (2026-07-21): fixed with an explicit `next_publish_time` real-time pacer in
+  `_run_playout_consumer`.** This is a re-implementation of the 2026-07-16 design
+  (`docs/superpowers/plans/2026-07-16-playout-consumer-real-time-pacing.md`) that was built,
+  reviewed, deployed, and reverted same-day 2026-07-17 with no stated reason (see [[log]]) —
+  re-derive intent from that plan doc, not from memory. **This pass also fixes a bug the
+  original attempt didn't have a test for:** real-time pacing means the consumer routinely
+  holds genuine backlog mid-call, not just at idle. `_run_conversion_stream`'s teardown used
+  to `consumer_task.cancel()` immediately when the converter's generator ended (e.g. normal
+  call hangup) — under the old "drain instantly" behavior the buffer was almost always empty
+  by then so this never mattered, but under real-time pacing the consumer can be cancelled
+  mid-`asyncio.sleep()` while holding an already-popped, not-yet-published chunk, silently
+  truncating the tail of the call's audio. Fixed two ways: (1) the pacer catches
+  `CancelledError` during its pacing sleep and publishes the in-flight chunk before
+  re-raising: (2) `_run_conversion_stream`'s `finally` flushes any remainder still sitting in
+  `_playout_buffer` (never popped) immediately/unpaced after the consumer stops. Caught by
+  `test_playout_buffer_smooths_bursty_converter_output` (existing test, no new test needed)
+  once its fake converter was pointed at the new pacer — it deterministically lost the last
+  1000 of 9000 bytes without the teardown fix. **Live listen test still not done** — do not
+  treat this as confirmed until one happens; that's the exact step skipped in 2026-07-17. See
   [[active-backlog]].
 - **`rtc.AudioFrame.data` is an int16-typed `memoryview` — `len()` on it returns *sample*
   count, not byte count.** (`len(frame.data)` on a 960-byte/480-sample frame returns 480,
@@ -313,6 +331,89 @@ Work through in order:
   single 2026-07-08 reference-output measurement, not derived from the model's
   training data — worth re-validating if a user's identity complaint persists after
   ruling out the input-muffling regression noted above. See [[active-backlog]].
+
+## Desktop voice changer and macOS BlackHole (`/desktop/`, verified 2026-07-23)
+
+The desktop page is a browser-to-FastAPI relay, not the LiveKit/PSTN worker path:
+`POST /api/desktop/session` issues a short-lived, single-use ticket; the browser offers it
+as `keira-desktop.<ticket>` on `/api/desktop/audio`; `DesktopAudioBridge` accepts fixed
+640-byte/20ms 16kHz PCM frames and returns fixed 960-byte/10ms 48kHz converted frames.
+Operator/control-token auth is currently disabled globally (merge `6e284bd`, decision
+commit `61d677c`), but the single-use desktop WebSocket ticket remains. Do not confuse the
+ticket with the removed `KEIRA_CONTROL_TOKEN` gate.
+
+- **Use a real current Chrome/Edge build.** The Codex in-app browser used during the
+  2026-07-23 local test did not complete the page's required Web Audio/device setup and
+  enumerated only built-in devices, leaving the fallback UI and buttons disabled.
+  This was a browser-surface limitation, not evidence that BlackHole or RVC was missing.
+  The page also requires microphone permission before `enumerateDevices()` reveals complete
+  device names.
+- **macOS device state was verified directly:** the driver exists at
+  `/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver`; CoreAudio reports `BlackHole 2ch`,
+  2 input + 2 output channels, 48kHz, virtual transport. The MacBook Air microphone was
+  48kHz; built-in speakers were 44.1kHz. If Chrome was already running when BlackHole was
+  installed, quit it fully (`Cmd+Q`) and reopen the page after granting microphone access.
+- **Button contracts differ:** **Test converted voice** needs only a selected physical
+  microphone and an available desktop session; it plays converted output through normal
+  speakers and does *not* require BlackHole. **Start conversion** additionally requires
+  `AudioContext.setSinkId` and an approved virtual output (`BlackHole`, `Loopback`, or
+  VB-CABLE `CABLE Input`). **Stop** is enabled only while a relay client exists.
+- **Fresh warm-path evidence:** a 2.0s direct synthetic RVC stream returned 174,086 bytes
+  / 1,813.4ms across 6 blocks, active-ready 1,970.34ms, TensorRT inference median/p95
+  55.64/58.08ms, converter-wait median/p95 1,437.22/1,597.90ms, network estimate
+  median/p95 1,062.58/1,221.63ms, zero drops. The exact local desktop route also passed:
+  a generated 2,208.9ms spoken sentence became 173,760 bytes / 181 valid output frames /
+  1,810.0ms, ready in 1,856.36ms, 6 stats messages, zero input drops. The ignored local
+  listen artifact is `kiera_conversion_test_rerun.wav`.
+- **Cold-path evidence:** the first direct session timed out its opening handshake and
+  failed active readiness after 180s; `/health` also returned no bytes within 45s. Modal
+  logs showed the stable `fastapi_app` waiting roughly five minutes for an
+  `ap-southeast` L4, followed by ~34s model/TRT startup. A later cold desktop session
+  correctly returned `converter_unavailable` after its 150s fail-closed gate. A direct
+  health warm-up then took ~94s; the identical desktop test immediately passed afterward.
+  Treat disabled/failed tests after idle as a capacity/readiness problem until `/health`
+  reports `ready`, not as a voice-model or BlackHole failure.
+- **`WARNING:asyncio:socket.send() raised exception.` is not an exception you can catch
+  (learned the hard way 2026-07-28).** It is emitted by CPython's
+  `asyncio/selector_events.py:1068` / `proactor_events.py:353` when something calls
+  `transport.write()` on a transport whose connection is **already lost**: it logs (only
+  after `LOG_THRESHOLD_FOR_CONNLOST_WRITES`, i.e. 5 prior silent drops), **discards the
+  data, and returns without raising.** Nothing in `desktop_audio.py`'s `try/except` can
+  ever see it. N of these warnings means N frames of converted audio were written *after*
+  the browser disconnected — which is evidence the converter is **working**, not failing.
+  Two separate "fixes" (a send lock, then a broadened `except`) were shipped against the
+  wrong mental model before anyone read the emitting source; see [[log]] 2026-07-28. When
+  this appears, ask why the client went away, not what threw.
+- **The desktop bridge has NO playout pacing, unlike the LiveKit path — this is the
+  known cause of stuttering desktop audio (measured 2026-07-28, unfixed).**
+  `DesktopAudioBridge.convert_output()` writes each converted frame the moment it arrives,
+  so Modal's arrival timing passes straight through to the browser. Measured over 30s of
+  evenly-sent input: 0.22s of audio at second 4, **nothing for seconds 5-11**, then
+  **6.2s of audio inside second 14**. Byte totals were near-conservative (27.5s in /
+  24.96s out), so this is purely delivery timing, not loss. The browser's playout worklet
+  only holds 5s (`MAX_QUEUE_SAMPLES`, drop-oldest), so the user hears a fraction of a
+  second then silence. `backend/pipeline.py` fixed exactly this class of bug for LiveKit
+  with a standing cushion + `next_publish_time` pacer (see the Playout buffer section
+  above); porting it here is tracked in [[active-backlog]]. **A first port attempt starved
+  playout to zero bytes** — clearing `playout_ready` on wakes that took no chunk swallows
+  the producer's `set()`, and a single `playout_enabled.wait()` before the loop strands the
+  consumer when a session ends pre-readiness. Both traps are documented in [[log]].
+- **Keep-warm trap:** `_rvc_keepwarm_loop` is default-off unless `RVC_KEEPWARM=1`.
+  `lifespan()` currently prints “RVC keep-warm loop started” unconditionally even when the
+  coroutine returns immediately; the local `.env` did not set `RVC_KEEPWARM` during this
+  test. Trust the environment and actual `/health` traffic, not that startup line.
+
+Next-session acceptance order: start the local server; explicitly warm `/health`; open
+`http://127.0.0.1:8000/desktop/` in real Chrome; allow microphone access; select the
+physical mic; run **Test converted voice**; select `BlackHole 2ch`; run **Start conversion**;
+then set WhatsApp Desktop's microphone to BlackHole and keep its speaker on the built-in
+speakers/headphones. Record UI state, readiness time, first converted audio, and any drops.
+**Blocked as of 2026-07-28**: run the two [[active-backlog]] P0s first (revert the `ready`-
+delaying send lock, then add playout pacing). Until pacing exists, **Test converted voice**
+delivers audio in bursts with multi-second gaps regardless of device setup, so a failed
+acceptance run would say nothing about BlackHole/VB-CABLE. This is also a Windows/VB-CABLE
+context now, not just macOS/BlackHole — the 2026-07-27/28 sessions ran on Windows with
+`CABLE Input`/`CABLE Output`.
 
 ## TensorRT/ONNX migration (merged to main 2026-07-07, merge commit `9c1093a`)
 `trt-migration` branch is merged into `main`. Rollout status as of 2026-07-16: Phase A
@@ -589,6 +690,17 @@ diverge for as long as nobody runs `modal deploy`.
   (VAD-based chunking was deleted, not just made optional) — the old "without it, chunking
   falls back to fixed max-length" note no longer applies to anything. It's effectively an
   unused dependency now regardless of platform.
+- **`python -m backend.test_pipeline` is not reliably green on this Windows dev machine, and
+  that's pre-existing/environmental, not necessarily a regression (confirmed 2026-07-17).**
+  Three consecutive full-suite runs each failed at a *different* point in the
+  `RVCStreamingConverter` WS-reconnect test family (`test_rvc_streaming_converter_buffer_cap_drop_oldest`,
+  `test_rvc_ready_metadata_drives_dynamic_block_timing`) — both exercise real in-process
+  `websockets.serve` servers against finite wall-clock deadlines and are sensitive to
+  scheduling jitter when the whole suite runs sequentially in one event loop under load.
+  Before treating a full-suite failure as caused by your change: re-run just the failing test
+  in isolation (`python -c "import asyncio; from backend.test_pipeline import <name>; asyncio.run(<name>())"`)
+  — if it passes alone, and the code you changed doesn't share any state/import path with it,
+  it's very likely this same pre-existing flakiness, not your diff.
 
 ## Voice identity & clarity: pitch range + input-chain fidelity (root-caused 2026-07-08)
 Why live calls never sounded like the trained voice AND were muffled — two *independent*

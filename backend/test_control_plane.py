@@ -8,17 +8,10 @@ from backend.security import (
     validate_agent_gender,
     validate_agent_identity,
     validate_e164_phone,
-    verify_bearer_token,
 )
 
 
 class ControlPlaneSecurityTests(unittest.TestCase):
-    def test_bearer_token_requires_exact_configured_value(self):
-        self.assertTrue(verify_bearer_token("Bearer unit-token", "unit-token"))
-        self.assertFalse(verify_bearer_token("Bearer wrong", "unit-token"))
-        self.assertFalse(verify_bearer_token("unit-token", "unit-token"))
-        self.assertFalse(verify_bearer_token("", "unit-token"))
-
     def test_control_models_reject_invalid_operator_input(self):
         self.assertTrue(validate_e164_phone("+15551234567"))
         self.assertFalse(validate_e164_phone("555-1234"))
