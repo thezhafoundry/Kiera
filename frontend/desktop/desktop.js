@@ -53,6 +53,13 @@ export class DesktopAudioClient {
     this.playoutNode = null;
     this.stopping = false;
     this.relayReady = false;
+    // Diagnostic capture of converted frames exactly as they arrive off the
+    // socket, before the worklet transfers (and neuters) the buffer. Lets a
+    // silent test be split into "audio never arrived" vs "audio arrived but
+    // did not play" without guessing at device routing.
+    this.recordOutput = false;
+    this.recordedChunks = [];
+    this.recordedBytes = 0;
   }
 
   onStatus(callback) {
@@ -210,6 +217,12 @@ export class DesktopAudioClient {
   handleSocketMessage(message) {
     if (message instanceof ArrayBuffer) {
       const output = rmsPcm16(message);
+      // Copy BEFORE postMessage: the transfer list neuters `message`, so a
+      // capture taken afterward would read an empty buffer.
+      if (this.recordOutput) {
+        this.recordedChunks.push(new Uint8Array(message.slice(0)));
+        this.recordedBytes += message.byteLength;
+      }
       this.playoutNode?.port.postMessage({ type: 'audio', pcm: message }, [message]);
       this.emitMeters({ input: 0, output, bufferMs: 0 });
       return;
@@ -229,6 +242,41 @@ export class DesktopAudioClient {
     } catch {
       this.fail('Desktop audio relay sent invalid status data');
     }
+  }
+
+  /** Wrap the captured PCM in a WAV container, or null if nothing arrived. */
+  buildRecordingBlob() {
+    if (this.recordedBytes === 0) {
+      return null;
+    }
+    const pcm = new Uint8Array(this.recordedBytes);
+    let offset = 0;
+    for (const chunk of this.recordedChunks) {
+      pcm.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    const header = new ArrayBuffer(44);
+    const view = new DataView(header);
+    const writeAscii = (at, text) => {
+      for (let i = 0; i < text.length; i += 1) view.setUint8(at + i, text.charCodeAt(i));
+    };
+    const byteRate = OUTPUT_SAMPLE_RATE * 2; // mono, 16-bit
+    writeAscii(0, 'RIFF');
+    view.setUint32(4, 36 + pcm.byteLength, true);
+    writeAscii(8, 'WAVE');
+    writeAscii(12, 'fmt ');
+    view.setUint32(16, 16, true); // PCM chunk size
+    view.setUint16(20, 1, true); // format = PCM
+    view.setUint16(22, 1, true); // channels
+    view.setUint32(24, OUTPUT_SAMPLE_RATE, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, 2, true); // block align
+    view.setUint16(34, 16, true); // bits per sample
+    writeAscii(36, 'data');
+    view.setUint32(40, pcm.byteLength, true);
+
+    return new Blob([header, pcm], { type: 'audio/wav' });
   }
 
   fail(message) {
@@ -596,6 +644,7 @@ export class DesktopSetupPage {
         if (sawPlayoutBuffer && meters.bufferMs <= 20) resolvePlayoutDrained();
       }
     });
+    client.recordOutput = true;
     try {
       const ticket = await this.requestTicket();
       await client.start({ inputDeviceId: this.inputSelect.value, ticket });
@@ -644,8 +693,41 @@ export class DesktopSetupPage {
       byId('voice-test-result').textContent = 'Voice test failed.';
     } finally {
       await client.stop();
+      this.offerRecordingDownload(client);
       this.refreshControls();
     }
+  }
+
+  /** Expose the captured converted audio as a download link.
+   *
+   * Diagnostic: separates "the browser never received converted audio" from
+   * "it received it but you did not hear it" (device routing, app volume, a
+   * suspended AudioContext). The bytes here are captured off the socket, so a
+   * playable file with sound proves delivery worked and isolates the fault to
+   * playback.
+   */
+  offerRecordingDownload(client) {
+    const slot = byId('voice-test-download');
+    if (!slot) return;
+    slot.replaceChildren();
+
+    const blob = client.buildRecordingBlob?.();
+    if (!blob) {
+      slot.textContent = 'No converted audio bytes reached the browser (nothing to save).';
+      return;
+    }
+
+    const seconds = client.recordedBytes / (OUTPUT_SAMPLE_RATE * 2);
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `keira-test-${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
+    link.textContent = `Download converted audio (${seconds.toFixed(1)}s, ${(blob.size / 1024).toFixed(0)} KB)`;
+    slot.appendChild(link);
+
+    const player = document.createElement('audio');
+    player.controls = true;
+    player.src = link.href;
+    slot.appendChild(player);
   }
 }
 
