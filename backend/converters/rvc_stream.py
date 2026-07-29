@@ -450,6 +450,7 @@ class RVCStreamingConverter(VoiceConverter):
                         self._apply_ready_metadata(data)
                         self._is_healthy = True
                         self._stream_ready.set()
+                        logger.warning("[DEBUG] handshake OK, spawning writer_task")
 
                         writer_task = asyncio.create_task(self._writer_loop(ws))
                         try:
@@ -494,7 +495,12 @@ class RVCStreamingConverter(VoiceConverter):
         fails (socket died mid-write), the frame is pushed back onto the
         front of the buffer so the next connection's writer resumes it —
         never silently lost."""
+        logger.warning("[DEBUG] writer_loop started")
+        iterations = 0
         while True:
+            iterations += 1
+            if iterations <= 3:
+                logger.warning("[DEBUG] writer_loop iteration %d, buffer len=%d", iterations, len(self._buffer))
             buffered = None
             async with self._buffer_lock:
                 if self._buffer:
@@ -517,6 +523,7 @@ class RVCStreamingConverter(VoiceConverter):
                 continue
             try:
                 await ws.send(buffered.payload)
+                logger.warning("[DEBUG] sent frame, %d bytes", len(buffered.payload))
                 sent_at = time.monotonic()
                 if self._sent_bytes_count == 0:
                     self._block_started_at = sent_at
