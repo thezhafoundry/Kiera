@@ -66,9 +66,23 @@ async function warmGpu() {
   try {
     const resp = await fetch(`${API_BASE}/api/warmup`, { method: 'POST', signal: controller.signal });
     const data = await resp.json().catch(() => ({}));
-    result.textContent = data.status === 'success' ? 'GPU warm and ready.' : `GPU warmup: ${data.message || `HTTP ${resp.status}`}`;
+    console.log('[WarmGPU] response:', resp.status, data);
+    if (data.status === 'success') {
+      result.textContent = 'GPU warm and ready.';
+    } else if (data.status === 'skipped') {
+      result.textContent = `GPU warmup skipped: ${data.message || 'RVC not configured'}`;
+    } else {
+      result.textContent = `GPU warmup error: ${data.message || `HTTP ${resp.status}`}`;
+    }
   } catch (err) {
-    result.textContent = err.name === 'AbortError' ? 'GPU warmup timed out. Try again.' : `GPU warmup failed: ${err.message}`;
+    console.error('[WarmGPU] fetch error:', err);
+    if (err.name === 'AbortError') {
+      result.textContent = 'GPU warmup timed out. Try again.';
+    } else if (err instanceof TypeError && err.message.includes('Failed to fetch')) {
+      result.textContent = 'Cannot reach server. Check your connection.';
+    } else {
+      result.textContent = `GPU warmup failed: ${err.message}`;
+    }
   } finally {
     clearTimeout(timeoutId);
     btn.disabled = false;
