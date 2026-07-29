@@ -147,6 +147,11 @@ class DesktopAudioBridge:
         self.playout_max_bytes = playout_max_bytes
         self.input_drop_count = 0
         self.playout_drop_count = 0
+        # Bytes handed to websocket.send_bytes for this session. Diagnostic:
+        # compared against what the converter produced and what the browser
+        # actually captured, it isolates audio loss to the converter, this
+        # relay, or the client -- instead of inferring it from symptoms.
+        self.playout_sent_bytes = 0
 
     async def run(self, websocket: WebSocket) -> None:
         """Relay fixed-size PCM frames until either side ends the session."""
@@ -198,6 +203,9 @@ class DesktopAudioBridge:
             maxsize=self.input_queue_frames
         )
         input_closed = asyncio.Event()
+        # Set only on a genuine client hangup (not on cancellation, which also
+        # sets `input_closed`). Gates the teardown backlog flush.
+        client_disconnected = asyncio.Event()
         input_enabled = asyncio.Event()
         output_buffer = bytearray()
         playout_enabled = asyncio.Event()
@@ -289,7 +297,14 @@ class DesktopAudioBridge:
                                 }
                             )
                     input_queue.put_nowait(frame)
-            except (WebSocketDisconnect, asyncio.CancelledError):
+            except WebSocketDisconnect:
+                # A real client hangup, as opposed to the cancellation below.
+                # The distinction drives whether teardown flushes held backlog:
+                # with the client gone there is no real-time playout left to
+                # protect, so the audio should be delivered rather than dropped.
+                client_disconnected.set()
+                return
+            except asyncio.CancelledError:
                 return
             finally:
                 input_closed.set()
@@ -299,6 +314,7 @@ class DesktopAudioBridge:
             for frame in split_output_frames(output_buffer, payload):
                 async with send_lock:
                     await websocket.send_bytes(frame)
+                self.playout_sent_bytes += len(frame)
 
         async def run_playout_consumer() -> None:
             """Drain the playout buffer at a strictly real-time pace.
@@ -411,13 +427,35 @@ class DesktopAudioBridge:
                     consumer_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await consumer_task
-                # The consumer paces to real time and can be mid-sleep holding
-                # backlog when the converter stream ends. Flush the remainder
-                # immediately/unpaced rather than truncating the tail -- a brief
-                # blip on the last fragment beats losing it outright. Only on a
-                # natural end: if we were cancelled or the conversion failed,
-                # the session is going away and nobody is listening.
-                if stream_ended_naturally and not failed:
+                # The consumer paces to real time while the converter produces
+                # far faster (~30ms of GPU work per 320ms block), so genuine
+                # backlog is the normal steady state, not an edge case. Flush
+                # it unpaced rather than truncating -- a brief fast tail beats
+                # losing it outright.
+                #
+                # Flush when the converter's own stream ENDED -- either it ran
+                # to completion, or the client hung up and `_pump_input` closed
+                # it out. Both mean the session is over and there is no
+                # real-time playout left to protect, so delivering the backlog
+                # beats deleting it.
+                #
+                # Deliberately NOT flushed on a bare mid-call cancellation with
+                # the converter still producing: the listener is still on the
+                # line there, and dumping backlog unpaced is exactly the
+                # time-compressed "blurred voice" artifact the pacer exists to
+                # prevent (asserted by
+                # test_bursty_converter_output_is_paced_to_real_time).
+                #
+                # `failed` stays excluded: that path already sent an error
+                # frame and closed the socket.
+                #
+                # `client_gone` covers the case that actually bit us: on a
+                # browser disconnect the converter generator is still alive
+                # (long-lived by design), so the stream never "ends" and the
+                # task is torn down by cancellation instead -- discarding
+                # everything the pacer had not yet reached. Measured
+                # 2026-07-29: GPU produced 22.17s, browser received 1.8s.
+                if not failed and (stream_ended_naturally or client_disconnected.is_set()):
                     async with playout_lock:
                         leftover = bytes(playout_buffer)
                         playout_buffer.clear()
@@ -534,7 +572,16 @@ class DesktopAudioBridge:
             if not failed:
                 async with send_lock:
                     await websocket.send_json(
-                        {"type": "stopped", "input_drop_count": self.input_drop_count}
+                        {
+                            "type": "stopped",
+                            "input_drop_count": self.input_drop_count,
+                            # Diagnostic pair: how much converted audio this
+                            # relay actually wrote, and how much it discarded
+                            # to the overflow cap. Compare against the client's
+                            # own capture to locate loss precisely.
+                            "playout_sent_bytes": self.playout_sent_bytes,
+                            "playout_drop_bytes": self.playout_drop_count,
+                        }
                     )
                     await websocket.close()
         finally:

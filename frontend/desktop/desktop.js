@@ -235,6 +235,12 @@ export class DesktopAudioClient {
       if (status.type === 'ready') {
         this.relayReady = true;
       }
+      if (status.type === 'stopped') {
+        // Server-side accounting for this session, used to locate audio loss:
+        // what the relay wrote vs. what this client actually captured.
+        this.serverSentBytes = status.playout_sent_bytes ?? null;
+        this.serverDropBytes = status.playout_drop_bytes ?? null;
+      }
       this.emitStatus(status);
       if (status.type === 'error') {
         this.fail(status.message || 'Desktop audio relay error');
@@ -728,6 +734,23 @@ export class DesktopSetupPage {
     player.controls = true;
     player.src = link.href;
     slot.appendChild(player);
+
+    // Locate any loss. The relay's own accounting (`playout_sent_bytes`) only
+    // arrives with the server's `stopped` message, which this flow usually
+    // does NOT see -- runVoiceTest closes the socket from the client side
+    // first. So report it when present and stay quiet about it otherwise,
+    // rather than implying a comparison that was never made.
+    const toSec = (b) => (b / (OUTPUT_SAMPLE_RATE * 2)).toFixed(1);
+    const parts = [`browser captured ${toSec(client.recordedBytes)}s off the socket`];
+    if (Number.isFinite(client.serverSentBytes)) {
+      parts.unshift(`relay sent ${toSec(client.serverSentBytes)}s`);
+    }
+    if (client.serverDropBytes > 0) {
+      parts.push(`relay dropped ${toSec(client.serverDropBytes)}s to buffer overflow`);
+    }
+    const note = document.createElement('p');
+    note.textContent = parts.join(' · ');
+    slot.appendChild(note);
   }
 }
 
