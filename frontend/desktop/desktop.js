@@ -624,10 +624,7 @@ export class DesktopSetupPage {
     const startedAt = performance.now();
     let receivedAudio = false;
     let resolveFirstAudio;
-    let sawPlayoutBuffer = false;
-    let resolvePlayoutDrained;
     const firstAudio = new Promise((resolve) => { resolveFirstAudio = resolve; });
-    const playoutDrained = new Promise((resolve) => { resolvePlayoutDrained = resolve; });
     let relayReady = false;
     let resolveRelayReady;
     const relayReadyPromise = new Promise((resolve) => { resolveRelayReady = resolve; });
@@ -644,10 +641,6 @@ export class DesktopSetupPage {
       if (meters.output > 0) {
         receivedAudio = true;
         resolveFirstAudio();
-      }
-      if (Number.isFinite(meters.bufferMs)) {
-        sawPlayoutBuffer ||= meters.bufferMs > 0;
-        if (sawPlayoutBuffer && meters.bufferMs <= 20) resolvePlayoutDrained();
       }
     });
     client.recordOutput = true;
@@ -682,17 +675,13 @@ export class DesktopSetupPage {
           + 'voiced input — a pause resets the buffering. Try again speaking without pausing.';
       }
       if (receivedAudio) {
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        // Cap on waiting for the playout buffer to drain after first audio.
-        // A slow/cold backend (confirmed live 2026-07-29: engine=onnx-cuda,
-        // not trt) can still be delivering the burst well past a short cap,
-        // and client.stop() below tears the socket down unconditionally —
-        // cutting playback off mid-stream ("split second, then gone"). Give
-        // it real headroom instead of assuming a warm-path drain time.
-        await Promise.race([
-          playoutDrained,
-          new Promise((resolve) => setTimeout(resolve, 15_000)),
-        ]);
+        // Record for a fixed duration after first audio, instead of waiting
+        // for the playout buffer to drain.  playoutDrained fires as soon as
+        // the first Modal block (320ms) is consumed by the Audio Worklet,
+        // but the converter is still computing subsequent blocks -- stopping
+        // there captures only the first burst.
+        byId('voice-test-result').textContent = 'Recording converted audio for 5s…';
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
       }
     } catch (error) {
       this.setError(error.message);
