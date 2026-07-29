@@ -31,7 +31,6 @@ from .pipeline import VoiceConversionWorker
 from .security import (
     redact_phone_number,
     validate_agent_identity,
-    validate_listener_identity,
     RateLimiter,
 )
 
@@ -225,11 +224,6 @@ RVC_ADAPTIVE_PITCH = os.getenv("RVC_ADAPTIVE_PITCH", "1") == "1"
 # The trained model's F0 center in Hz that the adaptive lock targets
 # (mi-test: ~208, measured 2026-07-08 from a known-good output).
 RVC_TARGET_F0 = float(os.getenv("RVC_TARGET_F0", "208"))
-
-# Gain applied to desktop mic audio before sending to the RVC converter. Desktop
-# mic levels tend to be quieter than phone/LiveKit paths. 3.0 brings ~5-20% RMS
-# input up to ~15-60%, matching the range the RVC model expects for clear output.
-DESKTOP_INPUT_GAIN = float(os.getenv("DESKTOP_INPUT_GAIN", "3.0"))
 
 DUMMY_MODEL_VERSION = "dummy-development"
 # WebRTC noise-suppression aggressiveness [0..4]. Level 3 was gutting high-frequency
@@ -711,7 +705,6 @@ def _persist_engine_state(call_info: dict, worker) -> None:
 class TokenRequest(BaseModel):
     roomName: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
     identity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-    role: Literal["agent", "listener"] = "agent"
     agentGender: Literal["male", "female"] = "male"
     voiceEngine: Literal["rvc"] = "rvc"
 
@@ -736,22 +729,8 @@ async def create_desktop_session(request: DesktopSessionRequest):
 async def get_token(request: TokenRequest):
     """
     Brokers LiveKit client access tokens for browser web clients.
-    `role="agent"` (default) is the existing agent-dashboard/mic-publishing path,
-    unchanged. `role="listener"` is subscribe-only, for a participant that only
-    plays back another participant's track (e.g. routing the bot's converted
-    audio to a virtual audio cable) and never publishes its own mic.
     """
-    if request.role == "agent":
-        _require_agent_identity(request.identity)
-        can_publish, can_subscribe = True, True
-    else:
-        if not validate_listener_identity(request.identity):
-            raise HTTPException(
-                status_code=422,
-                detail="identity must be 5-64 safe characters.",
-            )
-        can_publish, can_subscribe = False, True
-
+    _require_agent_identity(request.identity)
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         raise HTTPException(
             status_code=500, 
@@ -765,8 +744,8 @@ async def get_token(request: TokenRequest):
             .with_grants(api.VideoGrants(
                 room_join=True,
                 room=request.roomName,
-                can_publish=can_publish,
-                can_subscribe=can_subscribe,
+                can_publish=True,
+                can_subscribe=True
             )) \
             .with_ttl(datetime.timedelta(seconds=3600))
 
@@ -1582,13 +1561,7 @@ async def desktop_audio_websocket(websocket: WebSocket):
     if not ticket:
         await websocket.close(code=1008, reason="Desktop session ticket required")
         return
-    rvc_available = bool(RVC_ENDPOINT_URL) and bool(RVC_API_KEY)
-    if ALLOW_DUMMY_CONVERTER:
-        effective_engine = "dummy"
-        print("[Desktop] Using DummyVoiceConverter (ALLOW_DUMMY_CONVERTER=true)")
-    elif rvc_available:
-        effective_engine = "rvc"
-    else:
+    if not RVC_ENDPOINT_URL or not RVC_API_KEY:
         await websocket.close(code=1013, reason="RVC desktop relay is not configured")
         return
 
@@ -1598,34 +1571,26 @@ async def desktop_audio_websocket(websocket: WebSocket):
         await websocket.close(code=1008, reason="Desktop session ticket is invalid or expired")
         return
 
-    if effective_engine == "rvc":
-        pitch_shift = RVC_MALE_PITCH_SHIFT if profile == "male" else 0
-        try:
-            converter = RVCStreamingConverter(
-                endpoint_url=RVC_ENDPOINT_URL,
-                api_key=RVC_API_KEY,
-                pitch_shift=pitch_shift,
-                index_rate=RVC_INDEX_RATE,
-                rms_mix_rate=RVC_RMS_MIX_RATE,
-                protect=RVC_PROTECT,
-                adaptive_pitch=RVC_ADAPTIVE_PITCH,
-                target_f0=RVC_TARGET_F0,
-                connect_timeout=150.0,
-                model_version=RVC_MODEL_VERSION,
-            )
-        except ValueError:
-            await websocket.close(code=1013, reason="RVC desktop relay is not configured")
-            return
-    else:
-        converter = DummyVoiceConverter()
+    pitch_shift = RVC_MALE_PITCH_SHIFT if profile == "male" else 0
+    try:
+        converter = RVCStreamingConverter(
+            endpoint_url=RVC_ENDPOINT_URL,
+            api_key=RVC_API_KEY,
+            pitch_shift=pitch_shift,
+            index_rate=RVC_INDEX_RATE,
+            rms_mix_rate=RVC_RMS_MIX_RATE,
+            protect=RVC_PROTECT,
+            adaptive_pitch=RVC_ADAPTIVE_PITCH,
+            target_f0=RVC_TARGET_F0,
+            connect_timeout=150.0,
+            model_version=RVC_MODEL_VERSION,
+        )
+    except ValueError:
+        await websocket.close(code=1013, reason="RVC desktop relay is not configured")
+        return
 
     await websocket.accept(subprotocol=desktop_protocol)
-    desktop_suppressor = WebRTCNoiseSuppressor(ns_level=NS_LEVEL)
-    bridge = DesktopAudioBridge(
-        converter,
-        input_gain=DESKTOP_INPUT_GAIN,
-        suppressor=desktop_suppressor,
-    )
+    bridge = DesktopAudioBridge(converter)
     async with contextlib.aclosing(bridge):
         await bridge.run(websocket)
 

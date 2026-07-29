@@ -744,15 +744,3 @@ otherwise every timing measurement taken while diagnosing pacing is distorted by
 from a log message's wording rather than reading the source that emits it. Reading
 `selector_events.py` took two minutes and immediately invalidated both. Read the emitting
 source before patching an unfamiliar runtime warning.
-
-**Fixed (uncommitted as of 2026-07-29): `RVCStreamingConverter`'s WS `connect_timeout`
-default (10s) was silently below Modal's real `/ws` handshake latency, producing a
-"resolved" call with zero converted audio.** Modal's `/health` endpoint answering fast
-(~1s on a warm container) does not mean the `/ws` handshake is equally fast — measured
-live against a warm container, the handshake alone took 18.4s. Every connect attempt timed
-out at the old 10s default, so `_connection_loop` reconnected forever, every input frame
-landed in the 500ms reconnect buffer and was dropped there, and the session reported ready
-while producing no converted audio at all — a fail-closed policy failing in a way that
-looked like silence, not an error. Raised the default to 45s
-(`backend/converters/rvc_stream.py`) as a ceiling, not an added delay, since a fast
-handshake still returns immediately. Not yet committed — see `git diff` on that file.

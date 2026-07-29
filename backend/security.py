@@ -16,10 +16,6 @@ def validate_agent_identity(value: str) -> bool:
     return bool(_IDENTITY_RE.fullmatch(value or "")) and "agent" in value.lower()
 
 
-def validate_listener_identity(value: str) -> bool:
-    return bool(_IDENTITY_RE.fullmatch(value or ""))
-
-
 def validate_agent_gender(value: str) -> bool:
     return value in {"male", "female"}
 

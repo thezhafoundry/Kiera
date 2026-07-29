@@ -514,9 +514,8 @@ def test_desktop_audio_websocket_consumes_subprotocol_ticket(monkeypatch):
             captured["converter"] = kwargs
 
     class StubBridge:
-        def __init__(self, converter, **kwargs) -> None:
+        def __init__(self, converter) -> None:
             captured["bridge_converter"] = converter
-            captured["bridge_kwargs"] = kwargs
 
         async def run(self, websocket) -> None:
             await websocket.send_json({"type": "ready"})
@@ -549,14 +548,9 @@ async def test_bursty_converter_output_is_paced_to_real_time():
     must surface as delay, never as speed.
     """
     one_second = 96000  # 48kHz * 2 bytes
-    # Deliberately NO WebSocketDisconnect: this test covers cancellation while
-    # the client is still connected and listening, which is the only case where
-    # dumping held backlog unpaced would be audible as time-compressed speech.
-    # Once the client has actually hung up, teardown flushes instead (see
-    # test_paced_playout_flushes_backlog_when_client_disconnects) -- gating that
-    # flush on a disconnect the fixture itself performed is what made these two
-    # behaviors look contradictory.
-    websocket = TimestampingWebSocket(configured([bytes(640)] * 4))
+    websocket = TimestampingWebSocket(
+        configured([bytes(640)] * 4 + [WebSocketDisconnect()])
+    )
     converter = BurstyConverter(
         burst_bytes=one_second // 4,
         stall_seconds=0.2,
@@ -578,60 +572,6 @@ async def test_bursty_converter_output_is_paced_to_real_time():
     assert sent < one_second, (
         f"converted audio was forwarded faster than real time: {sent} bytes "
         f"({sent / one_second:.2f}s of audio) written in ~0.35s"
-    )
-
-
-@pytest.mark.asyncio
-async def test_paced_playout_flushes_backlog_when_client_disconnects():
-    """A client hangup must deliver held backlog, not discard it.
-
-    Measured live 2026-07-29: the GPU produced 22.17s of converted audio and
-    the browser received 1.8s. The converter is long-lived by design, so on a
-    disconnect its stream never "ends" -- the task is torn down by cancellation
-    instead, and the old teardown gate (`stream_ended_naturally`) therefore
-    never fired, dropping everything the real-time pacer had not yet reached.
-
-    Distinct from test_bursty_converter_output_is_paced_to_real_time: there the
-    client is still connected, so pacing must be preserved. Here it has hung up,
-    so there is no live playout left to protect.
-    """
-    one_second = 96000
-    websocket = FakeWebSocket(configured([bytes(640), WebSocketDisconnect()]))
-
-    produced = one_second * 3
-
-    class LongLivedConverter(VoiceConverter):
-        """Produces far faster than real time, then stays alive like production."""
-
-        async def convert_stream(self, in_audio: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
-            drain = asyncio.create_task(_consume(in_audio))
-            try:
-                for _ in range(3):
-                    yield bytes(one_second)
-                    await asyncio.sleep(0.01)
-                await asyncio.sleep(3600)
-            finally:
-                drain.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await drain
-
-    async def _consume(in_audio: AsyncIterator[bytes]) -> None:
-        async for _frame in in_audio:
-            pass
-
-    bridge = DesktopAudioBridge(
-        LongLivedConverter(), playout_cushion_bytes=one_second // 10
-    )
-    task = asyncio.create_task(bridge.run(websocket))
-    await asyncio.sleep(0.5)
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
-
-    delivered = len(websocket.binary_messages) * 960
-    assert delivered == produced, (
-        f"expected all {produced} bytes delivered after client disconnect, "
-        f"got {delivered} ({delivered / one_second:.2f}s of {produced / one_second:.2f}s)"
     )
 
 

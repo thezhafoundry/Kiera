@@ -83,9 +83,6 @@ RVC_ADAPTIVE_PITCH=1 # per-call F0-derived pitch lock; 0 = legacy fixed RVC_MALE
 RVC_TARGET_F0=208 # Hz center of the trained model's pitch range the adaptive lock targets
 PRESENCE_EQ_GAIN_DB=4 # dB boost on 1.2-3.4kHz before publish (PSTN clarity); 0 disables
 
-# Desktop Audio
-DESKTOP_INPUT_GAIN=3.0 # gain applied to desktop mic PCM before RVC conversion (default 3.0)
-
 # CORS (comma-separated; defaults to "*" if unset)
 CORS_ORIGINS=*
 

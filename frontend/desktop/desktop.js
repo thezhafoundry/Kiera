@@ -53,13 +53,6 @@ export class DesktopAudioClient {
     this.playoutNode = null;
     this.stopping = false;
     this.relayReady = false;
-    // Diagnostic capture of converted frames exactly as they arrive off the
-    // socket, before the worklet transfers (and neuters) the buffer. Lets a
-    // silent test be split into "audio never arrived" vs "audio arrived but
-    // did not play" without guessing at device routing.
-    this.recordOutput = false;
-    this.recordedChunks = [];
-    this.recordedBytes = 0;
   }
 
   onStatus(callback) {
@@ -217,12 +210,6 @@ export class DesktopAudioClient {
   handleSocketMessage(message) {
     if (message instanceof ArrayBuffer) {
       const output = rmsPcm16(message);
-      // Copy BEFORE postMessage: the transfer list neuters `message`, so a
-      // capture taken afterward would read an empty buffer.
-      if (this.recordOutput) {
-        this.recordedChunks.push(new Uint8Array(message.slice(0)));
-        this.recordedBytes += message.byteLength;
-      }
       this.playoutNode?.port.postMessage({ type: 'audio', pcm: message }, [message]);
       this.emitMeters({ input: 0, output, bufferMs: 0 });
       return;
@@ -235,12 +222,6 @@ export class DesktopAudioClient {
       if (status.type === 'ready') {
         this.relayReady = true;
       }
-      if (status.type === 'stopped') {
-        // Server-side accounting for this session, used to locate audio loss:
-        // what the relay wrote vs. what this client actually captured.
-        this.serverSentBytes = status.playout_sent_bytes ?? null;
-        this.serverDropBytes = status.playout_drop_bytes ?? null;
-      }
       this.emitStatus(status);
       if (status.type === 'error') {
         this.fail(status.message || 'Desktop audio relay error');
@@ -248,41 +229,6 @@ export class DesktopAudioClient {
     } catch {
       this.fail('Desktop audio relay sent invalid status data');
     }
-  }
-
-  /** Wrap the captured PCM in a WAV container, or null if nothing arrived. */
-  buildRecordingBlob() {
-    if (this.recordedBytes === 0) {
-      return null;
-    }
-    const pcm = new Uint8Array(this.recordedBytes);
-    let offset = 0;
-    for (const chunk of this.recordedChunks) {
-      pcm.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-
-    const header = new ArrayBuffer(44);
-    const view = new DataView(header);
-    const writeAscii = (at, text) => {
-      for (let i = 0; i < text.length; i += 1) view.setUint8(at + i, text.charCodeAt(i));
-    };
-    const byteRate = OUTPUT_SAMPLE_RATE * 2; // mono, 16-bit
-    writeAscii(0, 'RIFF');
-    view.setUint32(4, 36 + pcm.byteLength, true);
-    writeAscii(8, 'WAVE');
-    writeAscii(12, 'fmt ');
-    view.setUint32(16, 16, true); // PCM chunk size
-    view.setUint16(20, 1, true); // format = PCM
-    view.setUint16(22, 1, true); // channels
-    view.setUint32(24, OUTPUT_SAMPLE_RATE, true);
-    view.setUint32(28, byteRate, true);
-    view.setUint16(32, 2, true); // block align
-    view.setUint16(34, 16, true); // bits per sample
-    writeAscii(36, 'data');
-    view.setUint32(40, pcm.byteLength, true);
-
-    return new Blob([header, pcm], { type: 'audio/wav' });
   }
 
   fail(message) {
@@ -326,10 +272,9 @@ export class DesktopAudioClient {
 // How long to wait for the first converted frame, measured from the relay's
 // `ready` handshake. The converter buffers BLOCK_MS+CONTEXT_MS (720ms) before
 // its first inference and returns it ~1.2-1.4s later; measured warm, the first
-// frame lands ~1.36s after `ready`. TEMPORARY: bumped 10s -> 30s to diagnose
-// audio arriving after the test already closed the socket (2026-07-29); revert
-// once real first-block latency is confirmed.
-const VOICE_TEST_AUDIO_TIMEOUT_MS = 30_000;
+// frame lands ~1.36s after `ready`. 10s leaves headroom for a slow first block
+// without hanging the UI.
+const VOICE_TEST_AUDIO_TIMEOUT_MS = 10_000;
 // Cap on the `ready` handshake itself. The backend's own fail-closed gate is
 // 150s (READINESS_TIMEOUT_SECONDS); a cold Modal container has been measured
 // taking 24s+ just to hand back `ready`.
@@ -624,7 +569,10 @@ export class DesktopSetupPage {
     const startedAt = performance.now();
     let receivedAudio = false;
     let resolveFirstAudio;
+    let sawPlayoutBuffer = false;
+    let resolvePlayoutDrained;
     const firstAudio = new Promise((resolve) => { resolveFirstAudio = resolve; });
+    const playoutDrained = new Promise((resolve) => { resolvePlayoutDrained = resolve; });
     let relayReady = false;
     let resolveRelayReady;
     const relayReadyPromise = new Promise((resolve) => { resolveRelayReady = resolve; });
@@ -642,8 +590,11 @@ export class DesktopSetupPage {
         receivedAudio = true;
         resolveFirstAudio();
       }
+      if (Number.isFinite(meters.bufferMs)) {
+        sawPlayoutBuffer ||= meters.bufferMs > 0;
+        if (sawPlayoutBuffer && meters.bufferMs <= 20) resolvePlayoutDrained();
+      }
     });
-    client.recordOutput = true;
     try {
       const ticket = await this.requestTicket();
       await client.start({ inputDeviceId: this.inputSelect.value, ticket });
@@ -664,82 +615,26 @@ export class DesktopSetupPage {
       // Only now start the conversion budget. The converter buffers
       // BLOCK_MS+CONTEXT_MS (720ms) before its first inference and returns it
       // ~1.2-1.4s later, so the first frame lands ~1.36s after `ready`.
-      byId('voice-test-result').textContent = 'Speak now, continuously, for a few seconds — waiting for converted audio…';
+      byId('voice-test-result').textContent = 'Speak now — waiting for converted audio…';
       await Promise.race([
         firstAudio,
         new Promise((resolve) => setTimeout(resolve, VOICE_TEST_AUDIO_TIMEOUT_MS)),
       ]);
-      if (!receivedAudio) {
-        byId('voice-test-result').textContent =
-          'No converted audio returned. The converter only produces output from continuous '
-          + 'voiced input — a pause resets the buffering. Try again speaking without pausing.';
-      }
+      if (!receivedAudio) byId('voice-test-result').textContent = 'No converted audio returned. Check the relay and voice level.';
       if (receivedAudio) {
-        // Record for a fixed duration after first audio, instead of waiting
-        // for the playout buffer to drain.  playoutDrained fires as soon as
-        // the first Modal block (320ms) is consumed by the Audio Worklet,
-        // but the converter is still computing subsequent blocks -- stopping
-        // there captures only the first burst.
-        byId('voice-test-result').textContent = 'Recording converted audio for 5s…';
-        await new Promise((resolve) => setTimeout(resolve, 5_000));
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        await Promise.race([
+          playoutDrained,
+          new Promise((resolve) => setTimeout(resolve, 1200)),
+        ]);
       }
     } catch (error) {
       this.setError(error.message);
       byId('voice-test-result').textContent = 'Voice test failed.';
     } finally {
       await client.stop();
-      this.offerRecordingDownload(client);
       this.refreshControls();
     }
-  }
-
-  /** Expose the captured converted audio as a download link.
-   *
-   * Diagnostic: separates "the browser never received converted audio" from
-   * "it received it but you did not hear it" (device routing, app volume, a
-   * suspended AudioContext). The bytes here are captured off the socket, so a
-   * playable file with sound proves delivery worked and isolates the fault to
-   * playback.
-   */
-  offerRecordingDownload(client) {
-    const slot = byId('voice-test-download');
-    if (!slot) return;
-    slot.replaceChildren();
-
-    const blob = client.buildRecordingBlob?.();
-    if (!blob) {
-      slot.textContent = 'No converted audio bytes reached the browser (nothing to save).';
-      return;
-    }
-
-    const seconds = client.recordedBytes / (OUTPUT_SAMPLE_RATE * 2);
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `keira-test-${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
-    link.textContent = `Download converted audio (${seconds.toFixed(1)}s, ${(blob.size / 1024).toFixed(0)} KB)`;
-    slot.appendChild(link);
-
-    const player = document.createElement('audio');
-    player.controls = true;
-    player.src = link.href;
-    slot.appendChild(player);
-
-    // Locate any loss. The relay's own accounting (`playout_sent_bytes`) only
-    // arrives with the server's `stopped` message, which this flow usually
-    // does NOT see -- runVoiceTest closes the socket from the client side
-    // first. So report it when present and stay quiet about it otherwise,
-    // rather than implying a comparison that was never made.
-    const toSec = (b) => (b / (OUTPUT_SAMPLE_RATE * 2)).toFixed(1);
-    const parts = [`browser captured ${toSec(client.recordedBytes)}s off the socket`];
-    if (Number.isFinite(client.serverSentBytes)) {
-      parts.unshift(`relay sent ${toSec(client.serverSentBytes)}s`);
-    }
-    if (client.serverDropBytes > 0) {
-      parts.push(`relay dropped ${toSec(client.serverDropBytes)}s to buffer overflow`);
-    }
-    const note = document.createElement('p');
-    note.textContent = parts.join(' · ');
-    slot.appendChild(note);
   }
 }
 
