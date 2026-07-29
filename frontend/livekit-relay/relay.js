@@ -218,7 +218,140 @@ async function populateOutputDevices() {
   document.getElementById('start-relay').disabled = false;
 }
 
-document.getElementById('warm-gpu').addEventListener('click', warmGpu);
+function buildWavBlob(pcmBytes, sampleRate) {
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + pcmBytes.byteLength, true);
+  writeString(view, 8, 'WAVE');
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, 'data');
+  view.setUint32(40, pcmBytes.byteLength, true);
+  return new Blob([new Uint8Array(header), new Uint8Array(pcmBytes)], { type: 'audio/wav' });
+}
+
+function writeString(view, offset, str) {
+  for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+}
+
+async function runVoiceTest() {
+  const testResult = document.getElementById('voice-test-result');
+  const testBtn = document.getElementById('voice-test');
+  const startBtn = document.getElementById('start-relay');
+
+  if (relayRoom) { testResult.textContent = 'Stop the current relay first before testing.'; return; }
+  testBtn.disabled = true;
+  startBtn.disabled = true;
+  testResult.textContent = 'Recording a short converted voice test…';
+  setError(null);
+
+  let audioChunks = [];
+  let mediaRecorder = null;
+  let streamToRecord = null;
+  let audioEl = null;
+  let room = null;
+
+  try {
+    const roomName = document.getElementById('room-name').value.trim();
+    const identity = `agent-test-${randomSuffix()}`;
+    const { token, serverUrl } = await fetchToken(roomName, identity);
+
+    room = new Room({ adaptiveStream: true, dynacast: true });
+    let firstAudioTime = null;
+
+    room.on(RoomEvent.TrackSubscribed, async (track, publication, participant) => {
+      if (!participant.identity.startsWith('voice-converter-bot')) return;
+
+      audioEl = track.attach();
+      audioEl.autoplay = true;
+      document.body.appendChild(audioEl);
+
+      try { await audioEl.play().catch(() => {}); } catch (_) {}
+
+      streamToRecord = audioEl.captureStream();
+      mediaRecorder = new MediaRecorder(streamToRecord, { mimeType: 'audio/webm' });
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size) audioChunks.push(e.data); };
+      mediaRecorder.start();
+
+      firstAudioTime = performance.now();
+    });
+
+    setState('connecting');
+    await room.connect(serverUrl, token);
+    await room.startAudio();
+
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { noiseSuppression: false, autoGainControl: false, echoCancellation: true },
+    });
+    await room.localParticipant.publishTrack(micStream.getAudioTracks()[0], {
+      name: 'microphone', source: Track.Source.Microphone,
+    });
+
+    setState('warming');
+    testResult.textContent = 'Connecting to the conversion engine…';
+    await startBot(roomName, identity);
+
+    testResult.textContent = 'Speak now, continuously, for a few seconds — waiting for converted audio…';
+
+    const audioTimeout = 30000;
+    const start = performance.now();
+    while (!firstAudioTime && (performance.now() - start) < audioTimeout) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    if (!firstAudioTime) {
+      testResult.textContent = 'No converted audio returned. Try again speaking continuously.';
+      await room.disconnect();
+      return;
+    }
+
+    const elapsed = Math.round(firstAudioTime - performance.now() + (performance.now() - start));
+    testResult.textContent = `Recording converted audio for 5s (first audio after ${elapsed}ms)…`;
+    await new Promise((r) => setTimeout(r, 5000));
+  } catch (err) {
+    testResult.textContent = `Voice test failed: ${err.message}`;
+  } finally {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    if (streamToRecord) streamToRecord.getTracks().forEach((t) => t.stop());
+    if (audioEl) { audioEl.remove(); }
+    if (room) { await room.disconnect(); }
+
+    testBtn.disabled = false;
+    startBtn.disabled = false;
+    setState('stopped');
+    updateMeter('input', 0);
+    updateMeter('output', 0);
+
+    offerTestDownload(audioChunks);
+  }
+}
+
+async function offerTestDownload(chunks) {
+  const slot = document.getElementById('voice-test-download');
+  if (!slot || !chunks.length) return;
+  slot.replaceChildren();
+
+  try {
+    const webmBlob = new Blob(chunks, { type: 'audio/webm' });
+    const url = URL.createObjectURL(webmBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'keira-voice-test.webm';
+    link.textContent = 'Download voice test recording (WebM)';
+    slot.appendChild(link);
+    slot.appendChild(document.createTextNode(' — converted audio captured off the bot\'s track.'));
+  } catch (_) {
+    slot.textContent = 'Download failed: could not assemble recording.';
+  }
+}
+document.getElementById('voice-test').addEventListener('click', runVoiceTest);
 document.getElementById('start-relay').addEventListener('click', startRelay);
 document.getElementById('stop-relay').addEventListener('click', stopRelay);
 
