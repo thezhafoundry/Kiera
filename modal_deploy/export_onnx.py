@@ -213,13 +213,20 @@ def export_generator():
     # cannot compile those). Zero tensor for the trace is fine -- parity check
     # uses a real N(0,1) tensor so cosine matches between PyTorch and ORT.
     sine_noise = torch.zeros(1, OUT_PADDED_48K, 1, dtype=torch.float32)
-    args = (phone, phone_lengths, pitch, pitchf, sid, rnd, None, sine_noise)
+    # rand_ini: external phase offset for SineGen's harmonic excitation -- shape
+    # [1, 1, 1] (harmonic_num=0 -> dim=1). Same reasoning as sine_noise: avoids
+    # ONNX RandomUniform inside the graph. Previously hardcoded to zero every
+    # block, which made the voiced excitation perfectly periodic and produced
+    # an audible tonal buzz/drone (found 2026-07-29). Now generated externally
+    # per block so the phase varies instead of being fixed forever.
+    rand_ini = torch.zeros(1, 1, 1, dtype=torch.float32)
+    args = (phone, phone_lengths, pitch, pitchf, sid, rnd, None, sine_noise, rand_ini)
 
     os.makedirs(ONNX_DIR, exist_ok=True)
     out_path = f"{ONNX_DIR}/generator.onnx"
     torch.onnx.export(
         net_g, args, out_path,
-        input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd", "sine_noise"],
+        input_names=["phone", "phone_lengths", "pitch", "pitchf", "sid", "rnd", "sine_noise", "rand_ini"],
         output_names=["audio"],
         opset_version=OPSET, do_constant_folding=True,
     )
@@ -234,6 +241,7 @@ def export_generator():
         "sid": np.array([0], dtype=np.int64),
         "rnd": rng.standard_normal((1, 192, GEN_FRAMES)).astype(np.float32),
         "sine_noise": rng.standard_normal((1, OUT_PADDED_48K, 1)).astype(np.float32),
+        "rand_ini": rng.uniform(0, 1, (1, 1, 1)).astype(np.float32),
     }
     with torch.no_grad():
         ref_inputs = list(feed.values())
@@ -241,6 +249,7 @@ def export_generator():
             *[torch.from_numpy(v) for v in ref_inputs[:6]],
             None,
             torch.from_numpy(ref_inputs[6]),
+            torch.from_numpy(ref_inputs[7]),
         )
         ref = (ref[0] if isinstance(ref, tuple) else ref).numpy()
     sess = ort.InferenceSession(out_path, providers=["CPUExecutionProvider"])

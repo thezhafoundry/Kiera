@@ -332,7 +332,7 @@ class SineGen(torch.nn.Module):
             uv = uv.float()
         return uv
     
-    def _f02sine(self, f0, upp):
+    def _f02sine(self, f0, upp, rand_ini: torch.Tensor = None):
         """ f0: (batchsize, length, dim)
             where dim indicates fundamental tone and overtones
         """
@@ -345,16 +345,20 @@ class SineGen(torch.nn.Module):
         b = torch.arange(1, self.dim + 1, dtype=f0.dtype, device=f0.device).reshape(1, 1, -1)
         rad *= b
         # TRT shim: torch.rand emits ONNX RandomUniform which TRT Myelin cannot compile.
-        # Phase offset = 0 gives a fully deterministic harmonic excitation signal, which
-        # is acceptable for voice conversion (the trained voice identity comes from the
-        # FAISS-blended features, not the source phase).
-        rand_ini = torch.zeros(1, 1, self.dim, device=f0.device)
-        rand_ini[..., 0] = 0
+        # rand_ini is generated externally (numpy RNG in trt_pipeline.py, same pattern as
+        # sine_noise below) and passed in as an ONNX input instead. A fixed zero phase
+        # here makes the harmonic excitation perfectly periodic block-to-block, which is
+        # audible as a steady tonal buzz/drone (found 2026-07-29 comparing an offline
+        # replay against a live call — reproduced with no live call involved at all,
+        # isolating it to this deterministic excitation, not network/buffering/pitch-lock).
+        # Falls back to zeros when None (e.g. tracing warm-up with dummy inputs).
+        if rand_ini is None:
+            rand_ini = torch.zeros(1, 1, self.dim, device=f0.device)
         rad += rand_ini
         sines = torch.sin(2 * np.pi * rad)
         return sines
-        
-    def forward(self, f0: torch.Tensor, upp: int, sine_noise: torch.Tensor = None):
+
+    def forward(self, f0: torch.Tensor, upp: int, sine_noise: torch.Tensor = None, rand_ini: torch.Tensor = None):
         """sine_tensor, uv = forward(f0)
         input F0: tensor(batchsize=1, length, dim=1)
                   f0 for unvoiced steps should be 0
@@ -363,7 +367,7 @@ class SineGen(torch.nn.Module):
         """
         with torch.no_grad():
             f0 = f0.unsqueeze(-1)
-            sine_waves = self._f02sine(f0, upp) * self.sine_amp
+            sine_waves = self._f02sine(f0, upp, rand_ini) * self.sine_amp
             uv = self._f02uv(f0)
             uv = F.interpolate(
                 uv.transpose(2, 1), scale_factor=float(upp), mode="nearest"
@@ -423,8 +427,8 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = torch.nn.Tanh()
 
-    def forward(self, x, upp=None, sine_noise=None):
-        sine_wavs, uv, _ = self.l_sin_gen(x, upp, sine_noise)
+    def forward(self, x, upp=None, sine_noise=None, rand_ini=None):
+        sine_wavs, uv, _ = self.l_sin_gen(x, upp, sine_noise, rand_ini)
         if self.is_half:
             sine_wavs = sine_wavs.half()
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
@@ -503,8 +507,8 @@ class GeneratorNSF(torch.nn.Module):
 
         self.upp = np.prod(upsample_rates)
 
-    def forward(self, x, f0, g=None, sine_noise=None):
-        har_source, noi_source, uv = self.m_source(f0, self.upp, sine_noise)
+    def forward(self, x, f0, g=None, sine_noise=None, rand_ini=None):
+        har_source, noi_source, uv = self.m_source(f0, self.upp, sine_noise, rand_ini)
         har_source = har_source.transpose(1, 2)
         x = self.conv_pre(x)
         if g is not None:
@@ -647,7 +651,7 @@ class SynthesizerTrnMsNSFsidM(nn.Module):
             self.speaker_map[i] = self.emb_g(torch.LongTensor([[i]]))
         self.speaker_map = self.speaker_map.unsqueeze(0)
 
-    def forward(self, phone, phone_lengths, pitch, nsff0, g, rnd, max_len=None, sine_noise=None):
+    def forward(self, phone, phone_lengths, pitch, nsff0, g, rnd, max_len=None, sine_noise=None, rand_ini=None):
         if self.speaker_map is not None:  # [N, S]  *  [S, B, 1, H]
             g = g.reshape((g.shape[0], g.shape[1], 1, 1, 1))  # [N, S, B, 1, 1]
             g = g * self.speaker_map  # [N, S, B, 1, H]
@@ -660,7 +664,7 @@ class SynthesizerTrnMsNSFsidM(nn.Module):
         m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
         z_p = (m_p + torch.exp(logs_p) * rnd) * x_mask
         z = self.flow(z_p, x_mask, g=g, reverse=True)
-        o = self.dec((z * x_mask)[:, :, :max_len], nsff0, g=g, sine_noise=sine_noise)
+        o = self.dec((z * x_mask)[:, :, :max_len], nsff0, g=g, sine_noise=sine_noise, rand_ini=rand_ini)
         return o
 
 

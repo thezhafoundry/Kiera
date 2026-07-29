@@ -292,6 +292,13 @@ class TRTVoicePipeline:
         # Generated here (numpy RNG) rather than inside the ONNX graph so TRT
         # Myelin never sees a RandomNormal op. Shape [1, OUT_PADDED_48K, 1].
         sine_noise = self._rng.standard_normal((1, OUT_PADDED_48K, 1)).astype(np.float32)
+        # rand_ini: phase offset for SineGen's harmonic excitation, shape [1, 1, 1]
+        # (harmonic_num=0 -> dim=1). Same reasoning as sine_noise -- generated here
+        # (numpy RNG) instead of via ONNX RandomUniform, which TRT Myelin can't
+        # compile. Previously hardcoded to zero every block inside the model, which
+        # made the voiced excitation perfectly periodic and produced an audible
+        # tonal buzz/drone (found 2026-07-29); now varies per block instead.
+        rand_ini = self._rng.uniform(0.0, 1.0, (1, 1, 1)).astype(np.float32)
         out = self.s_gen.run(None, {
             "phone": feats.astype(np.float32),
             "phone_lengths": np.array([GEN_FRAMES], dtype=np.int64),
@@ -300,6 +307,7 @@ class TRTVoicePipeline:
             "sid": np.array([0], dtype=np.int64),
             "rnd": self._rng.standard_normal((1, 192, GEN_FRAMES)).astype(np.float32),
             "sine_noise": sine_noise,
+            "rand_ini": rand_ini,
         })[0].reshape(-1)                                   # [OUT_PADDED_48K] float32
         t_generator = time.perf_counter()
 
