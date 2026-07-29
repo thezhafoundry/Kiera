@@ -31,6 +31,7 @@ from .pipeline import VoiceConversionWorker
 from .security import (
     redact_phone_number,
     validate_agent_identity,
+    validate_listener_identity,
     RateLimiter,
 )
 
@@ -710,6 +711,7 @@ def _persist_engine_state(call_info: dict, worker) -> None:
 class TokenRequest(BaseModel):
     roomName: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.-]+$")
     identity: str = Field(min_length=5, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    role: Literal["agent", "listener"] = "agent"
     agentGender: Literal["male", "female"] = "male"
     voiceEngine: Literal["rvc"] = "rvc"
 
@@ -734,8 +736,22 @@ async def create_desktop_session(request: DesktopSessionRequest):
 async def get_token(request: TokenRequest):
     """
     Brokers LiveKit client access tokens for browser web clients.
+    `role="agent"` (default) is the existing agent-dashboard/mic-publishing path,
+    unchanged. `role="listener"` is subscribe-only, for a participant that only
+    plays back another participant's track (e.g. routing the bot's converted
+    audio to a virtual audio cable) and never publishes its own mic.
     """
-    _require_agent_identity(request.identity)
+    if request.role == "agent":
+        _require_agent_identity(request.identity)
+        can_publish, can_subscribe = True, True
+    else:
+        if not validate_listener_identity(request.identity):
+            raise HTTPException(
+                status_code=422,
+                detail="identity must be 5-64 safe characters.",
+            )
+        can_publish, can_subscribe = False, True
+
     if not LIVEKIT_API_KEY or not LIVEKIT_API_SECRET:
         raise HTTPException(
             status_code=500, 
@@ -749,8 +765,8 @@ async def get_token(request: TokenRequest):
             .with_grants(api.VideoGrants(
                 room_join=True,
                 room=request.roomName,
-                can_publish=True,
-                can_subscribe=True
+                can_publish=can_publish,
+                can_subscribe=can_subscribe,
             )) \
             .with_ttl(datetime.timedelta(seconds=3600))
 
@@ -1567,14 +1583,14 @@ async def desktop_audio_websocket(websocket: WebSocket):
         await websocket.close(code=1008, reason="Desktop session ticket required")
         return
     rvc_available = bool(RVC_ENDPOINT_URL) and bool(RVC_API_KEY)
-    if not rvc_available:
-        if not ALLOW_DUMMY_CONVERTER:
-            await websocket.close(code=1013, reason="RVC desktop relay is not configured")
-            return
+    if ALLOW_DUMMY_CONVERTER:
         effective_engine = "dummy"
-        print("[Desktop] RVC not configured; using DummyVoiceConverter (ALLOW_DUMMY_CONVERTER=true)")
-    else:
+        print("[Desktop] Using DummyVoiceConverter (ALLOW_DUMMY_CONVERTER=true)")
+    elif rvc_available:
         effective_engine = "rvc"
+    else:
+        await websocket.close(code=1013, reason="RVC desktop relay is not configured")
+        return
 
     sessions = getattr(websocket.app.state, "desktop_sessions", None)
     profile = sessions.consume(ticket) if sessions is not None else None

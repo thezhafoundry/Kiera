@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Keira — LiveKit Desktop Relay</title>
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; background: #0d1117; color: #c9d1d9; }
+    h1 { color: #58a6ff; }
+    section { border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem; background: #161b22; }
+    h2 { margin-top: 0; color: #58a6ff; }
+    input, select { padding: 0.5rem; font-size: 1rem; border: 1px solid #30363d; border-radius: 4px; background: #0d1117; color: #c9d1d9; width: 100%; box-sizing: border-box; }
+    button { padding: 0.5rem 1.5rem; font-size: 1rem; cursor: pointer; border: 1px solid #58a6ff; border-radius: 4px; background: #1f2937; color: #58a6ff; margin-right: 0.5rem; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button:hover:not(:disabled) { background: #58a6ff; color: #0d1117; }
+    .status { font-family: ui-monospace, monospace; margin-top: 0.5rem; padding: 0.5rem; border-radius: 4px; background: #0d1117; min-height: 1.5em; }
+    .label { display: block; font-size: 0.85rem; color: #8b949e; margin-bottom: 0.3rem; margin-top: 0.8rem; }
+    .meter { height: 6px; border-radius: 3px; background: #21262d; margin-top: 0.3rem; }
+    .meter-fill { height: 100%; border-radius: 3px; background: #58a6ff; width: 0%; transition: width 0.1s; }
+  </style>
+</head>
+<body>
+  <h1>LiveKit Desktop Relay</h1>
+  <p>One click — your voice is converted and routed to a virtual audio device that WhatsApp (or any app) can use as its microphone.</p>
+
+  <section>
+    <label class="label" for="room-name">Room name:</label>
+    <input id="room-name" value="relay-desktop" autocomplete="off">
+
+    <label class="label" for="output-device">Output device (e.g. VB-Cable):</label>
+    <select id="output-device"></select>
+
+    <label class="label" for="gender">Voice profile:</label>
+    <select id="gender-select">
+      <option value="male">Male</option>
+      <option value="female">Female</option>
+    </select>
+
+    <br><br>
+    <button id="btn-start">Start Relay</button>
+    <button id="btn-stop" disabled>Stop</button>
+    <div id="relay-status" class="status">Not connected.</div>
+  </section>
+
+  <section>
+    <h2>Meters</h2>
+    <div class="label">Input (<span id="input-db">--</span>)</div>
+    <div class="meter"><div id="input-meter" class="meter-fill" style="width: 0%"></div></div>
+    <div class="label" style="margin-top: 1rem;">Converted Output</div>
+    <div class="meter"><div id="output-meter" class="meter-fill" style="width: 0%"></div></div>
+  </section>
+
+  <script src="relay.js"></script>
+</body>
+</html>

@@ -278,7 +278,10 @@ class DesktopAudioBridge:
                 if get_input in done:
                     yield get_input.result()
 
+        _frame_counter = 0
+
         async def receive_input() -> None:
+            nonlocal _frame_counter
             try:
                 while True:
                     frame = await websocket.receive_bytes()
@@ -291,6 +294,14 @@ class DesktopAudioBridge:
 
                     if not input_enabled.is_set():
                         continue
+
+                    _frame_counter += 1
+                    if _frame_counter % 50 == 0:
+                        samples = array.array("h")
+                        samples.frombytes(frame)
+                        energy = sum(s * s for s in samples) / len(samples)
+                        rms = int(math.sqrt(energy)) if energy > 0 else 0
+                        print(f"[DesktopAudioBridge] RMS={rms} (int16, frame #{_frame_counter})")
 
                     if self.input_gain != 1.0:
                         samples = array.array("h")
