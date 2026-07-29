@@ -616,12 +616,16 @@ export class DesktopSetupPage {
       // Only now start the conversion budget. The converter buffers
       // BLOCK_MS+CONTEXT_MS (720ms) before its first inference and returns it
       // ~1.2-1.4s later, so the first frame lands ~1.36s after `ready`.
-      byId('voice-test-result').textContent = 'Speak now — waiting for converted audio…';
+      byId('voice-test-result').textContent = 'Speak now, continuously, for a few seconds — waiting for converted audio…';
       await Promise.race([
         firstAudio,
         new Promise((resolve) => setTimeout(resolve, VOICE_TEST_AUDIO_TIMEOUT_MS)),
       ]);
-      if (!receivedAudio) byId('voice-test-result').textContent = 'No converted audio returned. Check the relay and voice level.';
+      if (!receivedAudio) {
+        byId('voice-test-result').textContent =
+          'No converted audio returned. The converter only produces output from continuous '
+          + 'voiced input — a pause resets the buffering. Try again speaking without pausing.';
+      }
       if (receivedAudio) {
         await new Promise((resolve) => setTimeout(resolve, 150));
         // Cap on waiting for the playout buffer to drain after first audio.
