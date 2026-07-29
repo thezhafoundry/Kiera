@@ -1566,9 +1566,15 @@ async def desktop_audio_websocket(websocket: WebSocket):
     if not ticket:
         await websocket.close(code=1008, reason="Desktop session ticket required")
         return
-    if not RVC_ENDPOINT_URL or not RVC_API_KEY:
-        await websocket.close(code=1013, reason="RVC desktop relay is not configured")
-        return
+    rvc_available = bool(RVC_ENDPOINT_URL) and bool(RVC_API_KEY)
+    if not rvc_available:
+        if not ALLOW_DUMMY_CONVERTER:
+            await websocket.close(code=1013, reason="RVC desktop relay is not configured")
+            return
+        effective_engine = "dummy"
+        print("[Desktop] RVC not configured; using DummyVoiceConverter (ALLOW_DUMMY_CONVERTER=true)")
+    else:
+        effective_engine = "rvc"
 
     sessions = getattr(websocket.app.state, "desktop_sessions", None)
     profile = sessions.consume(ticket) if sessions is not None else None
@@ -1576,26 +1582,34 @@ async def desktop_audio_websocket(websocket: WebSocket):
         await websocket.close(code=1008, reason="Desktop session ticket is invalid or expired")
         return
 
-    pitch_shift = RVC_MALE_PITCH_SHIFT if profile == "male" else 0
-    try:
-        converter = RVCStreamingConverter(
-            endpoint_url=RVC_ENDPOINT_URL,
-            api_key=RVC_API_KEY,
-            pitch_shift=pitch_shift,
-            index_rate=RVC_INDEX_RATE,
-            rms_mix_rate=RVC_RMS_MIX_RATE,
-            protect=RVC_PROTECT,
-            adaptive_pitch=RVC_ADAPTIVE_PITCH,
-            target_f0=RVC_TARGET_F0,
-            connect_timeout=150.0,
-            model_version=RVC_MODEL_VERSION,
-        )
-    except ValueError:
-        await websocket.close(code=1013, reason="RVC desktop relay is not configured")
-        return
+    if effective_engine == "rvc":
+        pitch_shift = RVC_MALE_PITCH_SHIFT if profile == "male" else 0
+        try:
+            converter = RVCStreamingConverter(
+                endpoint_url=RVC_ENDPOINT_URL,
+                api_key=RVC_API_KEY,
+                pitch_shift=pitch_shift,
+                index_rate=RVC_INDEX_RATE,
+                rms_mix_rate=RVC_RMS_MIX_RATE,
+                protect=RVC_PROTECT,
+                adaptive_pitch=RVC_ADAPTIVE_PITCH,
+                target_f0=RVC_TARGET_F0,
+                connect_timeout=150.0,
+                model_version=RVC_MODEL_VERSION,
+            )
+        except ValueError:
+            await websocket.close(code=1013, reason="RVC desktop relay is not configured")
+            return
+    else:
+        converter = DummyVoiceConverter()
 
     await websocket.accept(subprotocol=desktop_protocol)
-    bridge = DesktopAudioBridge(converter, input_gain=DESKTOP_INPUT_GAIN)
+    desktop_suppressor = WebRTCNoiseSuppressor(ns_level=NS_LEVEL)
+    bridge = DesktopAudioBridge(
+        converter,
+        input_gain=DESKTOP_INPUT_GAIN,
+        suppressor=desktop_suppressor,
+    )
     async with contextlib.aclosing(bridge):
         await bridge.run(websocket)
 

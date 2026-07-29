@@ -16,6 +16,7 @@ from typing import Literal
 from fastapi import WebSocket, WebSocketDisconnect
 
 from .converters.base import VoiceConverter
+from .noise.noise_suppressor import NoiseSuppressor
 
 
 INPUT_SAMPLE_RATE = 16000
@@ -133,6 +134,7 @@ class DesktopAudioBridge:
         playout_cushion_bytes: int = PLAYOUT_CUSHION_BYTES,
         playout_max_bytes: int = PLAYOUT_MAX_BYTES,
         input_gain: float = 1.0,
+        suppressor: NoiseSuppressor | None = None,
     ) -> None:
         if input_queue_frames < 1:
             raise ValueError("input_queue_frames must be positive")
@@ -148,6 +150,7 @@ class DesktopAudioBridge:
         self.playout_cushion_bytes = playout_cushion_bytes
         self.playout_max_bytes = playout_max_bytes
         self.input_gain = input_gain
+        self.suppressor = suppressor
         self.input_drop_count = 0
         self.playout_drop_count = 0
         # Bytes handed to websocket.send_bytes for this session. Diagnostic:
@@ -296,6 +299,11 @@ class DesktopAudioBridge:
                             val = int(samples[i] * self.input_gain)
                             samples[i] = max(-32768, min(32767, val))
                         frame = samples.tobytes()
+
+                    if self.suppressor is not None:
+                        left = self.suppressor.process_frame(frame[:320])
+                        right = self.suppressor.process_frame(frame[320:])
+                        frame = left + right
 
                     if input_queue.full():
                         input_queue.get_nowait()
