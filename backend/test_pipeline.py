@@ -972,16 +972,7 @@ async def test_playout_buffer_smooths_bursty_converter_output():
     # RVCStreamingConverter's _MAX_BUFFER_BYTES, applied here to the new
     # playout buffer's class constants instead.
     worker._PLAYOUT_BUFFER_TARGET_BYTES = 3000
-    # Comfortably above the 9000 bytes this test ever injects. With real-time
-    # playout pacing (added alongside the next_publish_time pacer), the
-    # consumer no longer drains near-instantly -- it paces drain to actual
-    # playback duration, so peak buffer occupancy during a burst is now
-    # legitimately higher than under the old "drain as fast as the event
-    # loop allows" behavior. This test is about no-data-loss/cushion-wait,
-    # not the drop-oldest-on-overflow path (that's
-    # test_playout_buffer_drops_oldest_over_cap) -- so the cap here just
-    # needs enough headroom that pacing doesn't spuriously trigger it.
-    worker._PLAYOUT_BUFFER_MAX_BYTES = 20000
+    worker._PLAYOUT_BUFFER_MAX_BYTES = 8000
 
     conversion_task = asyncio.create_task(worker._run_conversion_stream())
     try:
@@ -1027,13 +1018,6 @@ async def test_playout_buffer_drops_oldest_over_cap():
             for i in range(20):
                 yield bytes([i % 256]) * 1000  # 1000 bytes per chunk, 20000 total
                 await asyncio.sleep(0.01)
-            # Keep the duplex stream open after the last chunk, like a real
-            # in-progress call -- otherwise the generator exhausting here
-            # ends _run_conversion_stream naturally, which now flushes and
-            # clears _playout_buffer on the way out (see the teardown fix
-            # in pipeline.py), emptying it before this test's own delayed
-            # inspection below ever runs.
-            await asyncio.sleep(30)
 
     worker = VoiceConversionWorker(
         room_url="ws://unused",

@@ -94,9 +94,9 @@ def _require_modal_auth(authorization: str) -> None:
 # truth) which is mounted into containers so compile_trt / export_onnx can also
 # import these without needing worker.py on the container path.
 try:
-    from modal_deploy.modal_defs import volume, trt_image
+    from modal_deploy.modal_defs import volume, image, trt_image
 except ImportError:   # inside container: modal_deploy package not present
-    from modal_defs import volume, trt_image
+    from modal_defs import volume, image, trt_image
 
 
 # ---- Shared conversion logic (plain Python, no Modal decorators) ----
@@ -305,7 +305,7 @@ class RVCEngine:
             is_male = f0 < 145.0
             pitch_shift = 12 if is_male else 0
             return pitch_shift
-        except Exception:
+        except Exception as e:
             return 0
 
     def run_conversion(
@@ -341,6 +341,8 @@ class RVCEngine:
         if pitch == -1:
             pitch = self._auto_detect_pitch(audio_bytes)
 
+        t1 = time.perf_counter()
+        
         # 2. Extract ContentVec features
         feats_input = np.expand_dims(np.expand_dims(audio, 0), 0)
         vec_input_name = self.vec_session.get_inputs()[0].name
@@ -350,7 +352,9 @@ class RVCEngine:
         feats = vec_outputs[0]
         if feats.shape[1] == 768:
             feats = feats.transpose(0, 2, 1)
-
+        
+        t2 = time.perf_counter()
+        
         # 3. Perform index search and feature blending (numpy)
         feats0 = feats.copy()
         if self.index is not None and self.big_npy is not None and index_rate > 0:
@@ -838,13 +842,12 @@ def _web_function_options(edge: str) -> dict:
         "volumes": {"/root/rvc-models": volume},
         "scaledown_window": 120,
         "region": location["region"],
-        "max_containers": 1,
+        "max_containers": 2,
         "secrets": [modal.Secret.from_name("rvc-api-key")],
         "env": {
             "USE_TRT": "1",
             rp.PROFILE_ENV_VAR: st.PROFILE_NAME,
             "RVC_EDGE_NAME": location["edge_name"],
-            "DEBUG_SAVE_AUDIO": "1",
         },
     }
     if location["routing_region"] is not None:
@@ -1105,7 +1108,7 @@ def main_chunked(
 
 
 @app.local_entrypoint()
-def main(pitch: int = -1, input_file: str = r"D:\Kiera\male_test.wav", output_file: str = ""):
+def main(pitch: int = -1, input_file: str = r"D:\Kiera\test1.wav", output_file: str = ""):
     import struct
 
     print(f"[Test] Input: {input_file} | pitch_shift={pitch} (Note: -1 means auto-detect)")

@@ -98,6 +98,7 @@ def export_hubert():
     import sys
     import fairseq.models.wav2vec.utils as fairseq_utils
     def patched_pad_to_multiple(x, multiple, dim=-1, value=0):
+        import torch
         import torch.nn.functional as F
         try:
             tsz = int(x.shape[dim])
@@ -154,7 +155,7 @@ def export_hubert():
         input_names=["audio"], output_names=["feats"],
         opset_version=OPSET, do_constant_folding=True,
     )
-    print("[Export] hubert.onnx written")
+    print(f"[Export] hubert.onnx written")
 
     rng = np.random.default_rng(0)
     speech = (rng.standard_normal(PADDED_IN) * 0.05).astype(np.float32)[None, :]

@@ -35,7 +35,6 @@
 - Create: `frontend/desktop/capture-worklet.js` — microphone capture, mono mix and 48 kHz-to-16 kHz stream framing.
 - Create: `frontend/desktop/playout-worklet.js` — converted-audio queue, 48 kHz output and silence on underrun.
 - Create: `frontend/desktop/audio_protocol.test.mjs` — deterministic Node tests for frame and resampling helpers.
-- Create: `frontend/desktop/desktop.test.mjs` — deterministic Node seam tests for relay readiness and page-state ordering.
 - Modify: `README.md` — Windows/VB-CABLE desktop setup and run instructions.
 
 ---
@@ -111,7 +110,7 @@ git commit -m "feat: define desktop audio framing contract"
 
 **Interfaces:**
 - `DesktopAudioBridge(converter: VoiceConverter, input_queue_frames: int = 25)`.
-- `DesktopAudioBridge.run(websocket: WebSocket) -> None` first requires `{ "type": "config", "sample_rate_in": 16000, "sample_rate_out": 48000, "frame_ms": 20 }`, then consumes binary 640-byte frames and emits complete converted 960-byte frames plus JSON status/error messages.
+- `DesktopAudioBridge.run(websocket: WebSocket) -> None` consumes binary 640-byte frames and emits complete converted 960-byte frames plus JSON status/error messages.
 - `POST /api/desktop/session` accepts `{ "profile": "male" | "female" }`, requires `Authorization: Bearer <KEIRA_CONTROL_TOKEN>`, and returns `{ "ticket": str, "expires_in": int }`.
 - `WS /api/desktop/audio` accepts the ticket as `keira-desktop.<ticket>` in `Sec-WebSocket-Protocol`; it never accepts a ticket from a query parameter.
 
@@ -152,8 +151,7 @@ git commit -m "feat: add authenticated desktop audio relay"
 
 **Interfaces:**
 - `mixToMono(channels: Float32Array[]) -> Float32Array`.
-- `createDownsampleState() -> DownsampleState` returns caller-owned filter history for one capture stream.
-- `downsample48kTo16k(input: Float32Array, state: DownsampleState) -> Float32Array` preserves stream state through the supplied state, applies a fixed 3:1 low-pass polyphase filter with a 7.2 kHz cutoff, and emits the exact output sample count for complete input groups.
+- `downsample48kTo16k(input: Float32Array) -> Float32Array` preserves stream state through a caller-owned carry buffer, applies a fixed 3:1 low-pass polyphase filter with a 7.2 kHz cutoff, and emits the exact output sample count for complete input groups.
 - `float32ToPcm16(input: Float32Array) -> Uint8Array` uses little-endian signed 16-bit PCM with clipping to `[-1, 1]`.
 - `pcm16ToFloat32(input: ArrayBuffer) -> Float32Array` decodes little-endian signed 16-bit PCM.
 - `takeFrames(buffer: Float32Array, frameSamples: number) -> { frames: Float32Array[], remainder: Float32Array }` never returns a partial frame.
@@ -214,7 +212,7 @@ Decode incoming PCM into a bounded Float32 queue, drain at 48 kHz, and fill ever
 
 - [ ] **Step 4: Add the client WebSocket and AudioContext graph**
 
-Open `wss://<current-host>/api/desktop/audio` with `keira-desktop.<ticket>` as the subprotocol, send `{ type: "config", sample_rate_in: 16000, sample_rate_out: 48000, frame_ms: 20 }` before binary frames, send binary capture frames, post returned PCM to the playout worklet, and set the `AudioContext` sink to the selected `CABLE Input` device when `setSinkId` is available. On any close/error, disconnect the graph and leave the playout node producing silence.
+Open `wss://<current-host>/api/desktop/audio` with `keira-desktop.<ticket>` as the subprotocol, send the JSON configuration before binary frames, send binary capture frames, post returned PCM to the playout worklet, and set the `AudioContext` sink to the selected `CABLE Input` device when `setSinkId` is available. On any close/error, disconnect the graph and leave the playout node producing silence.
 
 - [ ] **Step 5: Run protocol tests and a local browser smoke test**
 
@@ -235,7 +233,6 @@ git commit -m "feat: add desktop audio worklets and client"
 - Create: `frontend/desktop/index.html`
 - Create: `frontend/desktop/desktop.css`
 - Modify: `frontend/desktop/desktop.js`
-- Create: `frontend/desktop/desktop.test.mjs`
 
 **Interfaces:**
 - `POST /api/desktop/session` is called with the in-memory control token.
@@ -260,9 +257,7 @@ Before starting, obtain a fresh ticket with `fetch('/api/desktop/session', { met
 
 - [ ] **Step 5: Run the frontend smoke test**
 
-Run: `node --test frontend/desktop/desktop.test.mjs frontend/desktop/audio_protocol.test.mjs`.
-
-Then run the server with `uvicorn backend.main:app --reload --port 8000`, open `http://localhost:8000/desktop/`, and verify the complete state transitions with a fake or configured Modal endpoint. Expected: no browser console errors, no raw-audio playback path, and clean Stop/restart behavior.
+Run the server with `uvicorn backend.main:app --reload --port 8000`, open `http://localhost:8000/desktop/`, and verify the complete state transitions with a fake or configured Modal endpoint. Expected: no browser console errors, no raw-audio playback path, and clean Stop/restart behavior.
 
 - [ ] **Step 6: Commit the page**
 
