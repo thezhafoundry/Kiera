@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import array
 import hashlib
 import asyncio
 import contextlib
@@ -131,6 +132,7 @@ class DesktopAudioBridge:
         readiness_timeout: float = READINESS_TIMEOUT_SECONDS,
         playout_cushion_bytes: int = PLAYOUT_CUSHION_BYTES,
         playout_max_bytes: int = PLAYOUT_MAX_BYTES,
+        input_gain: float = 1.0,
     ) -> None:
         if input_queue_frames < 1:
             raise ValueError("input_queue_frames must be positive")
@@ -145,6 +147,7 @@ class DesktopAudioBridge:
         self.readiness_timeout = readiness_timeout
         self.playout_cushion_bytes = playout_cushion_bytes
         self.playout_max_bytes = playout_max_bytes
+        self.input_gain = input_gain
         self.input_drop_count = 0
         self.playout_drop_count = 0
         # Bytes handed to websocket.send_bytes for this session. Diagnostic:
@@ -285,6 +288,14 @@ class DesktopAudioBridge:
 
                     if not input_enabled.is_set():
                         continue
+
+                    if self.input_gain != 1.0:
+                        samples = array.array("h")
+                        samples.frombytes(frame)
+                        for i in range(len(samples)):
+                            val = int(samples[i] * self.input_gain)
+                            samples[i] = max(-32768, min(32767, val))
+                        frame = samples.tobytes()
 
                     if input_queue.full():
                         input_queue.get_nowait()

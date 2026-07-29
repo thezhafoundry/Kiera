@@ -225,6 +225,11 @@ RVC_ADAPTIVE_PITCH = os.getenv("RVC_ADAPTIVE_PITCH", "1") == "1"
 # (mi-test: ~208, measured 2026-07-08 from a known-good output).
 RVC_TARGET_F0 = float(os.getenv("RVC_TARGET_F0", "208"))
 
+# Gain applied to desktop mic audio before sending to the RVC converter. Desktop
+# mic levels tend to be quieter than phone/LiveKit paths. 3.0 brings ~5-20% RMS
+# input up to ~15-60%, matching the range the RVC model expects for clear output.
+DESKTOP_INPUT_GAIN = float(os.getenv("DESKTOP_INPUT_GAIN", "3.0"))
+
 DUMMY_MODEL_VERSION = "dummy-development"
 # WebRTC noise-suppression aggressiveness [0..4]. Level 3 was gutting high-frequency
 # voice detail (sibilance/consonants HuBERT needs) BEFORE the model saw it —
@@ -1590,7 +1595,7 @@ async def desktop_audio_websocket(websocket: WebSocket):
         return
 
     await websocket.accept(subprotocol=desktop_protocol)
-    bridge = DesktopAudioBridge(converter)
+    bridge = DesktopAudioBridge(converter, input_gain=DESKTOP_INPUT_GAIN)
     async with contextlib.aclosing(bridge):
         await bridge.run(websocket)
 

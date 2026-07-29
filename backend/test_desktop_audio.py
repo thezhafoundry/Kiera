@@ -514,8 +514,9 @@ def test_desktop_audio_websocket_consumes_subprotocol_ticket(monkeypatch):
             captured["converter"] = kwargs
 
     class StubBridge:
-        def __init__(self, converter) -> None:
+        def __init__(self, converter, **kwargs) -> None:
             captured["bridge_converter"] = converter
+            captured["bridge_kwargs"] = kwargs
 
         async def run(self, websocket) -> None:
             await websocket.send_json({"type": "ready"})
