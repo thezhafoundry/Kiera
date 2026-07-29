@@ -1105,7 +1105,7 @@ def main_chunked(
 
 
 @app.local_entrypoint()
-def main(pitch: int = -1, input_file: str = r"D:\Kiera\test1.wav", output_file: str = ""):
+def main(pitch: int = -1, input_file: str = r"D:\Kiera\male_test.wav", output_file: str = ""):
     import struct
 
     print(f"[Test] Input: {input_file} | pitch_shift={pitch} (Note: -1 means auto-detect)")
