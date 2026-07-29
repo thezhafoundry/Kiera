@@ -76,7 +76,16 @@ class RVCStreamingConverter(VoiceConverter):
         index_rate: float = 0.75,
         rms_mix_rate: float = 0.75,
         protect: float = 0.33,
-        connect_timeout: float = 10.0,
+        # Modal's /ws opening handshake is far slower than its /health reply:
+        # measured 2026-07-29 against a WARM container (health answered in
+        # ~1s), the WS handshake took 18.4s. At the previous 10s the connect
+        # timed out on every attempt, so `_connection_loop` reconnected
+        # forever, every input frame fell into the 500ms reconnect buffer and
+        # was dropped, and the session produced ZERO converted audio while
+        # still reporting ready. Keep this comfortably above the measured
+        # figure -- it is a ceiling, not a delay: a fast handshake returns
+        # immediately.
+        connect_timeout: float = 45.0,
         adaptive_pitch: bool = False,
         target_f0: float = 208.0,
         output_queue_max_chunks: int = DEFAULT_OUTPUT_QUEUE_MAX_CHUNKS,
