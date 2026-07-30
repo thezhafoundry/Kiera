@@ -745,7 +745,7 @@ from a log message's wording rather than reading the source that emits it. Readi
 `selector_events.py` took two minutes and immediately invalidated both. Read the emitting
 source before patching an unfamiliar runtime warning.
 
-**Fixed (uncommitted as of 2026-07-29): `RVCStreamingConverter`'s WS `connect_timeout`
+**Fixed (committed 2026-07-29, `RVCStreamingConverter`'s WS `connect_timeout`
 default (10s) was silently below Modal's real `/ws` handshake latency, producing a
 "resolved" call with zero converted audio.** Modal's `/health` endpoint answering fast
 (~1s on a warm container) does not mean the `/ws` handshake is equally fast — measured
@@ -755,4 +755,62 @@ landed in the 500ms reconnect buffer and was dropped there, and the session repo
 while producing no converted audio at all — a fail-closed policy failing in a way that
 looked like silence, not an error. Raised the default to 45s
 (`backend/converters/rvc_stream.py`) as a ceiling, not an added delay, since a fast
-handshake still returns immediately. Not yet committed — see `git diff` on that file.
+handshake still returns immediately. Survived a same-day chain of unrelated reverts
+(agent explicitly re-applied it after each checkout that would otherwise have reset it
+to 10s — see the 2026-07-29 revert-chain entry below) and is live on `main`.
+
+## 2026-07-29 (evening) — Revert chain for a "voice not clear" complaint; wrong root cause chased three times before the real one was found
+
+**Symptom reported same day, twice, worsening in description each time**: first "lost
+clarity in the output voice" on a PSTN call, then — after three code reverts attempting
+to fix it — "not at all clear" / "like the ummmmm bzzzzzzz sound." The three reverts
+(playout-pacer → desktop/livekit-relay feature → the whole desktop voice-changer feature
++ `KEIRA_CONTROL_TOKEN` gate) were all **client-side/Render-side** changes requested by
+the user based on a hunch about when the regression started, not derived from evidence.
+None of them addressed the actual cause and the second report came in worse, not better —
+by the time of the second report, `origin/main`/Render had two of the three reverts live
+(`b8b435d`, `d370b58`); the third (`21d537d`) was local-only.
+
+**Root cause, found by isolating the live-call path entirely**: an offline replay
+(`modal run modal_deploy/worker.py::main_chunked --pitch 7 --use-trt 1 --adaptive 1`,
+no LiveKit/SIP/network/pipeline.py involved at all) reproduced the exact same buzz —
+proving in one step that none of the three reverted subsystems (playout buffer, pitch
+lock, desktop feature) were ever the cause, and that this predated all of today's
+revert chain (confirmed against an offline file generated *before* any revert). The
+actual cause: `SineGen._f02sine`'s `rand_ini` phase offset
+(`RVC/infer/lib/infer_pack/models_onnx.py`) was hardcoded to zero every block (a
+TRT-Myelin-compatibility shim from the original TRT migration, see the "Load-bearing
+gotchas" TRT section below) — this subsystem-notes file previously described that as
+"lower perceptual impact than the unvoiced-noise bug, not yet revisited" (now corrected
+below). A fixed-zero phase offset makes the voiced harmonic excitation **perfectly
+periodic block-to-block**, which is audible as a steady tonal buzz/drone, not the more
+plausible-sounding "hissing on breaths" the unvoiced-noise bug produced. **Fixed by the
+user directly (commit `3f28944`, "changes in onnx"), same externalize-as-input pattern
+already used for `sine_noise`**: `rand_ini` now threaded as a real parameter through
+`SineGen.forward`/`_f02sine` → `SourceModuleHnNSF` → `GeneratorNSF` →
+`SynthesizerTrnMsNSFsidM`, exported as a genuine ONNX graph input
+(`modal_deploy/export_onnx.py`), and generated fresh per-block from the same numpy RNG
+`trt_pipeline.py` already uses for `sine_noise`/`rnd`. **Requires a fresh ONNX export +
+TRT engine rebuild + `modal deploy` to take effect live — not confirmed deployed as of
+this writing**, since none of that is visible from git state; verify `/health`'s
+`trt_cache`/`model_version` and a live listen test before treating this as resolved on
+production.
+
+**After the fix commit, the user separately reverted all three of the earlier
+reverts** (commit `ec46071`, "Undo all three reverts: restore to 5ea04b3, before
+livekit-relay page") — restoring the playout pacer, the desktop voice-changer feature,
+and the `KEIRA_CONTROL_TOKEN` removal, none of which were ever the actual cause. Do not
+re-propose reverting any of those three subsystems for a "voice clarity" complaint
+without first ruling out the vocoder/TRT layer via an offline replay — that one check
+would have saved three reverts' worth of unnecessary churn and risk (the control-token
+revert in particular would have required a matching Render env var and reintroduced a
+previously-removed auth gate for no benefit).
+
+**Process lesson**: three fix attempts against the same symptom with no improvement is
+the documented threshold (see `superpowers:systematic-debugging`) to stop
+adjusting the current hypothesis and re-derive from evidence instead of user recollection
+of "when did this last work." The offline replay tool
+(`modal_deploy/worker.py::main_chunked`, see "Offline diagnostic tooling" below) exists
+specifically to isolate the vocoder/TRT layer from the live call path in under 2 minutes
+— it should be an early check for any voice-quality complaint, not a last resort after
+exhausting the client-side stack.

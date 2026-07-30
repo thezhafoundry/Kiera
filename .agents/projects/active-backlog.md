@@ -29,7 +29,7 @@
 | **`/api/setup` must preserve the inbound `;edge=singapore` pin** on future reconciliation. | Medium | Open, identified 2026-07-08 |
 | **`RVC_MALE_PITCH_SHIFT=7` is calibrated to one agent**; continue validating adaptive pitch behavior and the audible transition. | Medium | Open, identified 2026-07-08 |
 | Verify the standing playout-buffer/bigger-block fix eliminates part-by-part audio on a live call. | High | Open, identified 2026-07-03 |
-| Re-verify TRT live deployment, C4 offline A/B WAVs, and C5 listen test. | High | Open, identified 2026-07-07 |
+| Re-verify TRT live deployment, C4 offline A/B WAVs, and C5 listen test. **Now blocking a real bug, not just routine verification**: `rand_ini` fix (commit `3f28944`, 2026-07-29) needs a fresh ONNX export + TRT engine rebuild + `modal deploy` before it's live — confirm via `/health`'s `trt_cache`/`model_version` and a real listen test for the "ummmmm bzzzzzzz" tonal buzz specifically (see [[log]] 2026-07-29 evening entry). | High | Open, identified 2026-07-07; rand_ini fix committed 2026-07-29, deploy/verification still pending |
 | Avoid Render `autoDeploy: commit` killing in-flight calls mid-test; add drain/graceful shutdown later. | Medium | Open, identified 2026-07-02 |
 | Compile RNNoise / get `webrtc-noise-gain` MSVC build working on Windows. | Low | Open |
 | **Adaptive pitch lock**: one-second prior→locked interpolation is implemented, deployed in Modal v11, and covered by tests; listen-test the transition and revalidate `RVC_TARGET_F0=208`. | High | Live listening follow-up open |

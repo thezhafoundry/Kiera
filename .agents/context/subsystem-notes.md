@@ -500,8 +500,19 @@ Merged to main (`b9df41f`). `modal deploy` required to go live on worker.
   generated in `trt_pipeline.py` per block and passed in as an ONNX **input** rather than
   generated inside the graph — same trick already used for the generator's `rnd` reparam
   input, sidesteps TRT Myelin's RandomNormal restriction without losing the stochasticity.
-  `SineGen._f02sine`'s initial-phase offset (`rand_ini`) is still zeroed/deterministic
-  (lower perceptual impact than the unvoiced-noise bug; not yet revisited).
+  **Update (found 2026-07-29, fixed same day, commit `3f28944`): the zeroed `rand_ini`
+  phase offset was NOT lower-impact — it was the dominant audible artifact, not the
+  unvoiced-noise bug above.** A fixed-zero phase makes the voiced harmonic excitation
+  perfectly periodic block-to-block, heard as a steady tonal buzz/drone ("ummmmm
+  bzzzzzzz"), reproduced with an offline replay with no live call involved at all
+  (isolating it from network/buffering/pitch-lock entirely — see [[log]] 2026-07-29
+  evening entry for the full misdiagnosis chain before this was found). Fixed the same
+  way as `sine_noise` above: `rand_ini` threaded as a real `SineGen`/`SourceModuleHnNSF`/
+  `GeneratorNSF`/`SynthesizerTrnMsNSFsidM` parameter, exported as a genuine ONNX input
+  (`modal_deploy/export_onnx.py`), generated fresh per-block in `trt_pipeline.py` from
+  the same RNG as `sine_noise`/`rnd`. **Requires a fresh ONNX export + TRT engine
+  rebuild + `modal deploy` before this is live** — check `/health`'s `trt_cache`/
+  `model_version` and do a live listen test before assuming production has it.
 
 ### Load-bearing gotchas
 Load-bearing gotchas found during the three review rounds:
