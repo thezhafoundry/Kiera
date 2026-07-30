@@ -488,6 +488,9 @@ async def _wait_for_rvc_ready(max_wait_seconds: float = 360.0, poll_interval: fl
                     print(f"[RVC Warmup] GPU booting, model loading... Retrying... ({elapsed:.0f}/{max_wait_seconds:.0f}s elapsed)")
                     await asyncio.sleep(poll_interval)
                     continue
+                if data.get("status") == "degraded":
+                    print(f"[RVC Warmup] DEGRADED: TRT init failed, worker fell back to onnx-cuda: {data}")
+                    return {"status": "error", "message": f"RVC engine degraded (onnx-cuda fallback): {data.get('trt_error')}", "rvc_status": data}
                 print(f"[RVC Warmup] SUCCESS: {data}")
                 return {"status": "success", "message": "GPU warmed up successfully.", "rvc_status": data}
             else:

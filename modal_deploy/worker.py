@@ -116,6 +116,11 @@ class RVCEngine:
         self.engine_kind = "onnx-cuda"   # "onnx-cuda" (fallback) or "trt"
         self._trt_cache_hot = False
         self.model_version = "unknown"
+        # Set only when USE_TRT=1 was requested but init failed and we fell back to
+        # onnx-cuda — distinguishes "onnx-cuda is the intended profile" from "TRT broke
+        # and we're silently serving a possibly-stale fallback engine".
+        self.trt_degraded = False
+        self.trt_error = None
 
     def startup(self):
         import glob
@@ -250,6 +255,8 @@ class RVCEngine:
                 print(f"[TRT] init FAILED ({e}) -- falling back to onnx-cuda path")
                 self.trt_pipe = None
                 self.engine_kind = "onnx-cuda"
+                self.trt_degraded = True
+                self.trt_error = f"{type(e).__name__}: {e}"
 
         # A1: Fail-closed — at least one engine must be ready before reporting healthy.
         # This guard runs after the TRT branch so `ready` truly means "an engine works".
@@ -520,13 +527,18 @@ def _build_web_app():
         device_name = "None"
         if torch.cuda.is_available():
             device_name = torch.cuda.get_device_name(0)
+        status = "loading"
+        if engine.ready:
+            status = "degraded" if engine.trt_degraded else "ready"
         return {
-            "status": "ready" if engine.ready else "loading",
+            "status": status,
             "model": "mi-test.pth",
             "cuda_available": torch.cuda.is_available(),
             "cuda_device": device_name,
             "rvc_device": "cuda" if torch.cuda.is_available() else "cpu",
             "engine": engine.engine_kind,
+            "trt_degraded": engine.trt_degraded,
+            "trt_error": engine.trt_error,
             "model_version": engine.model_version,
             "edge": os.getenv("RVC_EDGE_NAME", "unknown"),
             "container_region": os.getenv("MODAL_REGION", "unknown"),
