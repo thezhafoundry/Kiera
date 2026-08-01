@@ -28,10 +28,11 @@ READINESS_TIMEOUT_SECONDS = 150.0
 # 48kHz mono 16-bit: how many bytes represent one second of playout audio.
 OUTPUT_BYTES_PER_SECOND = OUTPUT_SAMPLE_RATE * 2
 # Standing cushion held before the first frame is written, absorbing the
-# converter's bursty arrival timing. Bumped from 0.25s (the LiveKit path's
-# _PLAYOUT_BUFFER_TARGET_BYTES) to 0.5s 2026-08-02: live desktop testing
-# showed the buffer repeatedly draining to zero between GPU bursts even at
-# 0.25s, audible as recurring breakup -- see .agents/decisions/log.md.
+# converter's bursty arrival timing. 0.5s (2026-08-02) fixed a confirmed
+# breakup from buffer underrun at 0.25s -- see .agents/decisions/log.md.
+# EXPERIMENTAL 2026-08-02: dropped to 0.05s to test how far latency can come
+# down before breakup returns. Expected to reintroduce underrun; not yet
+# field-confirmed either way.
 PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.05)
 # Hard cap on held backlog; oldest audio is dropped beyond this so a persistent
 # stall grows delay only up to a bound.
