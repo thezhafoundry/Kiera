@@ -814,3 +814,34 @@ of "when did this last work." The offline replay tool
 specifically to isolate the vocoder/TRT layer from the live call path in under 2 minutes
 — it should be an early check for any voice-quality complaint, not a last resort after
 exhausting the client-side stack.
+
+## Desktop playout cushion raised 0.25s → 0.5s (2026-08-02, `backend/desktop_audio.py`)
+
+**Symptom**: recurring, intermittent voice breakup on the desktop VC-Cable→WhatsApp path
+("aaah eeeh oooh"-style vowel babble bursts, not a one-time failure) — user-reported
+across multiple live WhatsApp calls and a Windows Sound Recorder isolation test.
+
+**Isolation, following the process lesson above**: an offline replay
+(`modal run modal_deploy/worker.py::main_chunked --pitch 12 --use-trt 1 --adaptive 1`
+against `male_test.wav`) came back completely clean — steady ~50-53ms/block TRT timings
+across ~63 blocks, sane adaptive-pitch lock (+12.00 st, median F0=113.8Hz, matched the
+prior exactly), natural RMS envelope with no dropouts. This ruled out the GPU/TRT/vocoder
+layer in one step, same as the 2026-07-29 `rand_ini` incident above — the bug is
+live-path-only, not reproducible from a static file.
+
+**Root cause, confirmed via the desktop page's own "Playout buffer" stat**: the buffer
+was observed climbing then repeatedly hitting **zero** during a live session — i.e. the
+server-side playout cushion (`PLAYOUT_CUSHION_BYTES`, 0.25s) was fully draining between
+bursts of converter output, exactly the bursty-arrival failure mode the cushion exists to
+absorb, just not sized large enough for this path's actual burst gaps. Every zero-out is
+an audible dropout/reentry glitch, consistent with the reported symptom.
+
+**Fix**: raised `PLAYOUT_CUSHION_BYTES` from 0.25s to 0.5s — a moderate first step per
+user's request to stay close to an 800ms total-latency budget rather than jumping straight
+to 0.8-1.0s. All 26 `backend/test_desktop_audio.py` tests pass unchanged. **Not yet
+field-confirmed** — needs a live re-test (WhatsApp or Sound Recorder) checking both for
+recurring breakup and the "Playout drops"/"Playout buffer" stats before this is considered
+resolved. If 0.5s still isn't enough, the next step is the same cushion further up, not a
+different mechanism — the pacer/cushion design itself (mirrored from
+`backend/pipeline.py`'s LiveKit-path fix) is confirmed working, just needs sizing to this
+path's actual burst profile.
