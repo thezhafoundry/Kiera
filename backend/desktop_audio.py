@@ -32,7 +32,7 @@ OUTPUT_BYTES_PER_SECOND = OUTPUT_SAMPLE_RATE * 2
 # _PLAYOUT_BUFFER_TARGET_BYTES) to 0.5s 2026-08-02: live desktop testing
 # showed the buffer repeatedly draining to zero between GPU bursts even at
 # 0.25s, audible as recurring breakup -- see .agents/decisions/log.md.
-PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.5)
+PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.05)
 # Hard cap on held backlog; oldest audio is dropped beyond this so a persistent
 # stall grows delay only up to a bound.
 PLAYOUT_MAX_BYTES = int(OUTPUT_BYTES_PER_SECOND * 5)
