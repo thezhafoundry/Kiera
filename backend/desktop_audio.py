@@ -7,6 +7,7 @@ import hashlib
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import secrets
 import threading
@@ -18,6 +19,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from .converters.base import VoiceConverter
 from .noise.noise_suppressor import NoiseSuppressor
+
+logger = logging.getLogger(__name__)
 
 
 INPUT_SAMPLE_RATE = 16000
@@ -301,8 +304,24 @@ class DesktopAudioBridge:
                     yield get_input.result()
 
         async def receive_input() -> None:
+            # TEMPORARY diagnostic instrumentation (2026-08-02): measuring
+            # whether event-loop stalls (gain loop, the native NS call, or
+            # something else on this single-worker instance) explain live
+            # input_drop_count > 0. Logs only outliers, not every frame, to
+            # avoid flooding Render logs. Remove once the cause is confirmed
+            # and fixed -- see .agents/decisions/log.md.
+            last_loop_at: Optional[float] = None
             try:
                 while True:
+                    loop_entered_at = time.monotonic()
+                    if last_loop_at is not None:
+                        gap_ms = (loop_entered_at - last_loop_at) * 1000.0
+                        if gap_ms > 40.0:
+                            logger.warning(
+                                "[Desktop][Diag] loop gap %.1fms (expected ~20ms) "
+                                "-- event loop stalled between frames",
+                                gap_ms,
+                            )
                     message = await websocket.receive()
                     if message.get("type") == "websocket.disconnect":
                         client_disconnected.set()
@@ -337,6 +356,7 @@ class DesktopAudioBridge:
                     if not input_enabled.is_set():
                         continue
 
+                    processing_started_at = time.monotonic()
                     if self.input_gain != 1.0:
                         samples = array.array("h")
                         samples.frombytes(frame)
@@ -344,11 +364,24 @@ class DesktopAudioBridge:
                             val = int(samples[i] * self.input_gain)
                             samples[i] = max(-32768, min(32767, val))
                         frame = samples.tobytes()
+                    gain_done_at = time.monotonic()
 
                     if self.suppressor is not None:
                         left = self.suppressor.process_frame(frame[:320])
                         right = self.suppressor.process_frame(frame[320:])
                         frame = left + right
+                    suppressor_done_at = time.monotonic()
+
+                    gain_ms = (gain_done_at - processing_started_at) * 1000.0
+                    suppressor_ms = (suppressor_done_at - gain_done_at) * 1000.0
+                    if gain_ms + suppressor_ms > 15.0:
+                        logger.warning(
+                            "[Desktop][Diag] slow frame processing: gain=%.1fms "
+                            "suppressor=%.1fms",
+                            gain_ms,
+                            suppressor_ms,
+                        )
+                    last_loop_at = time.monotonic()
 
                     if input_queue.full():
                         input_queue.get_nowait()
