@@ -260,6 +260,7 @@ function makeVoiceTestPage(client) {
     'reconnect-count': { textContent: '' },
     'call-timer': { textContent: '' },
     'latency-network': { textContent: '' },
+    'latency-accumulation': { textContent: '' },
     'latency-infer': { textContent: '' },
     'latency-hubert': { textContent: '' },
     'latency-index': { textContent: '' },

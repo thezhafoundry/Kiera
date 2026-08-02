@@ -124,8 +124,20 @@ export class DesktopAudioClient {
       this.bindWorklets();
 
       this.socket = await this.openSocket(ticket);
+      // Capture RAW mic audio: the browser's default noiseSuppression and
+      // autoGainControl strip high-frequency detail the RVC model needs and
+      // stack with the server-side WebRTCNoiseSuppressor, compounding into
+      // the same muffled-output regression measured on the LiveKit path
+      // 2026-07-08 (frontend/app.js) -- this path never got that fix until
+      // now. echoCancellation stays on: WhatsApp's own call audio plays
+      // through system speakers/headphones near this mic.
       this.stream = await this.mediaDevices.getUserMedia({
-        audio: inputDeviceId ? { deviceId: { exact: inputDeviceId } } : true,
+        audio: {
+          ...(inputDeviceId ? { deviceId: { exact: inputDeviceId } } : {}),
+          noiseSuppression: false,
+          autoGainControl: false,
+          echoCancellation: true,
+        },
       });
       this.source = this.context.createMediaStreamSource(this.stream);
       this.source.connect(this.captureNode);
@@ -398,11 +410,13 @@ export class DesktopSetupPage {
     this.callTimerIntervalId = null;
     this.callStartedAt = 0;
     this.latencySamples = this.emptyLatencySamples();
+    this.accumulationMs = null;
   }
 
   emptyLatencySamples() {
     return {
       network: { sum: 0, count: 0 },
+      accumulation: { sum: 0, count: 0 },
       infer: { sum: 0, count: 0 },
       playout: { sum: 0, count: 0 },
       total: { sum: 0, count: 0 },
@@ -646,11 +660,24 @@ export class DesktopSetupPage {
       this.recordLatencySample('playout', meters.bufferMs);
     }
 
+    // block_ms + context_ms is the block-ACCUMULATION wait: how long the
+    // converter holds incoming audio before it has enough to run inference
+    // at all. This is the dominant mouth-to-ear term (400-720ms depending on
+    // profile) and was previously missing from the total entirely -- that
+    // omission is why this panel showed ~100ms while a stopwatch showed ~2s.
+    // infer_ms is GPU compute time only, a much smaller number on top of it.
+    if ('block_ms' in meters && 'context_ms' in meters) {
+      this.accumulationMs = meters.block_ms + meters.context_ms;
+      byId('latency-accumulation').textContent = formatMs(this.accumulationMs);
+      this.recordLatencySample('accumulation', this.accumulationMs);
+    }
+
     const network = this.client?.networkRttMs;
     const infer = this.client?.meters?.infer_ms;
     const playout = this.client?.meters?.bufferMs;
-    if ([network, infer, playout].some((value) => typeof value === 'number')) {
-      const total = (network || 0) + (infer || 0) + (playout || 0);
+    const accumulation = this.accumulationMs;
+    if ([network, infer, playout, accumulation].some((value) => typeof value === 'number')) {
+      const total = (network || 0) + (accumulation || 0) + (infer || 0) + (playout || 0);
       byId('latency-total').textContent = formatMs(total);
       this.recordLatencySample('total', total);
     }
@@ -676,6 +703,7 @@ export class DesktopSetupPage {
     const seconds = String(totalSeconds % 60).padStart(2, '0');
     byId('summary-duration').textContent = `${minutes}:${seconds}`;
     byId('summary-network').textContent = formatMs(this.averageOf('network'));
+    byId('summary-accumulation').textContent = formatMs(this.averageOf('accumulation'));
     byId('summary-infer').textContent = formatMs(this.averageOf('infer'));
     byId('summary-playout').textContent = formatMs(this.averageOf('playout'));
     byId('summary-total').textContent = formatMs(this.averageOf('total'));
@@ -686,6 +714,7 @@ export class DesktopSetupPage {
   startCallTimer() {
     this.callStartedAt = performance.now();
     this.latencySamples = this.emptyLatencySamples();
+    this.accumulationMs = null;
     byId('call-summary-card').hidden = true;
     this.updateCallTimer();
     this.callTimerIntervalId = setInterval(() => this.updateCallTimer(), 250);
