@@ -30,7 +30,20 @@
       <section class="card telemetry"><h2>Live telemetry</h2>
         <div class="meter"><div><span>Input</span><strong id="input-meter-value">0%</strong></div><div class="meter-track"><i id="input-meter-fill"></i></div></div>
         <div class="meter"><div><span>Converted output</span><strong id="output-meter-value">0%</strong></div><div class="meter-track"><i id="output-meter-fill"></i></div></div>
-        <dl><div><dt>Voice-test latency</dt><dd id="voice-test-latency">Shown after test</dd></div><div><dt>Playout buffer</dt><dd id="playout-buffer">0 ms</dd></div><div><dt>Relay reconnects</dt><dd id="reconnect-count">0</dd></div><div><dt>Input drops</dt><dd id="input-drops">0</dd></div><div><dt>Playout drops</dt><dd id="playout-drops">0</dd></div></dl>
+        <dl><div><dt>Call timer</dt><dd id="call-timer">00:00</dd></div><div><dt>Voice-test latency</dt><dd id="voice-test-latency">Shown after test</dd></div><div><dt>Playout buffer</dt><dd id="playout-buffer">0 ms</dd></div><div><dt>Relay reconnects</dt><dd id="reconnect-count">0</dd></div><div><dt>Input drops</dt><dd id="input-drops">0</dd></div><div><dt>Playout drops</dt><dd id="playout-drops">0</dd></div></dl>
+      </section>
+      <section class="card telemetry"><h2>Live latency breakdown</h2>
+        <dl>
+          <div><dt>Network round-trip</dt><dd id="latency-network">--</dd></div>
+          <div><dt>GPU inference (total)</dt><dd id="latency-infer">--</dd></div>
+          <div><dt>&nbsp;&nbsp;HuBERT</dt><dd id="latency-hubert">--</dd></div>
+          <div><dt>&nbsp;&nbsp;FAISS index</dt><dd id="latency-index">--</dd></div>
+          <div><dt>&nbsp;&nbsp;RMVPE pitch</dt><dd id="latency-rmvpe">--</dd></div>
+          <div><dt>&nbsp;&nbsp;Generator</dt><dd id="latency-generator">--</dd></div>
+          <div><dt>&nbsp;&nbsp;Post-process</dt><dd id="latency-postproc">--</dd></div>
+          <div><dt>Playout buffer (held)</dt><dd id="latency-playout">--</dd></div>
+          <div><dt>Estimated mouth-to-ear</dt><dd id="latency-total">--</dd></div>
+        </dl>
       </section>
     </div>
     <section class="card instructions"><h2>WhatsApp Desktop setup</h2><ol><li>Install VB-CABLE, then reopen this page in current Chrome or Edge on Windows.</li><li>Select your physical microphone and <strong>CABLE Input</strong> as the converted output above.</li><li>In WhatsApp Desktop, set <strong>Microphone</strong> to <strong>CABLE Output</strong>; keep its speaker set to your headphones.</li><li>Start conversion before your call. If the relay interrupts, Keira closes it and sends no raw microphone audio.</li></ol></section>

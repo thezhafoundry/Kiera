@@ -6,6 +6,7 @@ import array
 import hashlib
 import asyncio
 import contextlib
+import json
 import math
 import secrets
 import threading
@@ -33,7 +34,7 @@ OUTPUT_BYTES_PER_SECOND = OUTPUT_SAMPLE_RATE * 2
 # EXPERIMENTAL 2026-08-02: dropped to 0.05s to test how far latency can come
 # down before breakup returns. Expected to reintroduce underrun; not yet
 # field-confirmed either way.
-PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.05)
+PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.1)
 # Hard cap on held backlog; oldest audio is dropped beyond this so a persistent
 # stall grows delay only up to a bound.
 PLAYOUT_MAX_BYTES = int(OUTPUT_BYTES_PER_SECOND * 5)
@@ -284,7 +285,30 @@ class DesktopAudioBridge:
         async def receive_input() -> None:
             try:
                 while True:
-                    frame = await websocket.receive_bytes()
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        client_disconnected.set()
+                        return
+
+                    text = message.get("text")
+                    if text is not None:
+                        # Latency-panel RTT probe: echo the client's timestamp
+                        # back unchanged so it can measure round-trip time
+                        # without touching the fixed-size binary audio frames.
+                        try:
+                            payload = json.loads(text)
+                        except ValueError:
+                            continue
+                        if payload.get("type") == "ping":
+                            async with send_lock:
+                                await websocket.send_json(
+                                    {"type": "pong", "t": payload.get("t")}
+                                )
+                        continue
+
+                    frame = message.get("bytes")
+                    if frame is None:
+                        continue
                     try:
                         validate_input_frame(frame)
                     except ValueError as exc:

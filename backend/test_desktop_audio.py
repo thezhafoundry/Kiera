@@ -43,6 +43,24 @@ class FakeWebSocket:
             raise ValueError("expected JSON config")
         return message
 
+    async def receive(self) -> dict:
+        """ASGI-shaped receive, matching Starlette's WebSocket.receive().
+
+        Queued bytes become a binary message, dicts become a text (JSON)
+        message, and WebSocketDisconnect becomes the ASGI disconnect message
+        instead of being raised -- exactly how a real socket reports a
+        client hangup to this call.
+        """
+        message = await self._incoming.get()
+        if isinstance(message, WebSocketDisconnect):
+            return {"type": "websocket.disconnect", "code": message.code}
+        if isinstance(message, BaseException):
+            raise message
+        if isinstance(message, dict):
+            import json as _json
+            return {"type": "websocket.receive", "text": _json.dumps(message)}
+        return {"type": "websocket.receive", "bytes": message}
+
     async def send_bytes(self, message: bytes) -> None:
         self.binary_messages.append(message)
 

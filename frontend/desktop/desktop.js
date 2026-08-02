@@ -60,6 +60,8 @@ export class DesktopAudioClient {
     this.recordOutput = false;
     this.recordedChunks = [];
     this.recordedBytes = 0;
+    this.pingIntervalId = null;
+    this.networkRttMs = null;
   }
 
   onStatus(callback) {
@@ -234,6 +236,16 @@ export class DesktopAudioClient {
       const status = JSON.parse(message);
       if (status.type === 'ready') {
         this.relayReady = true;
+        this.startPingLoop();
+      }
+      if (status.type === 'pong' && typeof status.t === 'number') {
+        // Round-trip time for the ping this echoes, halved as a rough
+        // one-way network estimate for the latency panel. Not a per-frame
+        // measurement (the fixed 640-byte audio frames carry no timestamp),
+        // just a periodic sample of the same socket's current RTT.
+        this.networkRttMs = performance.now() - status.t;
+        this.emitMeters({ networkRttMs: this.networkRttMs });
+        return;
       }
       if (status.type === 'stopped') {
         // Server-side accounting for this session, used to locate audio loss:
@@ -241,12 +253,42 @@ export class DesktopAudioClient {
         this.serverSentBytes = status.playout_sent_bytes ?? null;
         this.serverDropBytes = status.playout_drop_bytes ?? null;
       }
+      if (status.type === 'stats') {
+        // Forward every numeric field as-is (infer_ms, hubert_ms, index_ms,
+        // rmvpe_ms, generator_ms, postproc_ms, total_ms, block_ms, etc.) so
+        // the latency panel can display whatever the current engine reports
+        // without this client needing to know the field list in advance.
+        this.emitMeters(status);
+      }
       this.emitStatus(status);
       if (status.type === 'error') {
         this.fail(status.message || 'Desktop audio relay error');
       }
     } catch {
       this.fail('Desktop audio relay sent invalid status data');
+    }
+  }
+
+  startPingLoop() {
+    if (this.pingIntervalId !== null) {
+      return;
+    }
+    const sendPing = () => {
+      if (this.socket?.readyState === 1) {
+        this.socket.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+      }
+    };
+    sendPing();
+    this.pingIntervalId = setInterval(sendPing, 2000);
+    // Browsers have no unref(); Node (tests, any future non-browser host)
+    // does, and without it a leftover interval keeps the process alive.
+    this.pingIntervalId?.unref?.();
+  }
+
+  stopPingLoop() {
+    if (this.pingIntervalId !== null) {
+      clearInterval(this.pingIntervalId);
+      this.pingIntervalId = null;
     }
   }
 
@@ -295,6 +337,8 @@ export class DesktopAudioClient {
   }
 
   async release({ closeSocket }) {
+    this.stopPingLoop();
+    this.networkRttMs = null;
     const socket = this.socket;
     this.socket = null;
     this.relayReady = false;
@@ -351,6 +395,8 @@ export class DesktopSetupPage {
     this.authRequired = true;
     this.lastError = '';
     this.devices = { inputs: [], outputs: [] };
+    this.callTimerIntervalId = null;
+    this.callStartedAt = 0;
   }
 
   init() {
@@ -531,6 +577,7 @@ export class DesktopSetupPage {
         this.setState('ready');
       } else if (status.type === 'interrupted' || status.type === 'error') {
         this.backendReady = false;
+        if (!test) this.stopCallTimer();
         this.setState('interrupted', status.message || 'Desktop audio relay interrupted');
       } else if (status.type === 'stats') {
         this.updateMeters(status);
@@ -563,6 +610,51 @@ export class DesktopSetupPage {
     if ('input_drop_count' in meters) byId('input-drops').textContent = String(meters.input_drop_count);
     if ('oldestDropCount' in meters) byId('playout-drops').textContent = String(meters.oldestDropCount);
     if ('reconnect_count' in meters) byId('reconnect-count').textContent = String(meters.reconnect_count);
+    this.updateLatencyPanel(meters);
+  }
+
+  /** Live per-stage latency breakdown, populated from whatever the current
+   * relay/converter actually reports -- fields are absent rather than zero
+   * when unavailable (e.g. hubert_ms only exists on the TRT engine path). */
+  updateLatencyPanel(meters) {
+    if ('networkRttMs' in meters) byId('latency-network').textContent = formatMs(meters.networkRttMs);
+    if ('infer_ms' in meters) byId('latency-infer').textContent = formatMs(meters.infer_ms);
+    if ('hubert_ms' in meters) byId('latency-hubert').textContent = formatMs(meters.hubert_ms);
+    if ('index_ms' in meters) byId('latency-index').textContent = formatMs(meters.index_ms);
+    if ('rmvpe_ms' in meters) byId('latency-rmvpe').textContent = formatMs(meters.rmvpe_ms);
+    if ('generator_ms' in meters) byId('latency-generator').textContent = formatMs(meters.generator_ms);
+    if ('postproc_ms' in meters) byId('latency-postproc').textContent = formatMs(meters.postproc_ms);
+    if ('bufferMs' in meters) byId('latency-playout').textContent = formatMs(meters.bufferMs);
+
+    const network = this.client?.networkRttMs;
+    const infer = this.client?.meters?.infer_ms;
+    const playout = this.client?.meters?.bufferMs;
+    if ([network, infer, playout].some((value) => typeof value === 'number')) {
+      const total = (network || 0) + (infer || 0) + (playout || 0);
+      byId('latency-total').textContent = formatMs(total);
+    }
+  }
+
+  startCallTimer() {
+    this.callStartedAt = performance.now();
+    this.updateCallTimer();
+    this.callTimerIntervalId = setInterval(() => this.updateCallTimer(), 250);
+  }
+
+  updateCallTimer() {
+    const elapsedMs = performance.now() - this.callStartedAt;
+    const totalSeconds = Math.floor(elapsedMs / 1000);
+    const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+    const seconds = String(totalSeconds % 60).padStart(2, '0');
+    byId('call-timer').textContent = `${minutes}:${seconds}`;
+  }
+
+  stopCallTimer() {
+    if (this.callTimerIntervalId !== null) {
+      clearInterval(this.callTimerIntervalId);
+      this.callTimerIntervalId = null;
+    }
+    byId('call-timer').textContent = '00:00';
   }
 
   async startConversion() {
@@ -576,9 +668,11 @@ export class DesktopSetupPage {
       this.client = client;
       this.bindClient(client);
       await client.start({ inputDeviceId: this.inputSelect.value, outputDeviceId: this.outputSelect.value, ticket });
+      this.startCallTimer();
     } catch (error) {
       this.backendReady = false;
       this.client = null;
+      this.stopCallTimer();
       this.setState('interrupted', error.message);
     }
   }
@@ -586,6 +680,7 @@ export class DesktopSetupPage {
   async stopConversion() {
     const client = this.client;
     this.client = null;
+    this.stopCallTimer();
     if (client) await client.stop();
     this.backendReady = false;
     this.updateMeters({ input: 0, output: 0, bufferMs: 0, input_drop_count: 0, oldestDropCount: 0, reconnect_count: 0 });

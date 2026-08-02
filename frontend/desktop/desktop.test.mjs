@@ -57,13 +57,17 @@ function makePage() {
 test('capture frames are blocked until relay ready and forwarded afterward', () => {
   const { client, sent } = wireCaptureClient();
   const frame = new ArrayBuffer(640);
+  // 'ready' also starts the latency-panel ping loop, which sends its own
+  // JSON control frames on the same socket -- filter to binary audio frames
+  // specifically, matching what this test actually cares about.
+  const audioFramesSent = () => sent.filter((message) => message instanceof ArrayBuffer).length;
 
   client.captureNode.port.onmessage({ data: { type: 'frame', pcm: frame } });
-  assert.equal(sent.length, 0);
+  assert.equal(audioFramesSent(), 0);
 
   client.handleSocketMessage(JSON.stringify({ type: 'ready' }));
   client.captureNode.port.onmessage({ data: { type: 'frame', pcm: frame } });
-  assert.equal(sent.length, 1);
+  assert.equal(audioFramesSent(), 1);
 });
 
 test('relay readiness resets on stop and a new start', async () => {
@@ -254,6 +258,16 @@ function makeVoiceTestPage(client) {
     'input-drops': { textContent: '' },
     'playout-drops': { textContent: '' },
     'reconnect-count': { textContent: '' },
+    'call-timer': { textContent: '' },
+    'latency-network': { textContent: '' },
+    'latency-infer': { textContent: '' },
+    'latency-hubert': { textContent: '' },
+    'latency-index': { textContent: '' },
+    'latency-rmvpe': { textContent: '' },
+    'latency-generator': { textContent: '' },
+    'latency-postproc': { textContent: '' },
+    'latency-playout': { textContent: '' },
+    'latency-total': { textContent: '' },
     'connection-state': { textContent: '', dataset: {} },
     'page-error': { textContent: '', hidden: true },
     'device-warning': { textContent: '', hidden: true },
