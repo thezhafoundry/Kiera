@@ -397,6 +397,16 @@ export class DesktopSetupPage {
     this.devices = { inputs: [], outputs: [] };
     this.callTimerIntervalId = null;
     this.callStartedAt = 0;
+    this.latencySamples = this.emptyLatencySamples();
+  }
+
+  emptyLatencySamples() {
+    return {
+      network: { sum: 0, count: 0 },
+      infer: { sum: 0, count: 0 },
+      playout: { sum: 0, count: 0 },
+      total: { sum: 0, count: 0 },
+    };
   }
 
   init() {
@@ -615,16 +625,26 @@ export class DesktopSetupPage {
 
   /** Live per-stage latency breakdown, populated from whatever the current
    * relay/converter actually reports -- fields are absent rather than zero
-   * when unavailable (e.g. hubert_ms only exists on the TRT engine path). */
+   * when unavailable (e.g. hubert_ms only exists on the TRT engine path).
+   * Also accumulates into this.latencySamples for the post-call summary. */
   updateLatencyPanel(meters) {
-    if ('networkRttMs' in meters) byId('latency-network').textContent = formatMs(meters.networkRttMs);
-    if ('infer_ms' in meters) byId('latency-infer').textContent = formatMs(meters.infer_ms);
+    if ('networkRttMs' in meters) {
+      byId('latency-network').textContent = formatMs(meters.networkRttMs);
+      this.recordLatencySample('network', meters.networkRttMs);
+    }
+    if ('infer_ms' in meters) {
+      byId('latency-infer').textContent = formatMs(meters.infer_ms);
+      this.recordLatencySample('infer', meters.infer_ms);
+    }
     if ('hubert_ms' in meters) byId('latency-hubert').textContent = formatMs(meters.hubert_ms);
     if ('index_ms' in meters) byId('latency-index').textContent = formatMs(meters.index_ms);
     if ('rmvpe_ms' in meters) byId('latency-rmvpe').textContent = formatMs(meters.rmvpe_ms);
     if ('generator_ms' in meters) byId('latency-generator').textContent = formatMs(meters.generator_ms);
     if ('postproc_ms' in meters) byId('latency-postproc').textContent = formatMs(meters.postproc_ms);
-    if ('bufferMs' in meters) byId('latency-playout').textContent = formatMs(meters.bufferMs);
+    if ('bufferMs' in meters) {
+      byId('latency-playout').textContent = formatMs(meters.bufferMs);
+      this.recordLatencySample('playout', meters.bufferMs);
+    }
 
     const network = this.client?.networkRttMs;
     const infer = this.client?.meters?.infer_ms;
@@ -632,11 +652,41 @@ export class DesktopSetupPage {
     if ([network, infer, playout].some((value) => typeof value === 'number')) {
       const total = (network || 0) + (infer || 0) + (playout || 0);
       byId('latency-total').textContent = formatMs(total);
+      this.recordLatencySample('total', total);
     }
+  }
+
+  recordLatencySample(key, value) {
+    if (!Number.isFinite(value)) return;
+    const bucket = this.latencySamples[key];
+    bucket.sum += value;
+    bucket.count += 1;
+  }
+
+  averageOf(key) {
+    const bucket = this.latencySamples[key];
+    return bucket.count > 0 ? bucket.sum / bucket.count : null;
+  }
+
+  showCallSummary({ durationMs, playoutDropCount, inputDropCount }) {
+    const card = byId('call-summary-card');
+    card.hidden = false;
+    const totalSeconds = Math.floor(durationMs / 1000);
+    const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+    const seconds = String(totalSeconds % 60).padStart(2, '0');
+    byId('summary-duration').textContent = `${minutes}:${seconds}`;
+    byId('summary-network').textContent = formatMs(this.averageOf('network'));
+    byId('summary-infer').textContent = formatMs(this.averageOf('infer'));
+    byId('summary-playout').textContent = formatMs(this.averageOf('playout'));
+    byId('summary-total').textContent = formatMs(this.averageOf('total'));
+    byId('summary-playout-drops').textContent = String(playoutDropCount ?? '--');
+    byId('summary-input-drops').textContent = String(inputDropCount ?? '--');
   }
 
   startCallTimer() {
     this.callStartedAt = performance.now();
+    this.latencySamples = this.emptyLatencySamples();
+    byId('call-summary-card').hidden = true;
     this.updateCallTimer();
     this.callTimerIntervalId = setInterval(() => this.updateCallTimer(), 250);
   }
@@ -680,10 +730,20 @@ export class DesktopSetupPage {
   async stopConversion() {
     const client = this.client;
     this.client = null;
+    // Capture before stopCallTimer()/updateMeters() reset the on-screen
+    // values this reads -- the summary must reflect the call that just
+    // ended, not the post-reset zeroed state.
+    const wasRunning = this.callTimerIntervalId !== null;
+    const durationMs = performance.now() - this.callStartedAt;
+    const playoutDropCount = byId('playout-drops').textContent;
+    const inputDropCount = byId('input-drops').textContent;
     this.stopCallTimer();
     if (client) await client.stop();
     this.backendReady = false;
     this.updateMeters({ input: 0, output: 0, bufferMs: 0, input_drop_count: 0, oldestDropCount: 0, reconnect_count: 0 });
+    if (wasRunning) {
+      this.showCallSummary({ durationMs, playoutDropCount, inputDropCount });
+    }
     this.setState(this.canUseDesktopSession() ? 'stopped' : 'signed_out');
   }
 
