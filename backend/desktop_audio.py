@@ -29,12 +29,13 @@ READINESS_TIMEOUT_SECONDS = 150.0
 # 48kHz mono 16-bit: how many bytes represent one second of playout audio.
 OUTPUT_BYTES_PER_SECOND = OUTPUT_SAMPLE_RATE * 2
 # Standing cushion held before the first frame is written, absorbing the
-# converter's bursty arrival timing. 0.5s (2026-08-02) fixed a confirmed
-# breakup from buffer underrun at 0.25s -- see .agents/decisions/log.md.
-# EXPERIMENTAL 2026-08-02: dropped to 0.05s to test how far latency can come
-# down before breakup returns. Expected to reintroduce underrun; not yet
-# field-confirmed either way.
-PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.1)
+# converter's bursty arrival timing. 0.25s caused a confirmed breakup from
+# buffer underrun (2026-08-02); 0.5s fixed it cleanly on a live test -- see
+# .agents/decisions/log.md. 0.35s (2026-08-02) is a genuinely untested
+# midpoint between the known-bad and known-good values, chosen to trade a
+# little smoothness margin for less latency. NOT YET FIELD-CONFIRMED --
+# test a real call and check "Playout drops" stays 0 before trusting this.
+PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.35)
 # Hard cap on held backlog; oldest audio is dropped beyond this so a persistent
 # stall grows delay only up to a bound.
 PLAYOUT_MAX_BYTES = int(OUTPUT_BYTES_PER_SECOND * 5)
