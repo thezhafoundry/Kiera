@@ -845,3 +845,106 @@ resolved. If 0.5s still isn't enough, the next step is the same cushion further 
 different mechanism — the pacer/cushion design itself (mirrored from
 `backend/pipeline.py`'s LiveKit-path fix) is confirmed working, just needs sizing to this
 path's actual burst profile.
+
+## 2026-08-02 (same day, continued) — cushion tuning, candidate_b experiment, causal-VC
+research, and a real "stuck backlog" bug
+
+**Cushion kept moving after the 0.5s fix above, ending at 0.35s (commit `5029194`),
+untested at time of writing.** User wanted to explore latency below 900ms; walked through
+why 0.25s (breakup) vs 0.5s (clean) vs the intermediate 0.35s tradeoff, landed on 0.35s as
+a genuinely-untested midpoint rather than re-trying either known value. **Re-verify before
+trusting this** — see [[active-backlog]].
+
+**Root architectural finding, confirmed against the pre-existing design doc
+(`docs/superpowers/specs/2026-08-01-causal-streaming-vc-migration-design.md`)**: RVC's
+current pipeline has a hard floor around 1.2-1.5s that no buffer/cushion/block-size tuning
+can beat, because HuBERT/RMVPE/the generator are all non-causal — they structurally require
+a full audio chunk in hand before any processing can start. Getting under ~1000ms needs a
+causal-architecture replacement, not more tuning. User explicitly deprioritized this
+(scoped a cheaper proof-of-concept research pass instead of committing to the 4-phase
+migration).
+
+**Causal-VC research findings (websearch, not yet acted on beyond research)**: three real
+candidate architectures (StreamVC/Google, RT-VC, SynthVC) all hit 60-80ms end-to-end —
+10-20x faster than RVC — but **none have public trained weights**; all require training a
+new model from scratch on a foundation the size of hundreds of speakers/tens of thousands
+of utterances, dwarfing this project's ~32 minutes of existing single-voice training audio
+(counted directly from `mi-test/*.wav`). SynthVC is architecturally closest to Keira's
+fixed-voice setup but its own paper doesn't state a minimum per-speaker data requirement,
+suggesting it wasn't designed for RVC-scale few-shot data at all. **One genuine exception
+found: X-VC** (`github.com/Jerrister/X-VC`) — MIT-licensed, publicly released trained
+weights, a live demo, and zero-shot (feeds a reference clip of the target voice at
+inference time, no training run needed) — the only candidate that's actually usable
+off-the-shelf rather than requiring a training project. Its exact latency numbers could not
+be independently verified from the paper's tables (extraction failed); that's the first
+thing to confirm before further investment. Building a WebSocket server for a new engine is
+NOT the hard part — `modal_deploy/worker.py`'s existing `ws_stream` is a directly reusable
+pattern; the hard, unverified part is whether X-VC's zero-shot conversion actually sounds
+like the trained agent voice. Recommended next step if this is picked back up: an offline
+CLI test of X-VC against a reference clip of the agent's voice, before any Modal/server
+integration work — same "verify quality offline before touching live infra" lesson as
+everywhere else in this file.
+
+**`candidate_b` (400ms accumulation, 160/240/40/160) taken from "geometry exists, no
+artifacts" to "exported, TRT-compiled, offline-verified, briefly live, then reverted" in one
+session.** `RVC_STREAM_PROFILE=candidate_b modal run modal_deploy/export_onnx.py` passed all
+three PyTorch-vs-ONNX parity checks at `cosine=1.000000` (hubert, generator, rmvpe) —
+essentially a perfect numerical match, not just "close enough." TRT engine build completed.
+Offline `main_chunked --pitch 12 --use-trt 1 --adaptive 1` replay against `male_test.wav`
+came back clean per the user ("no issue"). Deployed live
+(`RVC_STREAM_PROFILE=candidate_b modal deploy modal_deploy/worker.py`) — **no live-call
+A/B/listen test was completed before the user asked to revert back to `baseline` (720ms)
+same session**, so live-call quality at 400ms remains genuinely unknown, not ruled out.
+Revert command: `RVC_STREAM_PROFILE=baseline modal deploy modal_deploy/worker.py` — no
+re-export/re-compile needed, `baseline`'s artifacts were never touched (isolated storage
+paths by design, see `modal_deploy/rvc_profiles.py::_profile_artifact_root`).
+
+**Real bug found and fixed: strict real-time-only playout pacing had no way to recover
+from backlog once it existed (commit `a9b2e64`).** User reported a *steady* ~4-second delay
+for an entire Sound Recorder test call, confirmed GPU was warm beforehand (ruling out a
+cold-start explanation for a one-time slow start). Root cause, found by reading
+`run_playout_consumer`'s pacer loop closely: the dry-side self-correction (re-anchor
+`next_publish_time` from `now` when the buffer runs empty) had no counterpart on the
+backlog side — once held audio exceeds the cushion for ANY reason (one early hiccup,
+network jitter, first-inference slowness), the pacer can only drain at exactly 1x real
+time forever after, making that delay permanent for the rest of the call by construction,
+not a symptom that fades. This is a different, more consequential bug than the cushion-size
+tuning above — cushion size only matters if the pacer can recover from an overshoot, and it
+couldn't.
+
+Fixed with a bounded catch-up: above `PLAYOUT_CATCHUP_THRESHOLD_BYTES` (0.75s) held, drain
+at `PLAYOUT_CATCHUP_RATE` (1.15x) instead of 1x until back at/below
+`PLAYOUT_CATCHUP_TARGET_BYTES` (0.4s), with hysteresis between the two thresholds to avoid
+flapping. Rate chosen conservatively to stay well under the audible time-compression
+threshold that motivated strict real-time pacing in the first place (2026-07-27/2026-08-02
+"blurred voice"/breakup findings above). New test
+(`test_backlog_above_catchup_threshold_shrinks_over_time`) floods a 3s backlog and asserts
+delivery is measurably faster than strict 1x while staying well short of an unpaced dump —
+first version of the test's upper bound was miscalculated (didn't account for
+event-loop/sleep scheduling slack) and had to be loosened after seeing the real measured
+rate (~1.33x observed vs. ~1.15x configured, simulated and confirmed as scheduling overhead,
+not a pacing bug) — see the test file for the corrected bound and why. **Not yet
+field-confirmed** — needs a live call where backlog is deliberately allowed to build, then
+watching it visibly recover instead of staying elevated for the rest of the call.
+
+**Separately, ported the 2026-07-08 double-noise-suppression fix to the desktop path
+(commit `5ddbd03`), motivated by an open-place/outdoor ambient-noise complaint.**
+`frontend/desktop/desktop.js`'s `getUserMedia` never got the fix `frontend/app.js` received
+2026-07-08 — it still requested the browser's default `noiseSuppression`/`autoGainControl`
+(both on by default), stacking with the server-side `WebRTCNoiseSuppressor(NS_LEVEL)` the
+same way that combination previously measured −9dB at 6-8kHz / muffled output. Raising
+`NS_LEVEL` to 3 was considered first (user asked directly) and explicitly deferred in favor
+of this lower-risk fix, since stacking two suppression stages was already a known bad
+pattern independent of what level either one runs at. **Not yet field-confirmed** whether
+this alone resolves the ambient-noise complaint or whether `NS_LEVEL` still needs raising
+afterward — see [[active-backlog]].
+
+**Also fixed the same day: the desktop latency panel's "Estimated mouth-to-ear" total
+silently omitted the block-accumulation wait (commit `5ddbd03`)**, the dominant term at
+400-720ms depending on profile. It summed only network RTT + GPU inference + current
+playout buffer size, so it showed ~100ms while the user's stopwatch measured ~2s on the
+same call — a real bug introduced when the panel was first built earlier the same session,
+caught by the user cross-checking against a stopwatch rather than trusting the UI. Fixed by
+reading `block_ms`/`context_ms` (already present in every Modal `stats` message, just never
+consumed by the frontend) and giving it its own visible row rather than folding it silently
+into a total.
