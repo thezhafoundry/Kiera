@@ -12,7 +12,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
-from typing import Literal
+from typing import Literal, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -41,6 +41,23 @@ PLAYOUT_CUSHION_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.35)
 PLAYOUT_MAX_BYTES = int(OUTPUT_BYTES_PER_SECOND * 5)
 # Bytes written per pacing step (100ms) once the cushion has filled.
 PLAYOUT_DRAIN_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.1)
+# If held backlog exceeds the cushion by more than this, drain at
+# CATCHUP_RATE (faster than real time) until back within CATCHUP_TARGET_BYTES
+# of the cushion, then resume strict real-time pacing. Without this, a single
+# early burst that pushes the buffer above the cushion becomes a PERMANENT
+# fixed delay for the rest of the call -- the strict real-time pacer has no
+# other way to reduce backlog once it exists (confirmed live 2026-08-02: a
+# steady ~4s lag for an entire call with a warm GPU, consistent with one
+# early hiccup that was never recovered from). The rate is intentionally
+# mild (1.15x) to stay well below the audible time-compression threshold
+# that motivated strict real-time pacing in the first place (see
+# test_bursty_converter_output_is_paced_to_real_time and the 2026-07-21
+# "blurred voice" finding in .agents/context/subsystem-notes.md) --
+# catching up 150ms of backlog per second of audio is not perceptible the
+# way dumping a multi-second backlog unpaced is.
+PLAYOUT_CATCHUP_THRESHOLD_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.75)
+PLAYOUT_CATCHUP_TARGET_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.4)
+PLAYOUT_CATCHUP_RATE = 1.15
 
 Profile = Literal["male", "female"]
 
@@ -372,14 +389,21 @@ class DesktopAudioBridge:
             as a fraction of a second of speech then silence. Backlog must
             surface as growing (bounded) delay, never as speed.
 
-            next_publish_time is self-correcting: if a chunk becomes available
-            after its deadline already passed (the buffer genuinely ran dry),
-            publish immediately and re-anchor from now rather than sleeping to
-            "catch up" -- a stale schedule would push the next audio out faster
-            than real time, which is the bug this pacer exists to prevent.
-            Mirrors backend/pipeline.py::_run_playout_consumer.
+            next_publish_time is self-correcting on the DRY side: if a chunk
+            becomes available after its deadline already passed (the buffer
+            genuinely ran dry), publish immediately and re-anchor from now
+            rather than sleeping to "catch up" -- a stale schedule would push
+            the next audio out faster than real time, which is the bug this
+            pacer exists to prevent. On the BACKLOG side, a mild catch-up
+            (PLAYOUT_CATCHUP_RATE) kicks in once held audio exceeds
+            PLAYOUT_CATCHUP_THRESHOLD_BYTES, advancing the schedule slightly
+            faster than 1x until back near PLAYOUT_CATCHUP_TARGET_BYTES --
+            without this, any backlog above the cushion is permanent for the
+            rest of the call, since strict 1x pacing has no other way to
+            shrink it. Mirrors backend/pipeline.py::_run_playout_consumer.
             """
             filled = False
+            catching_up = False
             next_publish_time: Optional[float] = None
             try:
                 while True:
@@ -388,6 +412,7 @@ class DesktopAudioBridge:
                     # playout, and a single wait() here would strand the
                     # consumer (and the audio it holds) forever.
                     await playout_enabled.wait()
+                    backlog_after = 0
                     async with playout_lock:
                         if not filled:
                             if len(playout_buffer) < self.playout_cushion_bytes:
@@ -399,6 +424,7 @@ class DesktopAudioBridge:
                         else:
                             chunk = bytes(playout_buffer[:PLAYOUT_DRAIN_BYTES])
                             del playout_buffer[:PLAYOUT_DRAIN_BYTES]
+                        backlog_after = len(playout_buffer)
                         # Clear whenever this iteration took no chunk -- that is
                         # exactly when we're about to await playout_ready below,
                         # so the event must not still be set from a stale
@@ -431,7 +457,22 @@ class DesktopAudioBridge:
                                 await write_frames(chunk)
                                 raise
                         await write_frames(chunk)
-                        next_publish_time += len(chunk) / OUTPUT_BYTES_PER_SECOND
+                        chunk_duration = len(chunk) / OUTPUT_BYTES_PER_SECOND
+                        # Hysteresis: start catching up above the threshold,
+                        # keep catching up until back at/below the (lower)
+                        # target, rather than flapping on/off every iteration
+                        # right at one boundary value.
+                        if backlog_after > PLAYOUT_CATCHUP_THRESHOLD_BYTES:
+                            catching_up = True
+                        elif backlog_after <= PLAYOUT_CATCHUP_TARGET_BYTES:
+                            catching_up = False
+                        if catching_up:
+                            # Advance the schedule by less than real time so
+                            # the next write happens sooner than it otherwise
+                            # would -- a mild, bounded catch-up rather than
+                            # dumping backlog unpaced.
+                            chunk_duration /= PLAYOUT_CATCHUP_RATE
+                        next_publish_time += chunk_duration
                     else:
                         await playout_ready.wait()
             except asyncio.CancelledError:

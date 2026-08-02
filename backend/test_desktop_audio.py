@@ -600,6 +600,57 @@ async def test_bursty_converter_output_is_paced_to_real_time():
 
 
 @pytest.mark.asyncio
+async def test_backlog_above_catchup_threshold_shrinks_over_time():
+    """Once real-time pacing falls behind, it must catch back up, not stay
+    behind forever.
+
+    Reproduced live 2026-08-02: a single early burst pushed held backlog past
+    the cushion, and with strict 1x-only pacing that became a fixed ~4s delay
+    for the rest of the call -- there was no mechanism to reduce backlog once
+    it existed. This asserts the opposite: a large one-time flood must be
+    delivered measurably faster than real time (bounded by
+    PLAYOUT_CATCHUP_RATE) while catching up, not just eventually delivered.
+    """
+    one_second = 96000  # 48kHz * 2 bytes
+    flood_seconds = 3.0
+    websocket = TimestampingWebSocket(configured([bytes(640)] * 4))
+    converter = BurstyConverter(
+        burst_bytes=one_second // 10,
+        stall_seconds=0.05,
+        flood_bytes=int(one_second * flood_seconds),
+    )
+    bridge = DesktopAudioBridge(converter, playout_cushion_bytes=one_second // 10)
+
+    task = asyncio.create_task(bridge.run(websocket))
+    await asyncio.wait_for(converter.finished.wait(), timeout=5)
+    # Let the pacer run long enough to observe catch-up behavior, well short
+    # of the full flood_seconds a strict-1x pacer would need.
+    await asyncio.sleep(1.5)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    sent = len(websocket.binary_messages) * 960
+    strict_real_time_bound = one_second * 1.5  # what 1.5s of wall-clock buys at 1x
+    assert sent > strict_real_time_bound, (
+        f"backlog did not catch up faster than real time: {sent} bytes "
+        f"({sent / one_second:.2f}s of audio) delivered in ~1.5s wall-clock, "
+        f"expected more than the {strict_real_time_bound / one_second:.2f}s "
+        "a strict 1x pacer would deliver"
+    )
+    # Still bounded -- catch-up must not degrade into an unpaced dump. The
+    # observed rate runs a bit above PLAYOUT_CATCHUP_RATE (event-loop/sleep
+    # scheduling slack, not a pacing bug); this bound is generous enough to
+    # tolerate that while still catching an unpaced/instant dump, which would
+    # deliver close to the full 3s flood in 1.5s wall-clock.
+    catchup_bound = one_second * 1.5 * 1.6
+    assert sent < catchup_bound, (
+        f"backlog caught up too fast, risking audible time-compression: "
+        f"{sent} bytes ({sent / one_second:.2f}s) in ~1.5s wall-clock"
+    )
+
+
+@pytest.mark.asyncio
 async def test_paced_playout_flushes_backlog_when_client_disconnects():
     """A client hangup must deliver held backlog, not discard it.
 
