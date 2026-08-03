@@ -438,6 +438,17 @@ class DesktopAudioBridge:
             filled = False
             catching_up = False
             next_publish_time: Optional[float] = None
+            # TEMPORARY diagnostic instrumentation (2026-08-03): investigating a
+            # reported ~5s delay between real speech and its converted playout
+            # reaching the client, specifically after a long (~20s) silent
+            # stretch mid-call. Render's own logs showed nothing during the
+            # silence/speech transition -- no gap in outbound frame sends, no
+            # error, no existing warning -- so the mechanism (if any) must be
+            # inside this consumer's state, which previously logged nothing at
+            # all. Remove once the cause is confirmed and fixed; see
+            # .agents/decisions/log.md.
+            fill_wait_started_at: Optional[float] = None
+            last_diag_log_at = 0.0
             try:
                 while True:
                     # Checked per-iteration rather than once up front: the
@@ -450,10 +461,34 @@ class DesktopAudioBridge:
                         if not filled:
                             if len(playout_buffer) < self.playout_cushion_bytes:
                                 chunk = b""
+                                now_diag = time.monotonic()
+                                if fill_wait_started_at is None:
+                                    fill_wait_started_at = now_diag
+                                    logger.warning(
+                                        "[Desktop][Diag] cushion fill wait started: "
+                                        "buffer=%dB, need=%dB",
+                                        len(playout_buffer),
+                                        self.playout_cushion_bytes,
+                                    )
+                                elif now_diag - last_diag_log_at > 1.0:
+                                    last_diag_log_at = now_diag
+                                    logger.warning(
+                                        "[Desktop][Diag] still waiting for cushion "
+                                        "to fill after %.2fs: buffer=%dB, need=%dB",
+                                        now_diag - fill_wait_started_at,
+                                        len(playout_buffer),
+                                        self.playout_cushion_bytes,
+                                    )
                             else:
                                 chunk = bytes(playout_buffer[: self.playout_cushion_bytes])
                                 del playout_buffer[: self.playout_cushion_bytes]
                                 filled = True
+                                if fill_wait_started_at is not None:
+                                    logger.warning(
+                                        "[Desktop][Diag] cushion filled after "
+                                        "%.2fs wait",
+                                        time.monotonic() - fill_wait_started_at,
+                                    )
                         else:
                             chunk = bytes(playout_buffer[:PLAYOUT_DRAIN_BYTES])
                             del playout_buffer[:PLAYOUT_DRAIN_BYTES]
@@ -495,10 +530,25 @@ class DesktopAudioBridge:
                         # keep catching up until back at/below the (lower)
                         # target, rather than flapping on/off every iteration
                         # right at one boundary value.
+                        was_catching_up = catching_up
                         if backlog_after > PLAYOUT_CATCHUP_THRESHOLD_BYTES:
                             catching_up = True
                         elif backlog_after <= PLAYOUT_CATCHUP_TARGET_BYTES:
                             catching_up = False
+                        if catching_up and not was_catching_up:
+                            logger.warning(
+                                "[Desktop][Diag] backlog catch-up started: "
+                                "backlog=%dB (threshold=%dB)",
+                                backlog_after,
+                                PLAYOUT_CATCHUP_THRESHOLD_BYTES,
+                            )
+                        elif was_catching_up and not catching_up:
+                            logger.warning(
+                                "[Desktop][Diag] backlog catch-up finished: "
+                                "backlog=%dB (target=%dB)",
+                                backlog_after,
+                                PLAYOUT_CATCHUP_TARGET_BYTES,
+                            )
                         if catching_up:
                             # Advance the schedule by less than real time so
                             # the next write happens sooner than it otherwise
