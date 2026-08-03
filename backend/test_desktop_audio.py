@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from backend.desktop_audio import (
     DesktopAudioBridge,
     DesktopSessionStore,
+    PLAYOUT_FILL_WAIT_TIMEOUT_SECONDS,
     silence_frame,
     split_output_frames,
     validate_input_frame,
@@ -596,6 +597,60 @@ async def test_bursty_converter_output_is_paced_to_real_time():
     assert sent < one_second, (
         f"converted audio was forwarded faster than real time: {sent} bytes "
         f"({sent / one_second:.2f}s of audio) written in ~0.35s"
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_speech_after_long_silence_is_not_delayed_by_cushion_fill():
+    """A quiet stretch before the first real speech must not add a fixed
+    delay on top of the eventual conversion.
+
+    Reported live 2026-08-03: staying silent for tens of seconds after
+    starting a call, then speaking, produced audio roughly 5s after speaking
+    started. Unlike test_bursty_converter_output_is_paced_to_real_time (whose
+    burst_bytes already exceeds playout_cushion_bytes, so the consumer's
+    `filled` flag flips true almost immediately), this models a burst SMALLER
+    than the cushion: run_playout_consumer's `not filled` branch
+    (desktop_audio.py) holds ALL output -- not just delays it -- until enough
+    bytes accumulate to cross playout_cushion_bytes in one shot. If the
+    converter's real post-silence output arrives in pieces smaller than the
+    cushion, each piece is held with zero bytes released, and the entire
+    first utterance is buffered silently until a later, unrelated arrival
+    finally tips the total over the cushion line.
+    """
+    one_second = 96000  # 48kHz * 2 bytes
+    cushion = int(one_second * 0.35)  # matches PLAYOUT_CUSHION_BYTES default
+
+    websocket = TimestampingWebSocket(configured([bytes(640)] * 4))
+    # First real speech produces one chunk smaller than the cushion -- e.g. one
+    # converted block of a short utterance -- then nothing else arrives for
+    # several seconds (no more speech yet), matching "spoke once, then paused".
+    converter = BurstyConverter(
+        burst_bytes=cushion // 2,
+        stall_seconds=5.0,
+        flood_bytes=cushion // 2,
+    )
+    bridge = DesktopAudioBridge(converter, playout_cushion_bytes=cushion)
+
+    task = asyncio.create_task(bridge.run(websocket))
+    speech_produced_at = asyncio.get_running_loop().time()
+    await asyncio.wait_for(converter.finished.wait(), timeout=8)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert websocket.binary_send_times, (
+        "expected the first burst's audio to be delivered eventually"
+    )
+    first_delivery_delay = websocket.binary_send_times[0] - speech_produced_at
+    bound = PLAYOUT_FILL_WAIT_TIMEOUT_SECONDS + 0.5
+    assert first_delivery_delay < bound, (
+        "first converted audio took "
+        f"{first_delivery_delay:.2f}s to reach the client after being "
+        "produced (expected under the "
+        f"{PLAYOUT_FILL_WAIT_TIMEOUT_SECONDS}s fill-wait timeout plus slack) "
+        "-- the cushion-fill stall is holding the first utterance back "
+        "rather than only pacing it"
     )
 
 

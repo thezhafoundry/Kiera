@@ -61,6 +61,15 @@ PLAYOUT_DRAIN_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.1)
 PLAYOUT_CATCHUP_THRESHOLD_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.75)
 PLAYOUT_CATCHUP_TARGET_BYTES = int(OUTPUT_BYTES_PER_SECOND * 0.4)
 PLAYOUT_CATCHUP_RATE = 1.15
+# Cap on how long the initial cushion-fill wait may withhold audio that has
+# already arrived. Without this, a converter chunk smaller than the cushion
+# (e.g. the first short utterance after a long silence) is held with ZERO
+# bytes released -- not just delayed -- until a later, unrelated arrival
+# happens to cross the cushion threshold, which can be many seconds later
+# (reproduced 2026-08-03: 5s+ of real, already-produced speech held silent).
+# Once this many seconds have passed with SOME audio buffered but not yet a
+# full cushion, release what's there rather than waiting indefinitely.
+PLAYOUT_FILL_WAIT_TIMEOUT_SECONDS = 1.0
 
 Profile = Literal["male", "female"]
 
@@ -459,18 +468,29 @@ class DesktopAudioBridge:
                     backlog_after = 0
                     async with playout_lock:
                         if not filled:
-                            if len(playout_buffer) < self.playout_cushion_bytes:
+                            now_diag = time.monotonic()
+                            has_audio = len(playout_buffer) > 0
+                            if fill_wait_started_at is None and has_audio:
+                                fill_wait_started_at = now_diag
+                                logger.warning(
+                                    "[Desktop][Diag] cushion fill wait started: "
+                                    "buffer=%dB, need=%dB",
+                                    len(playout_buffer),
+                                    self.playout_cushion_bytes,
+                                )
+                            waited_too_long = (
+                                fill_wait_started_at is not None
+                                and now_diag - fill_wait_started_at
+                                >= PLAYOUT_FILL_WAIT_TIMEOUT_SECONDS
+                            )
+                            if len(playout_buffer) < self.playout_cushion_bytes and not (
+                                has_audio and waited_too_long
+                            ):
                                 chunk = b""
-                                now_diag = time.monotonic()
-                                if fill_wait_started_at is None:
-                                    fill_wait_started_at = now_diag
-                                    logger.warning(
-                                        "[Desktop][Diag] cushion fill wait started: "
-                                        "buffer=%dB, need=%dB",
-                                        len(playout_buffer),
-                                        self.playout_cushion_bytes,
-                                    )
-                                elif now_diag - last_diag_log_at > 1.0:
+                                if (
+                                    fill_wait_started_at is not None
+                                    and now_diag - last_diag_log_at > 1.0
+                                ):
                                     last_diag_log_at = now_diag
                                     logger.warning(
                                         "[Desktop][Diag] still waiting for cushion "
@@ -480,14 +500,21 @@ class DesktopAudioBridge:
                                         self.playout_cushion_bytes,
                                     )
                             else:
-                                chunk = bytes(playout_buffer[: self.playout_cushion_bytes])
-                                del playout_buffer[: self.playout_cushion_bytes]
+                                # Either the cushion is genuinely full, or enough
+                                # audio has been sitting buffered for too long --
+                                # release what's there instead of withholding an
+                                # already-produced utterance indefinitely.
+                                take = min(len(playout_buffer), self.playout_cushion_bytes)
+                                chunk = bytes(playout_buffer[:take])
+                                del playout_buffer[:take]
                                 filled = True
                                 if fill_wait_started_at is not None:
                                     logger.warning(
-                                        "[Desktop][Diag] cushion filled after "
-                                        "%.2fs wait",
-                                        time.monotonic() - fill_wait_started_at,
+                                        "[Desktop][Diag] cushion released after "
+                                        "%.2fs wait (%s): released=%dB",
+                                        now_diag - fill_wait_started_at,
+                                        "timeout" if waited_too_long else "full",
+                                        take,
                                     )
                         else:
                             chunk = bytes(playout_buffer[:PLAYOUT_DRAIN_BYTES])
@@ -557,7 +584,20 @@ class DesktopAudioBridge:
                             chunk_duration /= PLAYOUT_CATCHUP_RATE
                         next_publish_time += chunk_duration
                     else:
-                        await playout_ready.wait()
+                        # Bounded, not indefinite: while still waiting for the
+                        # initial cushion to fill, this must periodically wake
+                        # on its own so the fill-wait timeout above can release
+                        # already-buffered audio even if nothing new arrives.
+                        # Once filled, there is no timeout to check, so a plain
+                        # indefinite wait is correct and avoids needless wakeups.
+                        if filled:
+                            await playout_ready.wait()
+                        else:
+                            with contextlib.suppress(asyncio.TimeoutError):
+                                await asyncio.wait_for(
+                                    playout_ready.wait(),
+                                    timeout=PLAYOUT_FILL_WAIT_TIMEOUT_SECONDS,
+                                )
             except asyncio.CancelledError:
                 pass
 
