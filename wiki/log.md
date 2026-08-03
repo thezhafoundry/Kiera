@@ -330,3 +330,61 @@ under TRT; Myelin FP16 bug on the generator).
   in `.agents/projects/active-backlog.md`: the TRT-export shims live as uncommitted edits
   to vendored RVC files, and the pre-existing "untrack RVC/" backlog item would erase them
   -- that item is now explicitly blocked until the shims are committed or relocated.
+
+## [2026-08-02] ingest | Desktop voice-changer path: pacer bugs, cushion tuning, candidate_b experiment
+
+Full ingest of a long agent session covering the desktop voice-changer path
+(`backend/desktop_audio.py`, `frontend/desktop/`) for the first time in this wiki --
+previously only the LiveKit/PSTN path's playout buffer was documented. Source:
+`.agents/decisions/log.md`'s several 2026-08-02 entries and `.agents/projects/active-backlog.md`.
+
+Started from a user report that VC Cable output wasn't reaching WhatsApp, which led through
+device-routing troubleshooting (VB-CABLE pair confusion, Windows default-communication-device
+roles), then into a real recurring-breakup bug, then a "still ~2s latency" investigation that
+surfaced real input-side frame loss -- five distinct real findings in one session, in the
+order they were found:
+
+- New concept page: [[desktop-playout-pacer]] -- the desktop path's own playout pacer,
+  structurally similar to but a separate implementation from [[adaptive-playout-buffer]]
+  (LiveKit path). Documents the cushion-sizing trail (0.25s breakup -> 0.5s clean -> 0.05s
+  experiment -> 0.35s current, untested) and the mechanism itself.
+- New issue: [[desktop-pacer-permanent-backlog-bug]] -- the more consequential of the two
+  pacer bugs found: strict real-time-only pacing had no way to recover from backlog once it
+  existed, turning one early hiccup into a permanent ~4s delay for the rest of a call. Fixed
+  with a bounded 1.15x catch-up, hysteresis between two thresholds. Notable process lesson
+  captured on the page: the fix's own verification test had a miscalculated bound on first
+  draft, caught by comparing against a standalone simulation rather than trusting the algebra.
+- New issue: [[desktop-double-noise-suppression]] -- the desktop path never received the
+  2026-07-08 fix from [[voice-identity-mismatch-investigation]] (browser NS/AGC stacking with
+  server-side suppression). Found while the user was asking about raising NS_LEVEL to fight
+  outdoor ambient noise; this lower-risk fix was applied first, NS_LEVEL raise deferred.
+- New issue: [[desktop-latency-panel-total-omitted-accumulation]] -- the same session's new
+  latency-breakdown panel had a real bug in its own total (omitted the dominant
+  block-accumulation term, ~100ms shown vs ~2s real) the same day it shipped, caught by the
+  user cross-checking against a stopwatch. Fixed. A second, separate display bug in the same
+  panel (GPU-inference-total stuck at 0ms) was found later and is still open.
+- New issue: [[desktop-input-frame-drops]] -- OPEN. The real finding behind "still ~2s
+  latency" after the pacer fix: 28 input frames dropped over a 1:49 call, meaning lost
+  speech upstream of everything tuned so far. Two plausible unthreaded-blocking-call
+  candidates identified (an un-offloaded native noise-suppressor call; a nonzero input-gain
+  loop confirmed active in production) but not yet confirmed as the cause -- temporary
+  timing diagnostics were shipped instead of fixing on a guess. Next step (not done as of
+  this entry): read live Render logs for the new `[Desktop][Diag]` warning lines.
+- New issue: [[candidate-b-artifacts-and-live-revert]] -- in pursuit of sub-1000ms latency,
+  the previously-unbuilt `candidate_b` profile (400ms accumulation) was exported,
+  TRT-compiled, offline-verified clean, deployed live, then reverted back to `baseline`
+  same session before any live-call A/B test. Closes the old "no artifacts exist" blocker
+  from [[rvc-baseline-routing-and-duration]]/backlog, but live-call quality at 400ms is
+  still unconfirmed.
+- Updated [[adaptive-playout-buffer]] with a banner distinguishing it from the new desktop
+  page -- the two buffers are easy to conflate since they're structurally similar but are
+  different code, different constants, and had different bugs found on different dates.
+- Updated `index.md`: one new concept, five new issues, all cross-linked.
+
+Also touched this session, not yet ingested into the wiki (lower priority, mostly research
+rather than settled project state): a websearch survey of causal/streaming voice-conversion
+architectures (StreamVC, RT-VC, SynthVC, X-VC) as a possible path to sub-1000ms latency with
+smooth audio -- see `.agents/decisions/log.md` 2026-08-02 for the findings. X-VC stood out as
+the only candidate with public trained weights and a zero-shot (no training run needed)
+approach, but its exact latency numbers couldn't be verified from the paper and nothing was
+built. Worth a source page here if that direction is picked back up.

@@ -19,6 +19,12 @@ wiki. This index is the first stop for any query — find the page here, then dr
   (72.51s in the current L4 baseline; ~75s historically) and a confirmed incident where a lead
   heard raw voice for a whole call (historical — raw fallback no longer exists at all
   post-rebuild). The live worker moved from T4 to **L4** on 2026-07-03.
+- [desktop-playout-pacer](pages/concepts/desktop-playout-pacer.md) — **new 2026-08-02.**
+  The desktop voice-changer's own playout pacer (browser → VB-CABLE/BlackHole →
+  WhatsApp/Zoom/etc.), a separate implementation from the LiveKit path's buffer above.
+  Cushion currently 0.35s (untested at that exact value); a bounded catch-up mechanism was
+  added the same day it was found missing — see
+  [[desktop-pacer-permanent-backlog-bug]].
 
 ## Issues (open/resolved problems)
 - [rvc-baseline-routing-and-duration](pages/issues/rvc-baseline-routing-and-duration.md) —
@@ -78,6 +84,28 @@ wiki. This index is the first stop for any query — find the page here, then dr
   — **open, medium priority.** Every push to `main` redeploys and kills in-flight calls.
 - [readme-latency-budget-contradiction](pages/issues/readme-latency-budget-contradiction.md)
   — **resolved historical doc bug.** The old per-request budget was removed by the streaming rebuild.
+- [desktop-pacer-permanent-backlog-bug](pages/issues/desktop-pacer-permanent-backlog-bug.md)
+  — **resolved 2026-08-02, field-confirmation pending.** Strict real-time-only pacing on
+  the desktop path had no way to recover from backlog once it existed — one early hiccup
+  became a permanent ~4s delay for the rest of a call. Fixed with a bounded 1.15x catch-up.
+- [desktop-double-noise-suppression](pages/issues/desktop-double-noise-suppression.md) —
+  **resolved 2026-08-02, field-confirmation pending.** The desktop path never got the
+  2026-07-08 fix from [[voice-identity-mismatch-investigation]] — browser NS/AGC was
+  stacking with server-side suppression. Aligned with the LiveKit path's fix.
+- [desktop-latency-panel-total-omitted-accumulation](pages/issues/desktop-latency-panel-total-omitted-accumulation.md)
+  — **partially resolved 2026-08-02.** The new latency panel's own total silently omitted
+  the dominant term (block-accumulation wait), showing ~100ms against a real ~2s. Fixed.
+  A second bug in the same panel (GPU-inference-total field stuck at 0ms) is still open.
+- [desktop-input-frame-drops](pages/issues/desktop-input-frame-drops.md) — **open,
+  actively diagnosing.** 28 input frames dropped on a 1:49 desktop call — real lost speech,
+  not just delay. Two plausible unthreaded-blocking-call candidates found; temporary
+  timing diagnostics shipped instead of guessing at a fix. Next step: read the logs from a
+  live test call.
+- [candidate-b-artifacts-and-live-revert](pages/issues/candidate-b-artifacts-and-live-revert.md)
+  — **open.** The 400ms-accumulation `candidate_b` profile was exported, TRT-compiled, and
+  offline-verified clean in one session, briefly deployed live, then reverted back to
+  `baseline` before any live-call A/B test — quality at 400ms on a real call remains
+  unconfirmed either way.
 
 ## Sources (ingested raw material)
 - [latency-md](pages/sources/latency-md.md) — `LATENCY.md` (removed 2026-07-16, merged into `.agents/context/subsystem-notes.md`)

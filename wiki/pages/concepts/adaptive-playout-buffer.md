@@ -5,6 +5,12 @@ sources: [subsystem-notes, decisions-log]
 updated: 2026-07-14
 ---
 
+> **This page covers the LiveKit/PSTN path only** (`backend/pipeline.py`). The desktop
+> voice-changer (`backend/desktop_audio.py`, browser → VB-CABLE/BlackHole → WhatsApp etc.)
+> has its own, structurally similar but separately-implemented playout pacer — see
+> [[desktop-playout-pacer]]. Don't assume a constant or fix on one page applies to the
+> other; they're different code with different bugs found on different dates.
+
 > **Current live value: 0.25s target (commit `b38070c`, "restore 320ms block geometry,
 > 80ms SOLA, 0.25s cushion"), ~5s cap.** History: ~3s (2026-07-03) → 1.25s (TRT phase 1,
 > 2026-07-07) → 0.25s (TRT phase 2, 2026-07-07) → reverted/re-landed at 0.25s again by

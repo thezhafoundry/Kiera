@@ -948,3 +948,64 @@ caught by the user cross-checking against a stopwatch rather than trusting the U
 reading `block_ms`/`context_ms` (already present in every Modal `stats` message, just never
 consumed by the frontend) and giving it its own visible row rather than folding it silently
 into a total.
+
+## 2026-08-02 (same day, continued again) — still ~2s live latency after the catch-up fix;
+found 28 input drops, root cause not yet confirmed
+
+**After the backlog-catch-up fix (`a9b2e64`) shipped, the user reported latency was still
+~2 seconds — steady from the very start, not a recovery-then-plateau pattern.** That's an
+important distinction: a steady-from-start delay means the catch-up mechanism likely never
+triggered (nothing to catch up from), so this is a *different* symptom than the earlier "4s
+lag that never recovers" bug, not evidence the catch-up fix failed. Live worker confirmed
+on `baseline` (720ms accumulation) via `/health` at the time.
+
+**Live latency-panel numbers (screenshot) gave real signal**: `82ms` network, `720ms`
+accumulation, `0ms` **GPU inference (total)** despite HuBERT/FAISS/RMVPE/Generator
+sub-fields all populated (3+14+9+24 ≈ 50ms) — **the "total" field itself has a display bug,
+stuck at 0 while summing correctly elsewhere; not yet fixed, logged in
+[[active-backlog]]**. Call summary showed `879ms` average estimated mouth-to-ear (roughly
+149+720+10+8, consistent with the panel's own math) — notably NOT ~2000ms, meaning either
+the panel still under-measures something, or the felt ~2s partly reflects moments the
+averaged stats didn't capture.
+
+**The real finding: `Input drops: 28` over a 1:49 call.** This is upstream of everything
+tuned so far — frames dropped here (in `backend/desktop_audio.py`'s `receive_input`,
+`input_queue.full()` path) never even reach the converter, meaning lost speech, not just
+delay. Traced the mechanism: `input_queue` (500ms/25-frame cap) only overflows if its
+consumer (`RVCStreamingConverter._pump_input`, which drains near-instantly into its own
+separate 500ms buffer) falls behind — which per code inspection shouldn't happen under
+normal operation, pointing instead at something stalling `receive_input`'s own loop between
+successive `websocket.receive()` calls (an event-loop stall, not a downstream backpressure
+issue).
+
+**Two real candidates identified, unthreaded/blocking code found in the process (not yet
+fixed, diagnostics shipped instead of guessing):**
+1. `WebRTCNoiseSuppressor.process_frame` (`backend/noise/noise_suppressor.py`) makes a
+   synchronous native C-extension call (`self.processor.Process10ms`) with **no
+   `asyncio.to_thread` offload** — runs on the event loop, called twice per 20ms input
+   frame (desktop path only; confirmed via `webrtc-noise-gain` install log that this is
+   genuinely active on Render, not a Windows-style silent bypass). This is a real violation
+   of this project's own stated rule in CLAUDE.md ("never block the event loop").
+2. `DESKTOP_INPUT_GAIN` env defaults to **3.0**, not 1.0 (`backend/main.py`), so the
+   pure-Python per-sample gain loop in `receive_input` is confirmed active on every frame in
+   production, not a dormant code path. Benchmarked locally at ~0.1ms/frame — negligible in
+   isolation, ruled out as the primary cause by itself, but adds to total per-frame cost.
+
+**Structural evidence supporting the theory, not yet a confirmed root cause**: fresh Render
+deploy logs show `Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the
+instance` — a single-worker, CPU-constrained free-tier instance is exactly where an
+unthreaded blocking call would have no spare capacity to absorb without stalling other
+work (including reading the next WebSocket frame). Could not get an exact per-call
+millisecond number without live profiling (webrtc_noise_gain isn't installable on this
+Windows dev machine per the existing documented Windows gotcha), so chose to instrument and
+measure live rather than fix on a plausible-but-unconfirmed theory — consistent with
+[[feedback_pacer-verification-tests]]'s broader lesson about verifying timing claims
+empirically, not algebraically.
+
+**Diagnostic instrumentation shipped instead (commit `6a98143`), TEMPORARY, marked for
+removal once the cause is confirmed**: `receive_input` now logs a warning when the gap
+between successive loop iterations exceeds 40ms (expected ~20ms — a direct event-loop-stall
+signal, cause-agnostic) or when gain+suppressor processing for one frame exceeds 15ms
+(isolates whether it's specifically these two calls vs. something else entirely). Deployed;
+**a live test call with these logs captured is the next step, not yet done as of this
+entry** — see [[active-backlog]].
