@@ -1,7 +1,7 @@
 ---
 title: Desktop latency panel's "estimated mouth-to-ear" total omitted block-accumulation wait
 type: issue
-status: partially-resolved
+status: open
 sources: [decisions-log, active-backlog]
 updated: 2026-08-02
 ---

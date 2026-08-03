@@ -1009,3 +1009,64 @@ signal, cause-agnostic) or when gain+suppressor processing for one frame exceeds
 (isolates whether it's specifically these two calls vs. something else entirely). Deployed;
 **a live test call with these logs captured is the next step, not yet done as of this
 entry** — see [[active-backlog]].
+
+## 2026-08-03 — desktop playout cushion-fill stall found, fixed, and field-confirmed; candidate_b live-tested for the first time
+
+**User-reported symptom, reproduced first in an offline test before touching production:**
+staying silent for ~20s mid-call, then speaking for ~10s, produced audio more than 5s after
+speech started. Systematic debugging ruled out the Modal/RVC side first (silence-bypass
+path is real-time and cheap, per-block emission is immediate, pitch auto-detect is a ~1s
+one-time cost not tied to silence gaps) and the browser side (`desktop.js` forwards
+capture/playout frames the instant they arrive, no client-side buffering) before landing on
+`backend/desktop_audio.py`'s `run_playout_consumer`.
+
+**Root cause, confirmed with a new failing test
+(`test_first_speech_after_long_silence_is_not_delayed_by_cushion_fill`,
+`backend/test_desktop_audio.py`) before any fix was written**: the consumer's initial
+`not filled` branch released **zero bytes**, not just delayed ones, until enough converted
+audio accumulated to cross the full `PLAYOUT_CUSHION_BYTES` (0.35s) threshold in one shot.
+If the first converted chunk after a silence gap was smaller than the cushion and nothing
+else arrived for a while, that already-produced speech sat buffered and silent until an
+unrelated later arrival happened to tip the total over the line — reproduced at exactly
+5.02s in the test, matching the live symptom. This is a distinct bug from the already-fixed
+[[log]] 2026-08-02 sustained-backlog issue (`a9b2e64`'s catch-up mechanism) — that fix only
+runs once `filled` is already `True`; the pre-fill stall had no timeout and no catch-up path
+at all.
+
+**Fix (commit `4046007`)**: added `PLAYOUT_FILL_WAIT_TIMEOUT_SECONDS = 1.0` — once some
+audio has been buffered below the cushion for longer than this, release what's there
+instead of waiting indefinitely for the rest. Required a second, non-obvious fix to actually
+work: the consumer's idle wait (`await playout_ready.wait()`) only wakes on new-audio
+arrival, so a timeout check inside the lock was dead code until the wait itself was bounded
+(`asyncio.wait_for(playout_ready.wait(), timeout=...)`) so the loop can re-evaluate the
+timeout even when nothing new arrives. First attempt at the fix landed the timeout logic
+without this second piece and the test still failed at 5.02s — caught by rerunning the test
+immediately rather than assuming the first change was sufficient.
+
+**Field-confirmed same day, twice** (`[Desktop][Diag]` temporary logging added alongside
+the fix, commit `3834073`, both deployed to Render before any live test): both calls after
+the fix show `cushion released after 0.23-0.46s wait (full)` — i.e. filled normally, fast,
+not via the timeout path — with brief backlog catch-up cycles self-correcting within
+~0.6-0.8s. No multi-second stall observed on either call.
+
+**Separately, `candidate_b` (400ms accumulation, 160/240/40/160) was deployed live and
+field-tested for the first time** (`RVC_STREAM_PROFILE=candidate_b modal deploy`) — per the
+2026-08-02 entry above it had only ever been offline-verified before this. `/health`
+confirmed `profile: candidate_b` live; the pacer fix was confirmed working on this profile
+too (same clean cushion-release/catch-up pattern as baseline). **Trap re-confirmed**: right
+after the deploy, one call landed on a stale container still reporting
+`profile: baseline` (`max_containers=2` means an old container can keep serving live calls
+after a redeploy until it cycles out — see [[subsystem-notes]]'s GPU-tier entry for the same
+class of issue) — don't trust "I just deployed X" alone; check the specific call's own
+`[RVC Warmup] SUCCESS` log line for which profile it actually warmed up with.
+
+**Also confirmed via live Render logs (not just code reading) during this investigation**:
+the desktop capture path sends continuous 20ms frames regardless of speech activity (no
+VAD, by design per the 2026-07-02 rebuild) — silent room tone still produces real frames,
+which the Modal worker's `SILENCE_RMS_THRESHOLD` bypass handles cheaply without full
+inference. Not a bug; matches the documented no-VAD architecture.
+
+**Open, not yet addressed this session**: the `Cannot call "send" once a close message has
+been sent` teardown crash (`desktop_audio.py`'s final `"stopped"` message send racing a
+socket already closed by another path) recurred on every call observed via live Render
+logs — same bug as [[active-backlog]]'s existing open item, not a new one.
