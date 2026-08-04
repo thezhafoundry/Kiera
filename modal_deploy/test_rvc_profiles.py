@@ -10,7 +10,7 @@ from modal_deploy.rvc_profiles import (
 )
 
 
-@pytest.mark.parametrize("name", ["baseline", "candidate_b"])
+@pytest.mark.parametrize("name", ["baseline", "candidate_b", "candidate_c"])
 def test_profile_geometry_contracts(name):
     profile = get_profile(name)
 
@@ -19,7 +19,7 @@ def test_profile_geometry_contracts(name):
     ) * 16
     assert profile.sola_samples == profile.sola_ms * 48
     assert profile.playout_ms > 0
-    assert profile.name in {"baseline", "candidate_b"}
+    assert profile.name in {"baseline", "candidate_b", "candidate_c"}
 
 
 def test_baseline_matches_the_current_deployed_geometry():
@@ -44,6 +44,17 @@ def test_candidate_b_matches_the_approved_geometry():
     ) == (160, 240, 40, 160)
 
 
+def test_candidate_c_matches_the_agreed_geometry():
+    profile = get_profile("candidate_c")
+
+    assert (
+        profile.block_ms,
+        profile.context_ms,
+        profile.sola_ms,
+        profile.playout_ms,
+    ) == (120, 200, 20, 120)
+
+
 def test_unknown_profile_is_rejected():
     with pytest.raises(ValueError, match="Unknown RVC stream profile"):
         get_profile("fast-ish")
@@ -58,6 +69,15 @@ def test_candidate_artifacts_cannot_overwrite_the_baseline():
     assert profile_onnx_dir(candidate).endswith("/profiles/candidate_b/onnx")
     assert profile_trt_cache_dir(candidate).endswith(
         "/profiles/candidate_b/trt_cache"
+    )
+
+
+def test_candidate_c_artifacts_are_isolated_from_baseline_and_candidate_b():
+    candidate_c = get_profile("candidate_c")
+
+    assert profile_onnx_dir(candidate_c).endswith("/profiles/candidate_c/onnx")
+    assert profile_trt_cache_dir(candidate_c).endswith(
+        "/profiles/candidate_c/trt_cache"
     )
 
 

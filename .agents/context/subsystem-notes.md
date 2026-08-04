@@ -804,4 +804,8 @@ Envelope method: 20ms RMS envelopes; windowed xcorr out48k↔twilio-conv gives d
   run the stable/AP A/B from Render, repair the non-fatal startup warm-up import error
   (`F0Predictor` module path), perform one warm staff PSTN spectral/listen test, and only
   then benchmark Candidate B (160/240/40/160) with matching TensorRT artifacts. Candidate C
-  is not implemented. Do not promote a profile from laptop results alone.
+  (120/200/20/120) has geometry + contract tests as of 2026-08-04 (`rvc_profiles.py`) but no
+  ONNX/TRT artifacts or listen test — same "offline quality check before any live deploy"
+  gate applies, and its shrunk 200ms context/20ms SOLA is a strictly higher quality risk
+  than Candidate B's still-unverified 400ms, not a safer step. Do not promote a profile from
+  laptop results alone.
