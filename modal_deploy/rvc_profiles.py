@@ -97,6 +97,13 @@ _PROFILES = {
         sola_ms=20,
         playout_ms=120,
     ),
+    "candidate_d": RVCProfile(
+        name="candidate_d",
+        block_ms=1,
+        context_ms=1,
+        sola_ms=1,
+        playout_ms=1,
+    ),
 }
 
 

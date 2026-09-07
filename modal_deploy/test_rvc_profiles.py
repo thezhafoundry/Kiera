@@ -3,6 +3,7 @@
 import pytest
 
 from modal_deploy.rvc_profiles import (
+    RVCProfile,
     build_model_version,
     get_profile,
     profile_onnx_dir,
@@ -10,7 +11,7 @@ from modal_deploy.rvc_profiles import (
 )
 
 
-@pytest.mark.parametrize("name", ["baseline", "candidate_b", "candidate_c"])
+@pytest.mark.parametrize("name", ["baseline", "candidate_b", "candidate_c", "candidate_d"])
 def test_profile_geometry_contracts(name):
     profile = get_profile(name)
 
@@ -19,7 +20,7 @@ def test_profile_geometry_contracts(name):
     ) * 16
     assert profile.sola_samples == profile.sola_ms * 48
     assert profile.playout_ms > 0
-    assert profile.name in {"baseline", "candidate_b", "candidate_c"}
+    assert profile.name in {"baseline", "candidate_b", "candidate_c", "candidate_d"}
 
 
 def test_baseline_matches_the_current_deployed_geometry():
@@ -55,6 +56,22 @@ def test_candidate_c_matches_the_agreed_geometry():
     ) == (120, 200, 20, 120)
 
 
+def test_candidate_d_matches_the_agreed_geometry():
+    profile = get_profile("candidate_d")
+
+    assert (
+        profile.block_ms,
+        profile.context_ms,
+        profile.sola_ms,
+        profile.playout_ms,
+    ) == (1, 1, 1, 1)
+
+
+def test_candidate_d_rejects_true_zero():
+    with pytest.raises(ValueError, match="must be positive"):
+        RVCProfile(name="candidate_d", block_ms=0, context_ms=1, sola_ms=1, playout_ms=1)
+
+
 def test_unknown_profile_is_rejected():
     with pytest.raises(ValueError, match="Unknown RVC stream profile"):
         get_profile("fast-ish")
@@ -78,6 +95,15 @@ def test_candidate_c_artifacts_are_isolated_from_baseline_and_candidate_b():
     assert profile_onnx_dir(candidate_c).endswith("/profiles/candidate_c/onnx")
     assert profile_trt_cache_dir(candidate_c).endswith(
         "/profiles/candidate_c/trt_cache"
+    )
+
+
+def test_candidate_d_artifacts_are_isolated_from_other_profiles():
+    candidate_d = get_profile("candidate_d")
+
+    assert profile_onnx_dir(candidate_d).endswith("/profiles/candidate_d/onnx")
+    assert profile_trt_cache_dir(candidate_d).endswith(
+        "/profiles/candidate_d/trt_cache"
     )
 
 

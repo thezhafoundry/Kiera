@@ -809,3 +809,15 @@ Envelope method: 20ms RMS envelopes; windowed xcorr out48k↔twilio-conv gives d
   gate applies, and its shrunk 200ms context/20ms SOLA is a strictly higher quality risk
   than Candidate B's still-unverified 400ms, not a safer step. Do not promote a profile from
   laptop results alone.
+- **Candidate D (1/1/1/1ms) added 2026-08-05 — a deliberate floor probe, not a realistic
+  deploy candidate.** User asked to "remove all the buffer and accumulations"; `RVCProfile`
+  hard-rejects any field `<= 0` in `__post_init__` (existing validation, not added for this),
+  so true zero cannot exist as a profile — 1ms/field is the smallest value the contract
+  allows. At this size `canonical_in` is 32 samples (2ms of audio) and the +32000-sample
+  TRT padding fully dominates `hubert_frames`, so the geometry math still returns a
+  positive frame count (verified: 99 frames) — but that only proves the arithmetic doesn't
+  crash, not that HuBERT/pitch tracking produce anything meaningful from 2ms of real audio,
+  or that a 1ms SOLA crossfade (48 samples) hides a block seam. Expect this to sound broken
+  if ever run for real. No ONNX/TRT artifacts, no listen test, not intended for promotion —
+  exists so the "how low can this geometry go" question has a concrete, testable answer
+  instead of an unverified assumption. See [[active-backlog]].
